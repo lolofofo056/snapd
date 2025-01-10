@@ -196,6 +196,9 @@ func snapDeclarationFormatAnalyze(headers map[string]interface{}, body []byte) (
 		if rule.feature(altAttrMatcherFeature) {
 			setFormatNum(5)
 		}
+		if rule.feature(publisherIDConstraintsFeature) {
+			setFormatNum(6)
+		}
 	})
 	if err != nil {
 		return 0, err
@@ -217,6 +220,9 @@ func snapDeclarationFormatAnalyze(headers map[string]interface{}, body []byte) (
 		}
 		if rule.feature(altAttrMatcherFeature) {
 			setFormatNum(5)
+		}
+		if rule.feature(publisherIDConstraintsFeature) {
+			setFormatNum(6)
 		}
 	})
 	if err != nil {
@@ -668,6 +674,13 @@ func checkSnapRevisionWhat(headers map[string]interface{}, name, what string) (s
 		return 0, fmt.Errorf(`%q %s must be >=1: %d`, name, what, snapRevision)
 	}
 	return snapRevision, nil
+}
+
+func checkOptionalSnapRevisionWhat(headers map[string]interface{}, name, what string) (snapRevision int, err error) {
+	if _, ok := headers[name]; !ok {
+		return 0, nil
+	}
+	return checkSnapRevisionWhat(headers, name, what)
 }
 
 func assembleSnapRevision(assert assertionBase) (Assertion, error) {

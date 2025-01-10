@@ -39,6 +39,7 @@ import (
 
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/gadget/quantity"
+	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/osutil/squashfs"
 	"github.com/snapcore/snapd/sandbox/selinux"
@@ -229,6 +230,12 @@ func getVersion() (int, error) {
 		}
 	}
 
+	// ignore the pre-release suffixes, since we otherwise we can't convert to an
+	// int and we only compare versions coarsely to check systemd is not too old
+	if i := strings.IndexRune(verstr, '~'); i != -1 {
+		verstr = verstr[:i]
+	}
+
 	ver, err := strconv.Atoi(verstr)
 	if err != nil {
 		return 0, fmt.Errorf("cannot convert systemd version to number: %s", verstr)
@@ -323,6 +330,11 @@ type MountUnitOptions struct {
 	Fstype      string
 	Options     []string
 	Origin      string
+	// RootDir is the root of the filesystem where the unit will be created
+	RootDir string
+	// PreventRestartIfModified is set if we do not want to restart the
+	// mount unit if modified
+	PreventRestartIfModified bool
 }
 
 // Backend identifies the implementation backend in use by a Systemd instance.
@@ -337,13 +349,25 @@ const (
 	EmulationModeBackend
 )
 
-type mountUpdateStatus int
+type MountUpdateStatus int
 
 const (
-	mountUnchanged mountUpdateStatus = iota
-	mountUpdated
-	mountCreated
+	MountUnchanged MountUpdateStatus = iota
+	MountUpdated
+	MountCreated
 )
+
+// EnsureMountUnitFlags contains flags that modify behavior of EnsureMountUnitFile
+// TODO should we call directly EnsureMountUnitFileWithOptions and
+// remove this type instead?
+type EnsureMountUnitFlags struct {
+	// PreventRestartIfModified is set if we do not want to restart the
+	// mount unit if even though it was modified
+	PreventRestartIfModified bool
+	// StartBeforeDriversLoad is set if the unit is needed before
+	// udevd starts to run rules
+	StartBeforeDriversLoad bool
+}
 
 // Systemd exposes a minimal interface to manage systemd via the systemctl command.
 type Systemd interface {
@@ -400,7 +424,7 @@ type Systemd interface {
 	// logs, and is required to get logs for services which are in journal namespaces.
 	LogReader(services []string, n int, follow, namespaces bool) (io.ReadCloser, error)
 	// EnsureMountUnitFile adds/enables/starts a mount unit.
-	EnsureMountUnitFile(description, what, where, fstype string) (string, error)
+	EnsureMountUnitFile(description, what, where, fstype string, flags EnsureMountUnitFlags) (string, error)
 	// EnsureMountUnitFileWithOptions adds/enables/starts a mount unit with options.
 	EnsureMountUnitFileWithOptions(unitOptions *MountUnitOptions) (string, error)
 	// RemoveMountUnitFile unmounts/stops/disables/removes a mount unit.
@@ -425,6 +449,8 @@ type Systemd interface {
 	CurrentTasksCount(unit string) (uint64, error)
 	// Run a command
 	Run(command []string, opts *RunOptions) ([]byte, error)
+	// Set log level for the system
+	SetLogLevel(logLevel string) error
 }
 
 // KeyringMode describes how the kernel keyring is setup, see systemd.exec(5)
@@ -1351,16 +1377,20 @@ func MountUnitPath(baseDir string) string {
 	return filepath.Join(dirs.SnapServicesDir, escapedPath+".mount")
 }
 
-// MountUnitPathWithLifetime returns the path of a {,auto}mount unit
-// created in the systemd directory suitable for the given unit lifetime
-func MountUnitPathWithLifetime(lifetime UnitLifetime, mountPointDir string) string {
+// mountUnitPathWithLifetime returns the path of a {,auto}mount unit created in
+// the systemd directory suitable for the given unit lifetime. rootDir is the
+// directory for the root filesystem.
+func mountUnitPathWithLifetime(lifetime UnitLifetime, mountPointDir, rootDir string) string {
+	if rootDir == "" {
+		rootDir = dirs.GlobalRootDir
+	}
 	escapedPath := EscapeUnitNamePath(mountPointDir)
 	var servicesPath string
 	switch lifetime {
 	case Persistent:
-		servicesPath = dirs.SnapServicesDir
+		servicesPath = dirs.SnapServicesDirUnder(rootDir)
 	case Transient:
-		servicesPath = dirs.SnapRuntimeServicesDir
+		servicesPath = dirs.SnapRuntimeServicesDirUnder(rootDir)
 	default:
 		panic(fmt.Sprintf("unknown systemd unit lifetime %q", lifetime))
 	}
@@ -1371,7 +1401,7 @@ func MountUnitPathWithLifetime(lifetime UnitLifetime, mountPointDir string) stri
 func ExistingMountUnitPath(mountPointDir string) string {
 	lifetimes := []UnitLifetime{Persistent, Transient}
 	for _, lifetime := range lifetimes {
-		unit := MountUnitPathWithLifetime(lifetime, mountPointDir)
+		unit := mountUnitPathWithLifetime(lifetime, mountPointDir, "")
 		if osutil.FileExists(unit) {
 			return unit
 		}
@@ -1383,11 +1413,15 @@ var squashfsFsType = squashfs.FsType
 
 // Note that WantedBy=multi-user.target and Before=local-fs.target are
 // only used to allow downgrading to an older version of snapd.
-const regularMountUnitTmpl = `[Unit]
+//
+// We want (see isBeforeDrivers) some snaps and components to be mounted before
+// modules are loaded (that is before systemd-{udevd,modules-load}).
+const snapMountUnitTmpl = `[Unit]
 Description={{.Description}}
 After=snapd.mounts-pre.target
-Before=snapd.mounts.target
-Before=local-fs.target
+Before=snapd.mounts.target{{if isBeforeDrivers .MountUnitType}}
+Before=systemd-udevd.service systemd-modules-load.service
+Before=usr-lib-modules.mount usr-lib-firmware.mount{{end}}
 
 [Mount]
 What={{.What}}
@@ -1404,68 +1438,38 @@ X-SnapdOrigin={{.}}
 {{- end}}
 `
 
-// We want kernel-modules components to be mounted before modules are
-// loaded (that is before systemd-{udevd,modules-load}).
-const beforeDriversLoadUnitTmpl = `[Unit]
-Description={{.Description}}
-DefaultDependencies=no
-After=systemd-remount-fs.service
-Before=sysinit.target
-Before=systemd-udevd.service systemd-modules-load.service
-Before=umount.target
-Conflicts=umount.target
+func isBeforeDriversLoadMountUnit(mType MountUnitType) bool {
+	return mType == BeforeDriversLoadMountUnit
+}
 
-[Mount]
-What={{.What}}
-Where={{.Where}}
-Type={{.Fstype}}
-Options={{join .Options ","}}
-
-[Install]
-WantedBy=sysinit.target
-{{- with .Origin}}
-X-SnapdOrigin={{.}}
-{{- end}}
-`
-
-var templateFuncs = template.FuncMap{"join": strings.Join}
-var parsedRegularMountUnitTmpl = template.Must(template.New("unit").Funcs(templateFuncs).Parse(regularMountUnitTmpl))
-var parsedKernelDriversMountUnitTmpl = template.Must(template.New("unit").Funcs(templateFuncs).Parse(beforeDriversLoadUnitTmpl))
+var templateFuncs = template.FuncMap{"join": strings.Join,
+	"isBeforeDrivers": isBeforeDriversLoadMountUnit}
+var parsedMountUnitTmpl = template.Must(template.New("unit").Funcs(templateFuncs).Parse(snapMountUnitTmpl))
 
 const (
 	snappyOriginModule = "X-SnapdOrigin"
 )
 
-func ensureMountUnitFile(u *MountUnitOptions) (mountUnitName string, modified mountUpdateStatus, err error) {
+// EnsureMountUnitFileContent creates a mount unit file.
+func EnsureMountUnitFileContent(u *MountUnitOptions) (mountUnitName string, modified MountUpdateStatus, err error) {
 	if u == nil {
-		return "", mountUnchanged, errors.New("ensureMountUnitFile() expects valid mount options")
+		return "", MountUnchanged, errors.New("ensureMountUnitFile() expects valid mount options")
 	}
 
-	mu := MountUnitPathWithLifetime(u.Lifetime, u.Where)
+	mu := mountUnitPathWithLifetime(u.Lifetime, u.Where, u.RootDir)
 	var unitContent bytes.Buffer
-
-	var mntUnitTmpl *template.Template
-	switch u.MountUnitType {
-	case RegularMountUnit:
-		mntUnitTmpl = parsedRegularMountUnitTmpl
-	case BeforeDriversLoadMountUnit:
-		mntUnitTmpl = parsedKernelDriversMountUnitTmpl
-	default:
-		return "", mountUnchanged, fmt.Errorf("internal error: unknown mount unit type")
-	}
-
-	if err := mntUnitTmpl.Execute(&unitContent, &u); err != nil {
-		return "", mountUnchanged, fmt.Errorf("cannot generate mount unit: %v", err)
+	if err := parsedMountUnitTmpl.Execute(&unitContent, &u); err != nil {
+		return "", MountUnchanged, fmt.Errorf("cannot generate mount unit: %v", err)
 	}
 
 	if osutil.FileExists(mu) {
-		modified = mountUpdated
+		modified = MountUpdated
 	} else {
-		modified = mountCreated
+		modified = MountCreated
 	}
 
 	if err := os.MkdirAll(filepath.Dir(mu), 0755); err != nil {
-		return "", mountUnchanged, fmt.Errorf("cannot create directory %s: %v", filepath.Dir(mu), err)
+		return "", MountUnchanged, fmt.Errorf("cannot create directory %s: %v", filepath.Dir(mu), err)
 	}
 
 	stateErr := osutil.EnsureFileState(mu, &osutil.MemoryFileState{
@@ -1474,9 +1478,9 @@ func ensureMountUnitFile(u *MountUnitOptions) (mountUnitName string, modified mo
 	})
 
 	if stateErr == osutil.ErrSameState {
-		modified = mountUnchanged
+		modified = MountUnchanged
 	} else if stateErr != nil {
-		return "", mountUnchanged, stateErr
+		return "", MountUnchanged, stateErr
 	}
 
 	return filepath.Base(mu), modified, nil
@@ -1494,10 +1498,10 @@ func fsMountOptions(fstype string) []string {
 	return options
 }
 
-// hostFsTypeAndMountOptions returns filesystem type and options to actually
+// HostFsTypeAndMountOptions returns filesystem type and options to actually
 // mount the given fstype at runtime, i.e. it determines if fuse should be used
 // for squashfs.
-func hostFsTypeAndMountOptions(fstype string) (hostFsType string, options []string) {
+func HostFsTypeAndMountOptions(fstype string) (hostFsType string, options []string) {
 	options = fsMountOptions(fstype)
 	hostFsType = fstype
 	if fstype == "squashfs" {
@@ -1508,31 +1512,36 @@ func hostFsTypeAndMountOptions(fstype string) (hostFsType string, options []stri
 	return hostFsType, options
 }
 
-func (s *systemd) EnsureMountUnitFile(description, what, where, fstype string) (string, error) {
-	hostFsType, options := hostFsTypeAndMountOptions(fstype)
+func (s *systemd) EnsureMountUnitFile(description, what, where, fstype string, flags EnsureMountUnitFlags) (string, error) {
+	hostFsType, options := HostFsTypeAndMountOptions(fstype)
 	if osutil.IsDirectory(what) {
 		options = append(options, "bind")
 		hostFsType = "none"
 	}
-	return s.EnsureMountUnitFileWithOptions(&MountUnitOptions{
-		Lifetime:    Persistent,
-		Description: description,
-		What:        what,
-		Where:       where,
-		Fstype:      hostFsType,
-		Options:     options,
-	})
+	mountOptions := &MountUnitOptions{
+		Lifetime:                 Persistent,
+		Description:              description,
+		What:                     what,
+		Where:                    where,
+		Fstype:                   hostFsType,
+		Options:                  options,
+		PreventRestartIfModified: flags.PreventRestartIfModified,
+	}
+	if flags.StartBeforeDriversLoad {
+		mountOptions.MountUnitType = BeforeDriversLoadMountUnit
+	}
+	return s.EnsureMountUnitFileWithOptions(mountOptions)
 }
 
 func (s *systemd) EnsureMountUnitFileWithOptions(unitOptions *MountUnitOptions) (string, error) {
 	daemonReloadLock.Lock()
 	defer daemonReloadLock.Unlock()
 
-	mountUnitName, modified, err := ensureMountUnitFile(unitOptions)
+	mountUnitName, modified, err := EnsureMountUnitFileContent(unitOptions)
 	if err != nil {
 		return "", err
 	}
-	if modified != mountUnchanged {
+	if modified != MountUnchanged {
 		// we need to do a daemon-reload here to ensure that systemd really
 		// knows about this new mount unit file
 		if err := s.daemonReloadNoLock(); err != nil {
@@ -1543,9 +1552,13 @@ func (s *systemd) EnsureMountUnitFileWithOptions(unitOptions *MountUnitOptions) 
 		if err := s.EnableNoReload(units); err != nil {
 			return "", err
 		}
-		// Start/restart the created or modified unit now
-		if err := s.RestartNoWaitForStop(units); err != nil {
-			return "", err
+
+		// If just modified, some times it is not convenient to restart
+		if modified != MountUpdated || !unitOptions.PreventRestartIfModified {
+			// Start/restart the created or modified unit now
+			if err := s.RestartNoWaitForStop(units); err != nil {
+				return "", err
+			}
 		}
 	}
 
@@ -1748,4 +1761,21 @@ func (s *systemd) Run(command []string, opts *RunOptions) ([]byte, error) {
 		return nil, fmt.Errorf("cannot run %q: %v", command, osutil.OutputErrCombine(stdout, stderr, err))
 	}
 	return stdout, nil
+}
+
+func (s *systemd) SetLogLevel(logLevel string) error {
+	_, err := s.systemctl("log-level", logLevel)
+
+	// Older systemd versions used systemd-analyze instead, try that if error
+	if err != nil {
+		if stdout, stderr, err2 := osutil.RunSplitOutput(
+			"systemd-analyze", "set-log-level", logLevel); err2 == nil {
+			return nil
+		} else {
+			logger.Noticef("while running systemd-analyze: %v",
+				osutil.OutputErrCombine(stdout, stderr, err2))
+		}
+	}
+
+	return err
 }

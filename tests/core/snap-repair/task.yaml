@@ -1,12 +1,12 @@
 summary: Ensure that snap-repair works on Ubuntu Core
 
+details: |
+    Checks the `snap repair` command is able repair the
+    system and the repairs are listed properly.
+
 environment:
     BLOB_DIR: $(pwd)/fake-store-blobdir
     STORE_ADDR: localhost:11028
-
-prepare: |
-    snap install jq
-    tests.cleanup defer snap remove jq
 
 restore: |
     if [ "$TRUST_TEST_KEYS" = "false" ]; then
@@ -53,6 +53,9 @@ execute: |
         elif os.query is-core22; then
             REPAIR_SCRIPT=uc22-run.sh
             REPAIR_JSON=uc22-run.json
+        elif os.query is-core24; then
+            REPAIR_SCRIPT=uc24-run.sh
+            REPAIR_JSON=uc24-run.json
         fi
 
         fakestore new-repair --dir "$BLOB_DIR" "$REPAIR_SCRIPT" --repair-json="$PWD/$REPAIR_JSON"
@@ -75,7 +78,7 @@ execute: |
         test "$(snapd.tool exec snap-repair list | tail -n +2 | wc -l)" = 1
 
         echo "And the SNAP_SYSTEM_MODE env var is set appropriately"
-        if os.query is-core20 || os.query is-core22; then
+        if os.query is-core-ge 20; then
             snapd.tool exec snap-repair show testrootorg-1 | MATCH "echo run"
         else
             snapd.tool exec snap-repair show testrootorg-1 | MATCH "echo ''"
@@ -86,7 +89,7 @@ execute: |
 
         # note that the value "2" here _must_ be a string, otherwise we can't 
         # sign it as all values must be strings or lists of strings, etc. 
-        jq '."repair-id" = "2"' < "$PWD/$REPAIR_JSON" > "$PWD/$REPAIR_JSON.tmp"
+        gojq '."repair-id" = "2"' < "$PWD/$REPAIR_JSON" > "$PWD/$REPAIR_JSON.tmp"
         mv "$PWD/$REPAIR_JSON.tmp" "$PWD/2-$REPAIR_JSON"
 
         fakestore new-repair --dir "$BLOB_DIR" retry.sh --repair-json="$PWD/2-$REPAIR_JSON"
@@ -101,7 +104,7 @@ execute: |
 
         echo "Add a new repair ID 2 revision that completes successfully"
 
-        jq '."revision" = "1"' < "$PWD/2-$REPAIR_JSON" > "$PWD/2-$REPAIR_JSON.tmp"
+        gojq '."revision" = "1"' < "$PWD/2-$REPAIR_JSON" > "$PWD/2-$REPAIR_JSON.tmp"
         mv "$PWD/2-$REPAIR_JSON.tmp" "$PWD/2-$REPAIR_JSON"
 
         fakestore new-repair --dir "$BLOB_DIR" "$REPAIR_SCRIPT" --repair-json="$PWD/2-$REPAIR_JSON"
@@ -129,6 +132,8 @@ execute: |
             fakestore new-repair --dir "$BLOB_DIR" uc20-recover.sh --repair-json="$PWD/uc20-recover.json"
         elif os.query is-core22; then
             fakestore new-repair --dir "$BLOB_DIR" uc22-recover.sh --repair-json="$PWD/uc22-recover.json"
+        elif os.query is-core24; then
+            fakestore new-repair --dir "$BLOB_DIR" uc24-recover.sh --repair-json="$PWD/uc24-recover.json"
         fi
 
         "$TESTSTOOLS"/store-state setup-fake-store "$BLOB_DIR"

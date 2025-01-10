@@ -24,7 +24,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -124,7 +123,7 @@ func makeExampleComponentSourceDir(c *C, componentYaml string) string {
 	metaDir := filepath.Join(tempdir, "meta")
 	err := os.Mkdir(metaDir, 0755)
 	c.Assert(err, IsNil)
-	err = ioutil.WriteFile(filepath.Join(metaDir, "component.yaml"), []byte(componentYaml), 0644)
+	err = os.WriteFile(filepath.Join(metaDir, "component.yaml"), []byte(componentYaml), 0644)
 	c.Assert(err, IsNil)
 	return tempdir
 }
@@ -168,7 +167,8 @@ apps:
 `)
 	c.Assert(os.Remove(filepath.Join(sourceDir, "bin", "hello-world")), IsNil)
 	_, err := pack.Pack(sourceDir, pack.Defaults)
-	c.Assert(err, Equals, snap.ErrMissingPaths)
+	c.Check(err, testutil.ErrorIs, snap.ErrMissingPaths)
+	c.Assert(err, ErrorMatches, `snap is unusable due to missing files: path "bin/hello-world" does not exist`)
 }
 
 func (s *packSuite) TestPackDefaultConfigureWithoutConfigureError(c *C) {
@@ -194,9 +194,12 @@ apps:
 	c.Assert(os.Mkdir(filepath.Join(sourceDir, "meta", "hooks"), 0755), IsNil)
 	configureHooks := []string{"configure", "default-configure"}
 	for _, hook := range configureHooks {
-		c.Assert(os.WriteFile(filepath.Join(sourceDir, "meta", "hooks", hook), []byte("#!/bin/sh"), 0666), IsNil)
+		c.Assert(os.WriteFile(filepath.Join(sourceDir, "meta", "hooks", hook), []byte("#!/bin/sh"), 0644), IsNil)
 		_, err := pack.Pack(sourceDir, pack.Defaults)
-		c.Check(err, ErrorMatches, "snap is unusable due to bad permissions")
+		c.Check(err, testutil.ErrorIs, snap.ErrBadModes)
+		c.Check(err, ErrorMatches, fmt.Sprintf("snap is unusable due to bad permissions: \"meta/hooks/%s\" should be executable, and isn't: -rw-r--r--", hook))
+		// Fix hook error to catch next hook's error
+		c.Assert(os.Chmod(filepath.Join(sourceDir, "meta", "hooks", hook), 755), IsNil)
 	}
 }
 
@@ -247,7 +250,8 @@ apps:
 `
 	c.Assert(os.WriteFile(filepath.Join(sourceDir, "meta", "snapshots.yaml"), []byte(invalidSnapshotYaml), 0411), IsNil)
 	_, err := pack.Pack(sourceDir, pack.Defaults)
-	c.Assert(err, ErrorMatches, "snap is unusable due to bad permissions")
+	c.Check(err, testutil.ErrorIs, snap.ErrBadModes)
+	c.Assert(err, ErrorMatches, `snap is unusable due to bad permissions: "meta/snapshots.yaml" should be world-readable, and isn't: -r----x--x`)
 }
 
 func (s *packSuite) TestPackSnapshotYamlHappy(c *C) {
@@ -284,7 +288,8 @@ apps:
 	c.Assert(os.Remove(filepath.Join(sourceDir, "bin", "hello-world")), IsNil)
 
 	err = pack.CheckSkeleton(&buf, sourceDir)
-	c.Assert(err, Equals, snap.ErrMissingPaths)
+	c.Check(err, testutil.ErrorIs, snap.ErrMissingPaths)
+	c.Assert(err, ErrorMatches, `snap is unusable due to missing files: path "bin/hello-world" does not exist`)
 	c.Check(buf.String(), Equals, "")
 }
 
@@ -347,9 +352,9 @@ func (s *packSuite) TestDebArchitecture(c *C) {
 	c.Check(pack.DebArchitecture(&snap.Info{Architectures: nil}), Equals, "all")
 }
 
-func (s *packSuite) TestPackSimple(c *C) {
+func (s *packSuite) TestPackComponentSimple(c *C) {
 	sourceDir := makeExampleComponentSourceDir(c, `component: hello+test
-type: test
+type: standard
 version: 1.0.1
 `)
 
@@ -396,7 +401,49 @@ version: 1.0.1
 	}
 }
 
-func (s *packSuite) TestPackComponentSimple(c *C) {
+func (s *packSuite) TestPackComponentProvenance(c *C) {
+	sourceDir := makeExampleComponentSourceDir(c, `component: hello+test
+type: standard
+version: 1.0.1
+provenance: prov
+`)
+
+	result, err := pack.Pack(sourceDir, nil)
+	c.Assert(err, IsNil)
+
+	// check that there is result
+	_, err = os.Stat(result)
+	c.Assert(err, IsNil)
+	c.Assert(result, Equals, "hello+test_1.0.1.comp")
+
+	// check that the content looks sane
+	output, err := exec.Command("unsquashfs", "-ll", result).CombinedOutput()
+	c.Assert(err, IsNil)
+	expr := fmt.Sprintf(`(?ms).*%s.*`, regexp.QuoteMeta("meta/component.yaml"))
+	c.Assert(string(output), Matches, expr)
+}
+
+func (s *packSuite) TestPackComponentNoVersion(c *C) {
+	sourceDir := makeExampleComponentSourceDir(c, `component: hello+test
+type: standard
+`)
+
+	result, err := pack.Pack(sourceDir, nil)
+	c.Assert(err, IsNil)
+
+	// check that there is result
+	_, err = os.Stat(result)
+	c.Assert(err, IsNil)
+	c.Assert(result, Equals, "hello+test.comp")
+
+	// check that the content looks sane
+	output, err := exec.Command("unsquashfs", "-ll", result).CombinedOutput()
+	c.Assert(err, IsNil)
+	expr := fmt.Sprintf(`(?ms).*%s.*`, regexp.QuoteMeta("meta/component.yaml"))
+	c.Assert(string(output), Matches, expr)
+}
+
+func (s *packSuite) TestPackSimple(c *C) {
 	sourceDir := makeExampleSnapSourceDir(c, `name: hello
 version: 1.0.1
 architectures: ["i386", "amd64"]

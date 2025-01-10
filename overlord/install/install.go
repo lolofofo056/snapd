@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2021-2023 Canonical Ltd
+ * Copyright (C) 2021-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -46,6 +46,7 @@ import (
 	"github.com/snapcore/snapd/secboot/keys"
 	"github.com/snapcore/snapd/seed"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
 	"github.com/snapcore/snapd/snap/squashfs"
 	"github.com/snapcore/snapd/strutil"
 	"github.com/snapcore/snapd/sysconfig"
@@ -219,7 +220,7 @@ func CheckEncryptionSupport(model *asserts.Model, tpmMode secboot.TPMProvisionMo
 // The observer if any is also returned as non-nil trustedObserver if
 // encryption is in use.
 func BuildInstallObserver(model *asserts.Model, gadgetDir string, useEncryption bool) (
-	observer gadget.ContentObserver, trustedObserver *boot.TrustedAssetsInstallObserver, err error) {
+	observer gadget.ContentObserver, trustedObserver boot.TrustedAssetsInstallObserver, err error) {
 
 	// observer will be a nil interface by default
 	trustedObserver, err = boot.TrustedAssetsInstallObserverForModel(model, gadgetDir, useEncryption)
@@ -228,7 +229,7 @@ func BuildInstallObserver(model *asserts.Model, gadgetDir string, useEncryption 
 	}
 	if err == nil {
 		observer = trustedObserver
-		if !useEncryption {
+		if !useEncryption && !trustedObserver.BootLoaderSupportsEfiVariables() {
 			// there will be no key sealing, so past the
 			// installation pass no other methods need to be called
 			trustedObserver = nil
@@ -242,7 +243,9 @@ func BuildInstallObserver(model *asserts.Model, gadgetDir string, useEncryption 
 // * provides trustedInstallObserver with the chosen keys
 // * uses trustedInstallObserver to track any trusted assets in ubuntu-seed
 // * save keys and markers for ubuntu-data being able to safely open ubuntu-save
-func PrepareEncryptedSystemData(model *asserts.Model, keyForRole map[string]keys.EncryptionKey, trustedInstallObserver *boot.TrustedAssetsInstallObserver) error {
+// It is the responsibility of the caller to call
+// ObserveExistingTrustedRecoveryAssets on trustedInstallObserver.
+func PrepareEncryptedSystemData(model *asserts.Model, keyForRole map[string]keys.EncryptionKey, trustedInstallObserver boot.TrustedAssetsInstallObserver) error {
 	// validity check
 	if len(keyForRole) == 0 || keyForRole[gadget.SystemData] == nil || keyForRole[gadget.SystemSave] == nil {
 		return fmt.Errorf("internal error: system encryption keys are unset")
@@ -253,11 +256,6 @@ func PrepareEncryptedSystemData(model *asserts.Model, keyForRole map[string]keys
 	// make note of the encryption keys
 	trustedInstallObserver.ChosenEncryptionKeys(dataEncryptionKey, saveEncryptionKey)
 
-	// XXX is the asset cache problematic from initramfs?
-	// keep track of recovery assets
-	if err := trustedInstallObserver.ObserveExistingTrustedRecoveryAssets(boot.InitramfsUbuntuSeedDir); err != nil {
-		return fmt.Errorf("cannot observe existing trusted recovery assets: %v", err)
-	}
 	if err := saveKeys(model, keyForRole); err != nil {
 		return err
 	}
@@ -443,6 +441,47 @@ func writeTimesyncdClock(srcRootDir, dstRootDir string) error {
 	return nil
 }
 
+func comparePreseedAndSeedSnaps(seedSnap *seed.Snap, preseedSnap *asserts.PreseedSnap) error {
+	if preseedSnap.Revision != seedSnap.SideInfo.Revision.N {
+		rev := snap.Revision{N: preseedSnap.Revision}
+		return fmt.Errorf("snap %q has wrong revision %s (expected: %s)", seedSnap.SnapName(), seedSnap.SideInfo.Revision, rev)
+	}
+	if preseedSnap.SnapID != seedSnap.SideInfo.SnapID {
+		return fmt.Errorf("snap %q has wrong snap id %q (expected: %q)", seedSnap.SnapName(), seedSnap.SideInfo.SnapID, preseedSnap.SnapID)
+	}
+
+	expectedComps := make(map[string]asserts.PreseedComponent, len(preseedSnap.Components))
+	for _, c := range preseedSnap.Components {
+		expectedComps[c.Name] = c
+	}
+
+	for _, c := range seedSnap.Components {
+		preseedComp, ok := expectedComps[c.CompSideInfo.Component.ComponentName]
+		if !ok {
+			return fmt.Errorf("component %q not present in the preseed assertion", c.CompSideInfo.Component)
+		}
+
+		if preseedComp.Revision != c.CompSideInfo.Revision.N {
+			rev := snap.Revision{N: preseedComp.Revision}
+			return fmt.Errorf("component %q has wrong revision %s (expected: %s)", c.CompSideInfo.Component, c.CompSideInfo.Revision, rev)
+		}
+
+		// once we've seen the component, remove it from the expected
+		// components. anything left over is missing from the seed.
+		delete(expectedComps, c.CompSideInfo.Component.ComponentName)
+	}
+
+	if len(expectedComps) != 0 {
+		missing := make([]string, 0, len(expectedComps))
+		for name := range expectedComps {
+			missing = append(missing, naming.NewComponentRef(seedSnap.SnapName(), name).String())
+		}
+		return fmt.Errorf("seed is missing components expected by preseed assertion: %s", strutil.Quoted(missing))
+	}
+
+	return nil
+}
+
 // ApplyPreseededData applies the preseed payload from the given seed, including
 // installing snaps, to the given target system filesystem.
 func ApplyPreseededData(preseedSeed seed.PreseedCapable, writableDir string) error {
@@ -495,14 +534,7 @@ func ApplyPreseededData(preseedSeed seed.PreseedCapable, writableDir string) err
 		if !ok {
 			return fmt.Errorf("snap %q not present in the preseed assertion", ssnap.SnapName())
 		}
-		if ps.Revision != ssnap.SideInfo.Revision.N {
-			rev := snap.Revision{N: ps.Revision}
-			return fmt.Errorf("snap %q has wrong revision %s (expected: %s)", ssnap.SnapName(), ssnap.SideInfo.Revision, rev)
-		}
-		if ps.SnapID != ssnap.SideInfo.SnapID {
-			return fmt.Errorf("snap %q has wrong snap id %q (expected: %q)", ssnap.SnapName(), ssnap.SideInfo.SnapID, ps.SnapID)
-		}
-		return nil
+		return comparePreseedAndSeedSnaps(ssnap, ps)
 	}
 
 	esnaps := preseedSeed.EssentialSnaps()
@@ -534,24 +566,22 @@ type preseedSnapHandler struct {
 	writableDir string
 }
 
-func (p *preseedSnapHandler) HandleUnassertedSnap(name, path string, _ timings.Measurer) (string, error) {
-	pinfo := snap.MinimalPlaceInfo(name, snap.Revision{N: -1})
-	targetPath := filepath.Join(p.writableDir, pinfo.MountFile())
-	mountDir := filepath.Join(p.writableDir, pinfo.MountDir())
+func (p *preseedSnapHandler) HandleUnassertedContainer(cpi snap.ContainerPlaceInfo, path string, _ timings.Measurer) (string, error) {
+	targetPath := filepath.Join(p.writableDir, cpi.MountFile())
+	mountDir := filepath.Join(p.writableDir, cpi.MountDir())
 
 	sq := squashfs.New(path)
 	opts := &snap.InstallOptions{MustNotCrossDevices: true}
 	if _, err := sq.Install(targetPath, mountDir, opts); err != nil {
-		return "", fmt.Errorf("cannot install snap %q: %v", name, err)
+		return "", fmt.Errorf("cannot install snap %q: %v", cpi.ContainerName(), err)
 	}
 
 	return targetPath, nil
 }
 
-func (p *preseedSnapHandler) HandleAndDigestAssertedSnap(name, path string, essType snap.Type, snapRev *asserts.SnapRevision, _ func(string, uint64) (snap.Revision, error), _ timings.Measurer) (string, string, uint64, error) {
-	pinfo := snap.MinimalPlaceInfo(name, snap.Revision{N: snapRev.SnapRevision()})
-	targetPath := filepath.Join(p.writableDir, pinfo.MountFile())
-	mountDir := filepath.Join(p.writableDir, pinfo.MountDir())
+func (p *preseedSnapHandler) HandleAndDigestAssertedContainer(cpi snap.ContainerPlaceInfo, path string, _ timings.Measurer) (string, string, uint64, error) {
+	targetPath := filepath.Join(p.writableDir, cpi.MountFile())
+	mountDir := filepath.Join(p.writableDir, cpi.MountDir())
 
 	logger.Debugf("copying: %q to %q; mount dir=%q", path, targetPath, mountDir)
 
@@ -582,7 +612,7 @@ func (p *preseedSnapHandler) HandleAndDigestAssertedSnap(name, path string, essT
 		return "", "", 0, err
 	}
 	if err := destFile.Commit(); err != nil {
-		return "", "", 0, fmt.Errorf("cannot copy snap %q: %v", name, err)
+		return "", "", 0, fmt.Errorf("cannot copy snap %q: %v", cpi.ContainerName(), err)
 	}
 
 	sq := squashfs.New(targetPath)
@@ -590,7 +620,7 @@ func (p *preseedSnapHandler) HandleAndDigestAssertedSnap(name, path string, essT
 	// since Install target path is the same as source path passed to squashfs.New,
 	// Install isn't going to copy the blob, but we call it to set up mount directory etc.
 	if _, err := sq.Install(targetPath, mountDir, opts); err != nil {
-		return "", "", 0, fmt.Errorf("cannot install snap %q: %v", name, err)
+		return "", "", 0, fmt.Errorf("cannot install snap %q: %v", cpi.ContainerName(), err)
 	}
 
 	sha3_384, err := asserts.EncodeDigest(crypto.SHA3_384, h.Sum(nil))

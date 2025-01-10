@@ -62,7 +62,7 @@ distro_name_package() {
         ubuntu-*|debian-*)
             debian_name_package "$@"
             ;;
-        amazon-*|centos-7-*)
+        amazon-*)
             amazon_name_package "$@"
             ;;
         fedora-*|centos-*)
@@ -108,7 +108,7 @@ distro_install_local_package() {
             # shellcheck disable=SC2086
             apt install $flags "$@"
             ;;
-        amazon-*|centos-7-*)
+        amazon-*)
             quiet yum -y localinstall "$@"
             ;;
         fedora-*|centos-*)
@@ -194,7 +194,7 @@ distro_install_package() {
             quiet eatmydata apt-get install $APT_FLAGS -y "${pkg_names[@]}"
             retval=$?
             ;;
-        amazon-linux-2-*|centos-7-*)
+        amazon-linux-2-*)
             # shellcheck disable=SC2086
             quiet yum -y install $YUM_FLAGS "${pkg_names[@]}"
             retval=$?
@@ -254,7 +254,7 @@ distro_purge_package() {
             # behind while purging in prepare
             eatmydata apt-get remove -y --purge -y "$@"
             ;;
-        amazon-*|centos-7-*)
+        amazon-*)
             quiet yum -y remove "$@"
             ;;
         fedora-*|centos-*)
@@ -279,7 +279,7 @@ distro_update_package_db() {
         ubuntu-*|debian-*)
             quiet eatmydata apt-get update
             ;;
-        amazon-*|centos-7-*)
+        amazon-*)
             quiet yum clean all
             quiet yum makecache
             ;;
@@ -305,7 +305,7 @@ distro_clean_package_cache() {
         ubuntu-*|debian-*)
             quiet eatmydata apt-get clean
             ;;
-        amazon-*|centos-7-*)
+        amazon-*)
             yum clean all
             ;;
         fedora-*|centos-*)
@@ -329,7 +329,7 @@ distro_auto_remove_packages() {
         ubuntu-*|debian-*)
             quiet eatmydata apt-get -y autoremove
             ;;
-        amazon-*|centos-7-*)
+        amazon-*)
             quiet yum -y autoremove
             ;;
         fedora-*|centos-*)
@@ -351,7 +351,7 @@ distro_query_package_info() {
         ubuntu-*|debian-*)
             apt-cache policy "$1"
             ;;
-        amazon-*|centos-7-*)
+        amazon-*)
             yum info "$1"
             ;;
         fedora-*|centos-*)
@@ -376,7 +376,11 @@ distro_install_build_snapd(){
         cp /etc/apt/sources.list sources.list.back
         echo "deb http://archive.ubuntu.com/ubuntu/ $(lsb_release -c -s)-proposed restricted main multiverse universe" | tee /etc/apt/sources.list -a
         apt update
-        apt install -y --only-upgrade snapd
+        if os.query is-ubuntu-ge 24.04; then
+            apt install -y --only-upgrade -t "$(lsb_release -c -s)-proposed" snapd
+        else
+            apt install -y --only-upgrade snapd
+        fi
         mv sources.list.back /etc/apt/sources.list
         apt update
 
@@ -398,11 +402,12 @@ distro_install_build_snapd(){
         add-apt-repository -y "$PPA_VALIDATION_NAME"
         apt update
         apt install -y --only-upgrade snapd
-        add-apt-repository --remove "$PPA_VALIDATION_NAME"
-        apt update
 
         # Double check that it really comes from the PPA
         apt show snapd | MATCH "APT-Sources: http.*ppa\.launchpad(content)?\.net"
+
+        add-apt-repository --remove "$PPA_VALIDATION_NAME"
+        apt update
     else
         packages=
         case "$SPREAD_SYSTEM" in
@@ -535,6 +540,7 @@ pkg_dependencies_ubuntu_generic(){
         udisks2
         upower
         uuid-runtime
+        pigz
         "
 }
 
@@ -565,6 +571,7 @@ pkg_dependencies_ubuntu_classic(){
             ;;
         ubuntu-16.04-64)
             echo "
+                chrony
                 dbus-user-session
                 evolution-data-server
                 fwupd
@@ -579,22 +586,10 @@ pkg_dependencies_ubuntu_classic(){
                 "
                 pkg_linux_image_extra
             ;;
-        ubuntu-18.04-32)
-            echo "
-                dbus-user-session
-                gccgo-6
-                evolution-data-server
-                fwupd
-                gnome-online-accounts
-                packagekit
-                "
-                pkg_linux_image_extra
-            ;;
         ubuntu-18.04-64)
             echo "
                 dbus-user-session
                 gccgo-8
-                gperf
                 evolution-data-server
                 fwupd
                 packagekit
@@ -616,17 +611,34 @@ pkg_dependencies_ubuntu_classic(){
                 shellcheck
                 "
             ;;
-        ubuntu-22.*|ubuntu-23.*|ubuntu-24.*)
+        ubuntu-22.*|ubuntu-23.*|ubuntu-24.04*)
             # bpftool is part of linux-tools package
             echo "
                 dbus-user-session
                 fwupd
                 golang
+                gperf
                 libvirt-daemon-system
                 linux-tools-$(uname -r)
                 lz4
                 qemu-kvm
                 qemu-utils
+                "
+            ;;
+	ubuntu-24.10*|ubuntu-25.*)
+            # bpftool is part of linux-tools package
+            # ubuntu-24.10+ systemd-dev is optional
+            echo "
+                dbus-user-session
+                fwupd
+                golang
+                gperf
+                libvirt-daemon-system
+                linux-tools-$(uname -r)
+                lz4
+                qemu-kvm
+                qemu-utils
+                systemd-dev
                 "
             ;;
         ubuntu-*)
@@ -692,6 +704,7 @@ pkg_dependencies_fedora_centos_common(){
         git
         golang
         jq
+        iptables
         iptables-services
         man
         net-tools
@@ -789,11 +802,12 @@ pkg_dependencies_opensuse(){
         man-pages
         nfs-kernel-server
         nss-mdns
+        osc
         PackageKit
         python3-yaml
         strace
         netcat-openbsd
-        osc
+        rpm-build
         udisks2
         upower
         uuidd
@@ -861,7 +875,7 @@ pkg_dependencies(){
             pkg_dependencies_ubuntu_generic
             pkg_dependencies_ubuntu_classic
             ;;
-        amazon-*|centos-7-*)
+        amazon-*)
             pkg_dependencies_amazon
             ;;
         centos-*)
@@ -892,6 +906,16 @@ install_pkg_dependencies(){
 # to stdout
 distro_upgrade() {
     case "$SPREAD_SYSTEM" in
+        amazon-linux-2023-*)
+            # Amazon Linux 2023 uses versioned releases, see
+            # https://docs.aws.amazon.com/linux/al2023/ug/deterministic-upgrades-usage.html
+            if [ "$(dnf check-release-update 2>&1)" = "" ]; then
+                return
+            fi
+
+            dnf upgrade --releasever=latest -y
+            echo "reboot"
+            ;;
         arch-*)
             # Arch does not support partial upgrades. On top of this, the image
             # we are running in may have been built some time ago and we need to

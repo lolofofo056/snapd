@@ -36,7 +36,6 @@ package main
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -44,6 +43,7 @@ import (
 
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/logger"
+	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/release"
 	apparmor_sandbox "github.com/snapcore/snapd/sandbox/apparmor"
 	"github.com/snapcore/snapd/snapdtool"
@@ -69,15 +69,36 @@ import (
 // any loss of functionality. This is an unsupported configuration that cannot
 // be properly handled by this function.
 func isContainerWithInternalPolicy() bool {
+	var securityFSPath = filepath.Join(dirs.GlobalRootDir, "/sys/kernel/security")
+
 	if release.OnWSL {
-		return true
+		// WSL-1 is an emulated Windows layer that has no support for AppArmor.
+		// WSL-2 is a virtualised environment with the Linux kernel as
+		// distributed by Microsoft.
+		//
+		// In the future, Microsoft could enable AppArmor in the WSL kernel
+		// configuration and modify the special init process that launches
+		// distributions in quasi-containers.  This change would initialize
+		// AppArmor nesting automatically, potentially eliminating the need for
+		// this WSL-specific logic.
+		//
+		// In the meantime, given that people experiment with AppArmor on WSL,
+		// so we only bail out if the securityfs is not available. When
+		// securityfs is present we assume everything else is "just right" even
+		// though that is not really true, and we know apparmor profiles loaded
+		// in one WSL distribution container are visible in all distribution
+		// containers.
+		if release.WSLVersion == 2 && osutil.IsDirectory(securityFSPath) {
+			return true
+		}
+		return false
 	}
 
-	var appArmorSecurityFSPath = filepath.Join(dirs.GlobalRootDir, "/sys/kernel/security/apparmor")
+	var appArmorSecurityFSPath = filepath.Join(securityFSPath, "apparmor")
 	var nsStackedPath = filepath.Join(appArmorSecurityFSPath, ".ns_stacked")
 	var nsNamePath = filepath.Join(appArmorSecurityFSPath, ".ns_name")
 
-	contents, err := ioutil.ReadFile(nsStackedPath)
+	contents, err := os.ReadFile(nsStackedPath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		logger.Noticef("Failed to read %s: %v", nsStackedPath, err)
 		return false
@@ -87,7 +108,7 @@ func isContainerWithInternalPolicy() bool {
 		return false
 	}
 
-	contents, err = ioutil.ReadFile(nsNamePath)
+	contents, err = os.ReadFile(nsNamePath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		logger.Noticef("Failed to read %s: %v", nsNamePath, err)
 		return false
@@ -139,7 +160,7 @@ func validateArgs(args []string) error {
 }
 
 func init() {
-	if err := logger.SimpleSetup(); err != nil {
+	if err := logger.SimpleSetup(nil); err != nil {
 		fmt.Fprintf(os.Stderr, "WARNING: failed to activate logging: %v\n", err)
 	}
 }

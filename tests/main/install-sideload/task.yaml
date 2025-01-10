@@ -1,5 +1,9 @@
 summary: Checks for snap sideload install
 
+details: |
+    Check snaps installation with --dangerous, --jailmode, --devmode, and
+    deprecated options. Also validate snaps can be removed with --revision option. 
+
 # slow in autopkgtest (>1m)
 backends: [-autopkgtest]
 
@@ -10,11 +14,24 @@ environment:
     SNAP_REEXEC/reexec1: 1
 
 prepare: |
+    if [ "$SNAP_REEXEC" = "0" ] && tests.info is-snapd-from-archive; then
+        tests.exec skip-test "No need to test when the snapd pkg is from the repository and reexec is disabled" && exit 0
+    fi
+
     for snap in basic test-snapd-tools basic-desktop test-snapd-devmode snap-hooks-bad-install; do
         snap pack "$TESTSLIB"/snaps/$snap
     done
+    SNAP_MOUNT_DIR="$(os.paths snap-mount-dir)"
+    if [ "$SNAP_REEXEC" = "1" ] && [ "$SNAP_MOUNT_DIR" != "/snap" ] && [ ! -L /snap ]; then
+        # reexec expects to find the snapd snap under /snap, enable it to do so
+        # on distros using /var/lib/snapd/snap
+        ln -sf "$SNAP_MOUNT_DIR" /snap
+        tests.cleanup defer rm -f /snap
+    fi
 
 execute: |
+    tests.exec is-skipped && exit 0
+
     echo "Sideloaded snap shows status"
     expected='^basic 1.0 installed$'
     snap install --dangerous ./basic_1.0_all.snap | MATCH "$expected"
@@ -25,17 +42,19 @@ execute: |
 
     echo "Sideloaded snap executes commands"
     snap install --dangerous ./test-snapd-tools_1.0_all.snap
+
     test-snapd-tools.success
     [ "$(test-snapd-tools.echo Hello World)" = "Hello World" ]
 
     echo "Sideload desktop snap"
     SNAP_MOUNT_DIR="$(os.paths snap-mount-dir)"
     snap install --dangerous ./basic-desktop_1.0_all.snap
-    diff -u <(head -n5 /var/lib/snapd/desktop/applications/basic-desktop_echo.desktop) - <<-EOF
+    diff -u <(head -n6 /var/lib/snapd/desktop/applications/basic-desktop_echo.desktop) - <<-EOF
     	[Desktop Entry]
     	X-SnapInstanceName=basic-desktop
     	Name=Echo
     	Comment=It echos stuff
+    	X-SnapAppName=echo
     	Exec=env BAMF_DESKTOP_FILE_HINT=/var/lib/snapd/desktop/applications/basic-desktop_echo.desktop $SNAP_MOUNT_DIR/bin/basic-desktop.echo
     EOF
 
@@ -68,7 +87,7 @@ execute: |
     # TODO:UC20: fix to work on uc20 too
     # The "seed/" dir is on a FAT partition on uc20 so the permissions are
     # different here.
-    if ! os.query is-core20 && ! os.query is-core22; then
+    if os.query is-core-le 18; then
         echo "All snap blobs are 0600"
         test "$( find /var/lib/snapd/{snaps,cache,seed/snaps}/ -type f -printf '%#m\n' | sort -u | xargs )" = "0600"
     fi

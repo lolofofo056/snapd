@@ -51,11 +51,11 @@ Nested values may be retrieved via a dotted path:
     frank
 `)
 
-var longAspectGetHelp = i18n.G(`
-If the first argument passed into get is an aspect identifier matching the
-format <account-id>/<bundle>/<aspect>, get will use the aspects configuration
-API. In this case, the command returns the data retrieved from the requested
-dot-separated aspect paths.
+var longConfdbGetHelp = i18n.G(`
+If the first argument passed into get is a confdb identifier matching the
+format <account-id>/<confdb>/<view>, get will use the confdb API. In this
+case, the command returns the data retrieved from the requested dot-separated
+view paths.
 `)
 
 type cmdGet struct {
@@ -71,8 +71,8 @@ type cmdGet struct {
 }
 
 func init() {
-	if err := validateAspectFeatureFlag(); err == nil {
-		longGetHelp += longAspectGetHelp
+	if err := validateConfdbFeatureFlag(); err == nil {
+		longGetHelp += longConfdbGetHelp
 	}
 
 	addCommand("get", shortGetHelp, longGetHelp, func() flags.Commander { return &cmdGet{} },
@@ -219,7 +219,7 @@ func (x *cmdGet) outputDefault(conf map[string]interface{}, snapName string, con
 
 		// TODO: remove this conditional and the warning below
 		// after a transition period.
-		fmt.Fprintf(Stderr, i18n.G(`WARNING: The output of 'snap get' will become a list with columns - use -d or -l to force the output format.\n`))
+		fmt.Fprint(Stderr, i18n.G(`WARNING: The output of 'snap get' will become a list with columns - use -d or -l to force the output format.\n`))
 		return x.outputJson(confToPrint)
 	}
 
@@ -256,18 +256,18 @@ func (x *cmdGet) Execute(args []string) error {
 
 	var conf map[string]interface{}
 	var err error
-	if isAspectID(snapName) {
-		if err := validateAspectFeatureFlag(); err != nil {
+	if isConfdbViewID(snapName) {
+		if err := validateConfdbFeatureFlag(); err != nil {
 			return err
 		}
 
-		// first argument is an aspectID, use the aspects API
-		aspectID := snapName
-		if err := validateAspectID(aspectID); err != nil {
+		// first argument is a confdbViewID, use the confdb API
+		confdbViewID := snapName
+		if err := validateConfdbViewID(confdbViewID); err != nil {
 			return err
 		}
 
-		conf, err = x.client.AspectGet(aspectID, confKeys)
+		conf, err = x.client.ConfdbGetViaView(confdbViewID, confKeys)
 	} else {
 		conf, err = x.client.Conf(snapName, confKeys)
 	}
@@ -286,10 +286,10 @@ func (x *cmdGet) Execute(args []string) error {
 	}
 }
 
-func validateAspectFeatureFlag() error {
-	if !features.AspectsConfiguration.IsEnabled() {
-		_, confName := features.AspectsConfiguration.ConfigOption()
-		return fmt.Errorf(`aspect-based configuration is disabled: you must set '%s' to true`, confName)
+func validateConfdbFeatureFlag() error {
+	if !features.Confdbs.IsEnabled() {
+		_, confName := features.Confdbs.ConfigOption()
+		return fmt.Errorf(`the "confdbs" feature is disabled: set '%s' to true`, confName)
 	}
 	return nil
 }

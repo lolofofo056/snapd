@@ -270,7 +270,6 @@ func delayedCrossMgrInit() {
 		snapstate.AddCheckSnapCallback(checkGadgetRemodelCompatible)
 	})
 	snapstate.CanAutoRefresh = canAutoRefresh
-	snapstate.CanManageRefreshes = CanManageRefreshes
 	snapstate.IsOnMeteredConnection = netutil.IsOnMeteredConnection
 	snapstate.DeviceCtx = DeviceCtx
 	snapstate.RemodelingChange = RemodelingChange
@@ -307,15 +306,14 @@ func interfaceConnected(st *state.State, snapName, ifName string) bool {
 	return err == nil && len(conns) > 0
 }
 
-// CanManageRefreshes returns true if the device can be
-// switched to the "core.refresh.schedule=managed" mode.
+// CanManageRefreshes returns true if a snap entitled to setting the
+// refresh-schedule to managed is installed in the system and the relevant
+// interface is currently connected.
 //
 // TODO:
 //   - Move the CanManageRefreshes code into the ifstate
 //   - Look at the connections and find the connection for snapd-control
 //     with the managed attribute
-//   - Take the snap from this connection and look at the snapstate to see
-//     if that snap has a snap declaration (to ensure it comes from the store)
 func CanManageRefreshes(st *state.State) bool {
 	snapStates, err := snapstate.All(st)
 	if err != nil {
@@ -470,7 +468,7 @@ type modelSnapsForRemodel struct {
 	newSnap                string
 	newModelSnap           *asserts.ModelSnap
 	newRequiredRevision    snap.Revision
-	newModelValidationSets []snapasserts.ValidationSetKey
+	newModelValidationSets *snapasserts.ValidationSets
 }
 
 func (ms *modelSnapsForRemodel) canHaveUC18PinnedTrack() bool {
@@ -605,7 +603,7 @@ func (ro *remodelVariant) maybeSideInfoAndPathFromID(id string) *pathSideInfo {
 	return nil
 }
 
-func revisionOptionsForRemodel(channel string, revision snap.Revision, valsets []snapasserts.ValidationSetKey) *snapstate.RevisionOptions {
+func revisionOptionsForRemodel(channel string, revision snap.Revision, valsets *snapasserts.ValidationSets) *snapstate.RevisionOptions {
 	opts := &snapstate.RevisionOptions{
 		Channel:  channel,
 		Revision: revision,
@@ -753,7 +751,7 @@ func remodelEssentialSnapTasks(ctx context.Context, st *state.State, ms modelSna
 // except for the snapd snap).
 func tasksForEssentialSnap(ctx context.Context, st *state.State,
 	snapType string, current, new *asserts.Model,
-	revision snap.Revision, vSetKeys []snapasserts.ValidationSetKey, remodelVar remodelVariant,
+	revision snap.Revision, vsets *snapasserts.ValidationSets, remodelVar remodelVariant,
 	tracker snapstate.PrereqTracker, deviceCtx snapstate.DeviceContext, fromChange string,
 ) (*state.TaskSet, error) {
 	var currentSnap, newSnap string
@@ -785,7 +783,7 @@ func tasksForEssentialSnap(ctx context.Context, st *state.State,
 		newSnap:                newSnap,
 		newModelSnap:           newModelSnap,
 		newRequiredRevision:    revision,
-		newModelValidationSets: vSetKeys,
+		newModelValidationSets: vsets,
 	}
 	ts, err := remodelEssentialSnapTasks(ctx, st, ms, remodelVar, deviceCtx, fromChange, tracker)
 	if err != nil {
@@ -796,7 +794,7 @@ func tasksForEssentialSnap(ctx context.Context, st *state.State,
 
 func remodelSnapdSnapTasks(
 	st *state.State, newModel *asserts.Model, rev snap.Revision,
-	vSetKeys []snapasserts.ValidationSetKey, remodelVar remodelVariant,
+	vsets *snapasserts.ValidationSets, remodelVar remodelVariant,
 	tracker snapstate.PrereqTracker, deviceCtx snapstate.DeviceContext, fromChange string,
 ) (*state.TaskSet, error) {
 	// First check if snapd snap is installed at all (might be the case
@@ -828,7 +826,7 @@ func remodelSnapdSnapTasks(
 	}
 
 	if channelChanged || revisionChanged {
-		revOpts := revisionOptionsForRemodel(newSnapdChannel, rev, vSetKeys)
+		revOpts := revisionOptionsForRemodel(newSnapdChannel, rev, vsets)
 
 		userID := 0
 		return remodelVar.UpdateWithDeviceContext(st, "snapd", naming.WellKnownSnapID("snapd"), revOpts, userID,
@@ -885,10 +883,8 @@ func remodelTasks(ctx context.Context, st *state.State, current, new *asserts.Mo
 		return nil, err
 	}
 
-	vSetKeys := validationSets.Keys()
-
 	// First handle snapd as a special case
-	ts, err := remodelSnapdSnapTasks(st, new, snapRevisions["snapd"], vSetKeys, remodelVar, tracker, deviceCtx, fromChange)
+	ts, err := remodelSnapdSnapTasks(st, new, snapRevisions["snapd"], validationSets, remodelVar, tracker, deviceCtx, fromChange)
 	if err != nil {
 		return nil, err
 	}
@@ -908,7 +904,7 @@ func remodelTasks(ctx context.Context, st *state.State, current, new *asserts.Mo
 		}
 		ts, err := tasksForEssentialSnap(ctx, st,
 			modelSnap.SnapType, current, new,
-			snapRevisions[modelSnap.SnapName()], vSetKeys, remodelVar, tracker, deviceCtx, fromChange)
+			snapRevisions[modelSnap.SnapName()], validationSets, remodelVar, tracker, deviceCtx, fromChange)
 		if err != nil {
 			return nil, err
 		}
@@ -967,7 +963,7 @@ func remodelTasks(ctx context.Context, st *state.State, current, new *asserts.Mo
 			return nil, err
 		}
 
-		revOpts := revisionOptionsForRemodel(newModelSnapChannel, snapRevisions[modelSnap.SnapName()], vSetKeys)
+		revOpts := revisionOptionsForRemodel(newModelSnapChannel, snapRevisions[modelSnap.SnapName()], validationSets)
 
 		if needsInstall {
 			ts, err := remodelVar.InstallWithDeviceContext(ctx, st, modelSnap.SnapName(), modelSnap.ID(), revOpts,
@@ -1747,14 +1743,14 @@ func CreateRecoverySystem(st *state.State, label string, opts CreateRecoverySyst
 		}
 
 		if sn.Presence != "required" {
-			sets, _, err := valsets.CheckPresenceRequired(sn)
+			pres, err := valsets.Presence(sn)
 			if err != nil {
 				return nil, err
 			}
 
 			// snap isn't already installed, and it isn't required by model or
 			// any validation sets, so we should skip it
-			if len(sets) == 0 {
+			if pres.Presence != asserts.PresenceRequired {
 				continue
 			}
 		}
@@ -1768,15 +1764,16 @@ func CreateRecoverySystem(st *state.State, label string, opts CreateRecoverySyst
 			continue
 		}
 
-		const userID = 0
 		// TODO: this respects the passed in validation sets, but does not
 		// currently respect refresh-control style of constraining snap
 		// revisions.
-		ts, info, err := snapstateDownload(context.TODO(), st, sn.Name, dirs.SnapBlobDir, &snapstate.RevisionOptions{
+		//
+		// TODO: download somewhere other than the default snap blob dir.
+		ts, info, err := snapstateDownload(context.TODO(), st, sn.Name, nil, dirs.SnapBlobDir, snapstate.RevisionOptions{
 			Channel:        sn.DefaultChannel,
 			Revision:       rev,
-			ValidationSets: valsets.Keys(),
-		}, userID, snapstate.Flags{}, nil)
+			ValidationSets: valsets,
+		}, snapstate.Options{})
 		if err != nil {
 			return nil, err
 		}
@@ -1908,10 +1905,20 @@ func extractSnapSetupTaskIDs(tss []*state.TaskSet) ([]string, error) {
 	return taskIDs, nil
 }
 
+// OptionalContainers is used to define the snaps and components that are
+// optional in a system's model, but can be installed when installing a system.
+type OptionalContainers struct {
+	// Snaps is a list of optional snap names that can be installed.
+	Snaps []string `json:"snaps,omitempty"`
+	// Components is a mapping of snap names to lists of optional components
+	// names that can be installed.
+	Components map[string][]string `json:"components,omitempty"`
+}
+
 // InstallFinish creates a change that will finish the install for the given
 // label and volumes. This includes writing missing volume content, seting
 // up the bootloader and installing the kernel.
-func InstallFinish(st *state.State, label string, onVolumes map[string]*gadget.Volume) (*state.Change, error) {
+func InstallFinish(st *state.State, label string, onVolumes map[string]*gadget.Volume, optionalContainers *OptionalContainers) (*state.Change, error) {
 	if label == "" {
 		return nil, fmt.Errorf("cannot finish install with an empty system label")
 	}
@@ -1923,6 +1930,9 @@ func InstallFinish(st *state.State, label string, onVolumes map[string]*gadget.V
 	finishTask := st.NewTask("install-finish", fmt.Sprintf("Finish setup of run system for %q", label))
 	finishTask.Set("system-label", label)
 	finishTask.Set("on-volumes", onVolumes)
+	if optionalContainers != nil {
+		finishTask.Set("optional-install", *optionalContainers)
+	}
 	chg.AddTask(finishTask)
 
 	return chg, nil

@@ -16,14 +16,13 @@ details: |
 # memory cgroup is disabled
 systems:
   - -ubuntu-14.04-*
-  - -centos-7-*
   - -amazon-linux-2-*
   - -ubuntu-16.04-*
   - -ubuntu-core-16-*
   - -ubuntu-core-*-arm-*
 
 prepare: |
-  snap install hello-world go-example-webserver remarshal jq
+  snap install hello-world go-example-webserver
 
 execute: |
   # the bug mainly happens when we create a quota group with nothing in it,
@@ -49,12 +48,12 @@ execute: |
   # that systemd returns
   # TODO: change this to use the no unit flag when that is a thing so we can
   # compare to actual value
-  snap quota sub | yaml2json | jq -r '.current.memory' | NOMATCH "18.4EB"
-  snap quota top | yaml2json | jq -r '.current.memory' | NOMATCH "18.4EB"
+  snap quota sub | gojq --yaml-input -r '.current.memory' | NOMATCH "18.4EB"
+  snap quota top | gojq --yaml-input -r '.current.memory' | NOMATCH "18.4EB"
 
   # now trigger the bug by removing the sub21 group
   snap remove-quota sub21
 
   # usage should still be sensible
-  snap quota sub | yaml2json | jq -r '.current.memory' | NOMATCH "18.4EB"
-  snap quota top | yaml2json | jq -r '.current.memory' | NOMATCH "18.4EB"
+  snap quota sub | gojq --yaml-input -r '.current.memory' | NOMATCH "18.4EB"
+  snap quota top | gojq --yaml-input -r '.current.memory' | NOMATCH "18.4EB"

@@ -44,7 +44,7 @@ transition_to_recover_mode(){
 
     # with the external backend, we do not have the special snapd snap with
     # the first-boot run mode tweaks as created from $TESTLIB/prepare.sh's 
-    # repack_snapd_snap_with_deb_content_and_run_mode_firstboot_tweaks func
+    # build_snapd_snap_with_run_mode_firstboot_tweaks func
     # so instead to get the spread gopath and other data needed to continue
     # the test, we need to add a .ssh/rc script which copies all of the data
     # from /host/ubuntu-data in recover mode to the tmpfs /home, see
@@ -128,12 +128,8 @@ prepare_recover_mode() {
     # wait till the system seeding is finished
     snap wait system seed.loaded
 
-    # we're running in an ephemeral system and thus have to re-install snaps
-    snap install --edge jq
-    snap install test-snapd-curl --devmode --edge
-
     MATCH 'snapd_recovery_mode=recover' < /proc/cmdline
     # verify we are in recovery mode via the API
-    test-snapd-curl.curl -s --unix-socket /run/snapd.socket http://localhost/v2/system-info > system-info
-    jq -r '.result["system-mode"]' < system-info | MATCH 'recover'
+    snap debug api /v2/system-info > system-info
+    gojq -r '.result["system-mode"]' < system-info | MATCH 'recover'
 }

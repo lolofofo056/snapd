@@ -1,5 +1,9 @@
 summary: systemd units get regenerated when snapd is refreshed
 
+details: |
+  Check that updating snapd does not remount already installed
+  snaps.
+
 systems:
   # there seems to be some kernel issue with duplicated mounts in
   # /proc/*/mounts on 14.04 so it makes it more difficult to test
@@ -17,17 +21,12 @@ prepare: |
   # Download current snapd edge
   snap download --edge snapd --basename=snapd_edge
 
-  # Repack it with currently built snapd
-  unpackdir=/tmp/snapd-update-services
-  unsquashfs -no-progress -d "${unpackdir}" snapd_edge.snap
-  dpkg-deb -x "${GOHOME}"/snapd_*.deb "${unpackdir}"
-  snap pack "${unpackdir}" --filename snapd_modified.snap
-  rm -rf "${unpackdir}"
+  # Get the snapd package built from the current branch
+  CURRENT_SNAPD_SNAP="$(ls "$SNAPD_WORK_DIR"/snapd_snap/snapd_*.snap)"
+  cp "$CURRENT_SNAPD_SNAP" "$PWD/snapd_current.snap"
 
 restore: |
   rm -rf /tmp/snapd-update-services
-  rm -f snapd_edge.snap
-  rm -f snapd_modified.snap
 
 execute: |
   snap install --dangerous snapd_edge.snap
@@ -65,15 +64,19 @@ execute: |
   done
 
   # Snapd update
-  snap install --dangerous snapd_modified.snap
+  snap install --dangerous snapd_current.snap
 
   # Check the service file has been updated
   systemctl is-active snap.test-snapd-service.test-snapd-service.service
   systemctl show -p TimeoutStopUSec snap.test-snapd-service.test-snapd-service.service | MATCH 'TimeoutStopUSec=30s'
 
-  # Check the mounts have been updated
+  # Check the mounts have been updated and that we have option "nodev"
+  # XXX Actually, check that the mounts *have not* been updated
+  # because we are not reloading the mount units for installed snaps anymore,
+  # as it is not clear we should change things for running processes.
+  # But leaving the test around in case we change our mind.
   for unit in "${mount_units[@]}"; do
     what="$(systemctl show -p What "${unit}")"
     what="${what#What=}"
-    findmnt -o OPTIONS -n "${what}" | MATCH nodev
+    findmnt -o OPTIONS -n "${what}" | NOMATCH nodev
   done

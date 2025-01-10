@@ -20,8 +20,6 @@
 package builtin
 
 import (
-	"strings"
-
 	"github.com/snapcore/snapd/interfaces"
 	"github.com/snapcore/snapd/interfaces/apparmor"
 )
@@ -158,6 +156,11 @@ unix (connect, receive, send)
      type=stream
      peer=(addr="@tmp/.mozc.*"),
 
+# gcin
+# allow communicating with gcin server
+unix (connect, receive, send)
+     type=stream
+     peer=(addr="@tmp/gcin-*/socket*"),
 
 # fcitx
 # allow communicating with fcitx dbus service
@@ -251,7 +254,6 @@ dbus (send)
     interface=org.gtk.vfs.MountTracker
     member=LookupMount,
 
-###SNAP_DESKTOP_FILE_RULES###
 # Snaps are unable to use the data in mimeinfo.cache (since they can't execute
 # the returned desktop file themselves). unity messaging menu doesn't require
 # mimeinfo.cache and xdg-mime will fallback to reading the desktop files
@@ -270,6 +272,42 @@ dbus (send)
     interface=org.gtk.GLib.PACRunner
     member=Lookup
     peer=(label=unconfined),
+
+# dbusmenu
+dbus (send)
+    bus=session
+    path=/{MenuBar{,/[0-9A-F]*},com/canonical/{menu/[0-9A-F]*,dbusmenu}}
+    interface=com.canonical.dbusmenu
+    member="{LayoutUpdated,ItemsPropertiesUpdated}"
+    peer=(label="{plasmashell,unconfined}"),
+
+dbus (receive)
+    bus=session
+    path=/{MenuBar{,/[0-9A-F]*},com/canonical/{menu/[0-9A-F]*,dbusmenu}}
+    interface="{com.canonical.dbusmenu,org.freedesktop.DBus.Properties}"
+    member=Get*
+    peer=(label="{plasmashell,unconfined}"),
+
+dbus (receive)
+    bus=session
+    path=/{MenuBar{,/[0-9A-F]*},com/canonical/{menu/[0-9A-F]*,dbusmenu}}
+    interface=com.canonical.dbusmenu
+    member="{AboutTo*,Event*}"
+    peer=(label="{plasmashell,unconfined}"),
+
+dbus (receive)
+    bus=session
+    path=/{MenuBar{,/[0-9A-F]*},com/canonical/{menu/[0-9A-F]*,dbusmenu}}
+    interface=org.freedesktop.DBus.Introspectable
+    member=Introspect
+    peer=(label="{plasmashell,unconfined}"),
+
+dbus (receive)
+    bus=session
+    path=/com/canonical/dbusmenu
+    interface=org.freedesktop.DBus.Properties
+    member=Get*
+    peer=(label="{plasmashell,unconfined}"),
 
 # app-indicators
 dbus (send)
@@ -302,35 +340,35 @@ dbus (send)
     path=/{StatusNotifierWatcher,org/ayatana/NotificationItem/*}
     interface=org.kde.StatusNotifierWatcher
     member=RegisterStatusNotifierItem
-    peer=(label=unconfined),
+    peer=(label="{plasmashell,unconfined}"),
 
 dbus (send)
     bus=session
     path=/{StatusNotifierItem,org/ayatana/NotificationItem/*}
     interface=org.kde.StatusNotifierItem
     member="New{AttentionIcon,Icon,IconThemePath,OverlayIcon,Status,Title,ToolTip}"
-    peer=(name=org.freedesktop.DBus, label=unconfined),
+    peer=(name=org.freedesktop.DBus, label="{plasmashell,unconfined}"),
 
 dbus (receive)
     bus=session
     path=/{StatusNotifierItem,org/ayatana/NotificationItem/*}
     interface=org.kde.StatusNotifierItem
     member={Activate,ContextMenu,Scroll,SecondaryActivate,ProvideXdgActivationToken,XAyatanaSecondaryActivate}
-    peer=(label=unconfined),
+    peer=(label="{plasmashell,unconfined}"),
 
 dbus (send)
     bus=session
     path=/{StatusNotifierItem/menu,org/ayatana/NotificationItem/*/Menu}
     interface=com.canonical.dbusmenu
     member="{LayoutUpdated,ItemsPropertiesUpdated}"
-    peer=(name=org.freedesktop.DBus, label=unconfined),
+    peer=(name=org.freedesktop.DBus, label="{plasmashell,unconfined}"),
 
 dbus (receive)
     bus=session
     path=/{StatusNotifierItem,StatusNotifierItem/menu,org/ayatana/NotificationItem/**}
     interface={org.freedesktop.DBus.Properties,com.canonical.dbusmenu}
     member={Get*,AboutTo*,Event*}
-    peer=(label=unconfined),
+    peer=(label="{plasmashell,unconfined}"),
 
 # notifications
 dbus (send)
@@ -368,7 +406,7 @@ dbus (send)
     path=/org/ayatana/NotificationItem/*
     interface=org.kde.StatusNotifierItem
     member=XAyatanaNew*
-    peer=(name=org.freedesktop.DBus, label=unconfined),
+    peer=(name=org.freedesktop.DBus, label="{plasmashell,unconfined}"),
 `
 
 const desktopLegacyConnectedPlugSecComp = `
@@ -385,8 +423,17 @@ type desktopLegacyInterface struct {
 }
 
 func (iface *desktopLegacyInterface) AppArmorConnectedPlug(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
-	snippet := strings.Join(getDesktopFileRules(plug.Snap().DesktopPrefix()), "\n")
-	spec.AddSnippet(strings.Replace(desktopLegacyConnectedPlugAppArmor, "###SNAP_DESKTOP_FILE_RULES###", snippet+"\n", -1))
+	spec.AddSnippet(desktopLegacyConnectedPlugAppArmor)
+
+	// the DesktopFileRules can conflict with the rules in other, more privileged,
+	// interfaces (like desktop-launch), so they are added here with the minimum
+	// priority, while those other, more privileged, interfaces will add an empty
+	// string with a bigger privilege value.
+	desktopSnippet, err := getDesktopFileRules(plug.Snap())
+	if err != nil {
+		return err
+	}
+	spec.AddPrioritizedSnippet(desktopSnippet, prioritizedSnippetDesktopFileAccess, desktopLegacyAndUnity7Priority)
 
 	return nil
 }

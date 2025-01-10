@@ -1,5 +1,11 @@
 summary: Check that snap-mgmt.sh works
 
+details: |
+    Check that "snap-mgmt.sh --purge" removes all data installed by snapd.
+    This includes /var/snap, some writable parts of /var/lib/snapd.
+    /run/snapd/ns should be unmounted. Systemd and dbus configuration
+    managed in /etc should also be removed.
+
 # slow in autopkgtest (>1m)
 backends: [-autopkgtest]
 
@@ -54,6 +60,10 @@ prepare: |
 
     echo "test service is known to systemd and enabled"
     systemctl list-unit-files --type service --no-legend | MATCH 'snap.test-snapd-service\..*\.service\s+enabled'
+
+    # install a snap with some components to make sure that we properly clean
+    # those up too
+    snap install test-snap-with-components+one+two
 
     # expecting to find various files that snap installation produced
     test "$(find /etc/udev/rules.d -name '*-snap.*.rules' | wc -l)" -gt 0

@@ -31,6 +31,7 @@ import (
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/gadget"
 	"github.com/snapcore/snapd/logger"
+	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/overlord/configstate/config"
 	"github.com/snapcore/snapd/overlord/restart"
 	"github.com/snapcore/snapd/overlord/snapstate"
@@ -153,6 +154,9 @@ func (m *DeviceManager) doUpdateGadgetAssets(t *state.Task, _ *tomb.Tomb) error 
 		return nil
 	}
 
+	// Inject fault during the refresh of the gadget assets
+	osutil.MaybeInjectFault("refresh-gadget-assets")
+
 	// add kernel directories
 	currentKernelInfo, err := snapstate.CurrentInfo(st, groundDeviceCtx.Model().Kernel())
 	// XXX: switch to the normal `if err != nil { return err }` pattern
@@ -201,7 +205,13 @@ func (m *DeviceManager) doUpdateGadgetAssets(t *state.Task, _ *tomb.Tomb) error 
 		// attempt to modify modeenv inside, which implicitly is
 		// guarded by the state lock; on top of that we do not expect
 		// the update to be moving large amounts of data
-		return gadgetUpdate(model, *currentData, *updateData, snapRollbackDir, updatePolicy, updateObserver)
+		if err := gadgetUpdate(model, *currentData, *updateData, snapRollbackDir, updatePolicy, updateObserver); err != nil {
+			return err
+		}
+		if updateObserver == nil {
+			return nil
+		}
+		return observeTrustedBootAssets.UpdateBootEntry()
 	}()
 	if err != nil {
 		if err == gadget.ErrNoUpdate {
@@ -280,7 +290,7 @@ func buildAppendedKernelCommandLine(t *state.Task, gd *gadget.GadgetData, device
 	cmdlineAppend, forbidden := gadget.FilterKernelCmdline(rawCmdlineAppend, gd.Info.KernelCmdline.Allow)
 	if forbidden != "" {
 		warnMsg := fmt.Sprintf("%q is not allowed by the gadget and has been filtered out from the kernel command line", forbidden)
-		logger.Noticef(warnMsg)
+		logger.Notice(warnMsg)
 		t.Logf(warnMsg)
 	}
 

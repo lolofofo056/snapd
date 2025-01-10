@@ -43,6 +43,7 @@
 #include "../libsnap-confine-private/cleanup-funcs.h"
 #include "../libsnap-confine-private/mount-opt.h"
 #include "../libsnap-confine-private/mountinfo.h"
+#include "../libsnap-confine-private/snap-dir.h"
 #include "../libsnap-confine-private/snap.h"
 #include "../libsnap-confine-private/string-utils.h"
 #include "../libsnap-confine-private/tool.h"
@@ -111,7 +112,7 @@ static void setup_private_tmp(const char *snap_instance)
 		die("%s has unexpected ownership / permissions",
 		    SNAP_PRIVATE_TMP_ROOT_DIR);
 	}
-	// Create /tmp/snap-private-tmp/snap.$SNAP_INSTANCE_NAME/ 0700 root.root.
+	// Create /tmp/snap-private-tmp/snap.$SNAP_INSTANCE_NAME/ 0700 root:root.
 	sc_must_snprintf(base, sizeof(base), "snap.%s", snap_instance);
 	if (mkdirat(private_tmp_root_fd, base, 0700) < 0 && errno != EEXIST) {
 		die("cannot create base directory: %s", base);
@@ -129,7 +130,7 @@ static void setup_private_tmp(const char *snap_instance)
 		die("%s/%s has unexpected ownership / permissions",
 		    SNAP_PRIVATE_TMP_ROOT_DIR, base);
 	}
-	// Create /tmp/$PRIVATE/snap.$SNAP_NAME/tmp 01777 root.root Ignore EEXIST since we
+	// Create /tmp/$PRIVATE/snap.$SNAP_NAME/tmp 01777 root:root Ignore EEXIST since we
 	// want to reuse and we will open with O_NOFOLLOW, below.
 	if (mkdirat(base_dir_fd, "tmp", 01777) < 0 && errno != EEXIST) {
 		die("cannot create private tmp directory %s/tmp", base);
@@ -321,7 +322,7 @@ static void sc_initialize_ns_fstab(const char *snap_instance_name)
 		die("cannot open %s", info_path);
 	}
 	if (fchown(fd, 0, 0) < 0) {
-		die("cannot chown %s to root.root", info_path);
+		die("cannot chown %s to root:root", info_path);
 	}
 	// The stream now owns the file descriptor.
 	stream = fdopen(fd, "w");
@@ -541,7 +542,7 @@ static void sc_bootstrap_mount_namespace(const struct sc_mount_config *config)
 		sc_initialize_ns_fstab(config->snap_instance);
 		// Create a tmpfs on scratch_dir; we'll them mount all the root
 		// directories of the base snap onto it.
-		sc_do_mount("none", scratch_dir, "tmpfs", 0, NULL);
+		sc_do_mount("none", scratch_dir, "tmpfs", 0, "uid=0,gid=0");
 		sc_replicate_base_rootfs(scratch_dir, config->rootfs_dir,
 					 config->mounts);
 	} else {
@@ -712,38 +713,41 @@ static void sc_bootstrap_mount_namespace(const struct sc_mount_config *config)
 	// already contains the correct view of the mounted snaps.
 	if (config->normal_mode) {
 		sc_must_snprintf(dst, sizeof dst, "%s/snap", scratch_dir);
-		sc_do_mount(SNAP_MOUNT_DIR, dst, NULL, MS_BIND | MS_REC, NULL);
+		sc_do_mount(sc_snap_mount_dir(NULL), dst, NULL,
+			    MS_BIND | MS_REC, NULL);
 		sc_do_mount("none", dst, NULL, MS_REC | MS_SLAVE, NULL);
 	}
 	// Ensure that hostfs exists and is group-owned by root. We may have (now
 	// or earlier) created the directory as the user who first ran a snap on a
 	// given system and the group identity of that user is visible on disk.
-	// This was LP:#1665004
-	struct stat sb;
-	if (stat(SC_HOSTFS_DIR, &sb) < 0) {
-		if (errno == ENOENT) {
-			// Create the hostfs directory if one is missing. This directory is a part
-			// of packaging now so perhaps this code can be removed later.
-			// Note: we use 0000 as permissions here, to avoid the risk that
-			// the user manages to fiddle with the newly created directory
-			// before we have the chance to chown it to root:root. We are
-			// setting the usual 0755 permissions just after the chown below.
-			if (mkdir(SC_HOSTFS_DIR, 0000) < 0) {
-				die("cannot perform operation: mkdir %s",
-				    SC_HOSTFS_DIR);
-			}
-			if (chown(SC_HOSTFS_DIR, 0, 0) < 0) {
-				die("cannot set root ownership on %s directory",
-				    SC_HOSTFS_DIR);
-			}
-			if (chmod(SC_HOSTFS_DIR, 0755) < 0) {
-				die("cannot set 0755 permissions on %s directory", SC_HOSTFS_DIR);
+	// This was LP:#1665004. We do this by trying to create the hostfs directory
+	// if one is missing. This directory is a part of packaging now so perhaps
+	// this code can be removed later. Note: we use 0000 as permissions here, to
+	// avoid the risk that the user manages to fiddle with the newly created
+	// directory before we have the chance to chown it to root:root. We are
+	// setting the usual 0755 permissions just after the chown below.
+	if (mkdir(SC_HOSTFS_DIR, 0000) < 0) {
+		if (errno == EEXIST) {
+			// The directory exists, verify its ownership.
+			struct stat sb;
+			if (stat(SC_HOSTFS_DIR, &sb) < 0) {
+				die("cannot stat %s", SC_HOSTFS_DIR);
+			} else if (sb.st_uid != 0 || sb.st_gid != 0) {
+				die("%s is not owned by root", SC_HOSTFS_DIR);
 			}
 		} else {
-			die("cannot stat %s", SC_HOSTFS_DIR);
+			die("cannot perform operation: mkdir %s",
+			    SC_HOSTFS_DIR);
 		}
-	} else if (sb.st_uid != 0 || sb.st_gid != 0) {
-		die("%s is not owned by root", SC_HOSTFS_DIR);
+	} else {
+		if (chown(SC_HOSTFS_DIR, 0, 0) < 0) {
+			die("cannot set root ownership on %s directory",
+			    SC_HOSTFS_DIR);
+		}
+		if (chmod(SC_HOSTFS_DIR, 0755) < 0) {
+			die("cannot set 0755 permissions on %s directory",
+			    SC_HOSTFS_DIR);
+		}
 	}
 	// Make the upcoming "put_old" directory for pivot_root private so that
 	// mount events don't propagate to any peer group. In practice pivot root
@@ -1058,16 +1062,16 @@ static bool is_mounted_with_shared_option(const char *dir)
 void sc_ensure_shared_snap_mount(void)
 {
 	if (!is_mounted_with_shared_option("/")
-	    && !is_mounted_with_shared_option(SNAP_MOUNT_DIR)) {
+	    && !is_mounted_with_shared_option(sc_snap_mount_dir(NULL))) {
 		// TODO: We could be more aggressive and refuse to function but since
 		// we have no data on actual environments that happen to limp along in
 		// this configuration let's not do that yet.  This code should be
 		// removed once we have a measurement and feedback mechanism that lets
 		// us decide based on measurable data.
-		sc_do_mount(SNAP_MOUNT_DIR, SNAP_MOUNT_DIR, "none",
-			    MS_BIND | MS_REC, NULL);
-		sc_do_mount("none", SNAP_MOUNT_DIR, NULL, MS_SHARED | MS_REC,
-			    NULL);
+		sc_do_mount(sc_snap_mount_dir(NULL), sc_snap_mount_dir(NULL),
+			    "none", MS_BIND | MS_REC, NULL);
+		sc_do_mount("none", sc_snap_mount_dir(NULL), NULL,
+			    MS_SHARED | MS_REC, NULL);
 	}
 }
 
@@ -1097,7 +1101,7 @@ void sc_setup_user_mounts(struct sc_apparmor *apparmor, int snap_update_ns_fd,
 
 void sc_ensure_snap_dir_shared_mounts(void)
 {
-	const char *dirs[] = { SNAP_MOUNT_DIR, "/var/snap", NULL };
+	const char *dirs[] = { sc_snap_mount_dir(NULL), "/var/snap", NULL };
 	for (int i = 0; dirs[i] != NULL; i++) {
 		const char *dir = dirs[i];
 		if (!is_mounted_with_shared_option(dir)) {
@@ -1124,16 +1128,17 @@ void sc_setup_parallel_instance_classic_mounts(const char *snap_name,
 	char src[PATH_MAX] = { 0 };
 	char dst[PATH_MAX] = { 0 };
 
-	const char *dirs[] = { SNAP_MOUNT_DIR, "/var/snap", NULL };
+	const char *dirs[] = { sc_snap_mount_dir(NULL), "/var/snap", NULL };
 	for (int i = 0; dirs[i] != NULL; i++) {
 		const char *dir = dirs[i];
 		sc_do_mount("none", dir, NULL, MS_REC | MS_SLAVE, NULL);
 	}
 
 	/* Mount SNAP_MOUNT_DIR/<snap>_<key> on SNAP_MOUNT_DIR/<snap> */
-	sc_must_snprintf(src, sizeof src, "%s/%s", SNAP_MOUNT_DIR,
+	sc_must_snprintf(src, sizeof src, "%s/%s", sc_snap_mount_dir(NULL),
 			 snap_instance_name);
-	sc_must_snprintf(dst, sizeof dst, "%s/%s", SNAP_MOUNT_DIR, snap_name);
+	sc_must_snprintf(dst, sizeof dst, "%s/%s", sc_snap_mount_dir(NULL),
+			 snap_name);
 	sc_do_mount(src, dst, "none", MS_BIND | MS_REC, NULL);
 
 	/* Mount /var/snap/<snap>_<key> on /var/snap/<snap> */

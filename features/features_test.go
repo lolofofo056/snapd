@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2018 Canonical Ltd
+ * Copyright (C) 2018-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -29,6 +29,7 @@ import (
 	"github.com/snapcore/snapd/features"
 	"github.com/snapcore/snapd/overlord/configstate/config"
 	"github.com/snapcore/snapd/overlord/state"
+	"github.com/snapcore/snapd/systemd"
 )
 
 func Test(t *testing.T) { TestingT(t) }
@@ -47,7 +48,6 @@ func (*featureSuite) TestName(c *C) {
 	check(features.Layouts, "layouts")
 	check(features.ParallelInstances, "parallel-instances")
 	check(features.Hotplug, "hotplug")
-	check(features.SnapdSnap, "snapd-snap")
 	check(features.PerUserMountNamespace, "per-user-mount-namespace")
 	check(features.RefreshAppAwareness, "refresh-app-awareness")
 	check(features.ClassicPreservesXdgRuntimeDir, "classic-preserves-xdg-runtime-dir")
@@ -62,7 +62,9 @@ func (*featureSuite) TestName(c *C) {
 	check(features.GateAutoRefreshHook, "gate-auto-refresh-hook")
 	check(features.QuotaGroups, "quota-groups")
 	check(features.RefreshAppAwarenessUX, "refresh-app-awareness-ux")
-	check(features.AspectsConfiguration, "aspects-configuration")
+	check(features.Confdbs, "confdbs")
+	check(features.ConfdbControl, "confdb-control")
+	check(features.AppArmorPrompting, "apparmor-prompting")
 
 	c.Check(tested, Equals, features.NumberOfFeatures())
 	c.Check(func() { _ = features.SnapdFeature(1000).String() }, PanicMatches, "unknown feature flag code 1000")
@@ -86,8 +88,6 @@ func (*featureSuite) TestIsExported(c *C) {
 
 	check(features.Layouts, false)
 	check(features.Hotplug, false)
-	check(features.SnapdSnap, false)
-
 	check(features.ParallelInstances, true)
 	check(features.PerUserMountNamespace, true)
 	check(features.RefreshAppAwareness, true)
@@ -101,11 +101,89 @@ func (*featureSuite) TestIsExported(c *C) {
 	check(features.CheckDiskSpaceRefresh, false)
 	check(features.CheckDiskSpaceRemove, false)
 	check(features.GateAutoRefreshHook, false)
-	check(features.RefreshAppAwarenessUX, true)
-	check(features.AspectsConfiguration, true)
 	check(features.QuotaGroups, false)
+	check(features.RefreshAppAwarenessUX, true)
+	check(features.Confdbs, true)
+	check(features.ConfdbControl, false)
+	check(features.AppArmorPrompting, true)
 
 	c.Check(tested, Equals, features.NumberOfFeatures())
+}
+
+func (*featureSuite) TestQuotaGroupsSupportedCallback(c *C) {
+	callback, exists := features.FeaturesSupportedCallbacks[features.QuotaGroups]
+	c.Assert(exists, Equals, true)
+
+	restore1 := systemd.MockSystemdVersion(229, nil)
+	defer restore1()
+	supported, reason := callback()
+	c.Check(supported, Equals, false)
+	c.Check(reason, Matches, "systemd version 229 is too old.*")
+
+	restore2 := systemd.MockSystemdVersion(230, nil)
+	defer restore2()
+	supported, reason = callback()
+	c.Check(supported, Equals, true)
+	c.Check(reason, Equals, "")
+}
+
+func (*featureSuite) TestUserDaemonsSupportedCallback(c *C) {
+	callback, exists := features.FeaturesSupportedCallbacks[features.UserDaemons]
+	c.Assert(exists, Equals, true)
+
+	restore1 := features.MockReleaseSystemctlSupportsUserUnits(func() bool { return false })
+	defer restore1()
+	supported, reason := callback()
+	c.Check(supported, Equals, false)
+	c.Check(reason, Matches, "user session daemons are not supported.*")
+
+	restore2 := features.MockReleaseSystemctlSupportsUserUnits(func() bool { return true })
+	defer restore2()
+	supported, reason = callback()
+	c.Check(supported, Equals, true)
+	c.Check(reason, Equals, "")
+}
+
+func (*featureSuite) TestIsSupported(c *C) {
+	fakeFeature := features.SnapdFeature(len(features.KnownFeatures()))
+
+	// Check that feature without callback always returns true
+	is, why := fakeFeature.IsSupported()
+	c.Check(is, Equals, true)
+	c.Check(why, Equals, "")
+
+	var fakeSupported bool
+	var fakeReason string
+	restore := features.MockFeaturesSupportedCallbacks(map[features.SnapdFeature]func() (bool, string){
+		fakeFeature: func() (bool, string) { return fakeSupported, fakeReason },
+	})
+	defer restore()
+
+	fakeSupported = true
+	fakeReason = ""
+	is, why = fakeFeature.IsSupported()
+	c.Check(is, Equals, true)
+	c.Check(why, Equals, "")
+
+	// Check that a non-empty reason is ignored
+	fakeSupported = true
+	fakeReason = "foo"
+	is, why = fakeFeature.IsSupported()
+	c.Check(is, Equals, true)
+	c.Check(why, Equals, "")
+
+	fakeSupported = false
+	fakeReason = "foo"
+	is, why = fakeFeature.IsSupported()
+	c.Check(is, Equals, false)
+	c.Check(why, Equals, "foo")
+
+	// Check that unsupported value does not require reason
+	fakeSupported = false
+	fakeReason = ""
+	is, why = fakeFeature.IsSupported()
+	c.Check(is, Equals, false)
+	c.Check(why, Equals, "")
 }
 
 func (*featureSuite) TestIsEnabled(c *C) {
@@ -137,7 +215,6 @@ func (*featureSuite) TestIsEnabledWhenUnset(c *C) {
 	check(features.Layouts, true)
 	check(features.ParallelInstances, false)
 	check(features.Hotplug, false)
-	check(features.SnapdSnap, false)
 	check(features.PerUserMountNamespace, false)
 	check(features.RefreshAppAwareness, true)
 	check(features.ClassicPreservesXdgRuntimeDir, true)
@@ -150,9 +227,11 @@ func (*featureSuite) TestIsEnabledWhenUnset(c *C) {
 	check(features.CheckDiskSpaceRefresh, false)
 	check(features.CheckDiskSpaceRemove, false)
 	check(features.GateAutoRefreshHook, false)
-	check(features.RefreshAppAwarenessUX, false)
-	check(features.AspectsConfiguration, false)
 	check(features.QuotaGroups, false)
+	check(features.RefreshAppAwarenessUX, false)
+	check(features.Confdbs, false)
+	check(features.AppArmorPrompting, false)
+	check(features.ConfdbControl, false)
 
 	c.Check(tested, Equals, features.NumberOfFeatures())
 }
@@ -165,9 +244,10 @@ func (*featureSuite) TestControlFile(c *C) {
 	c.Check(features.HiddenSnapDataHomeDir.ControlFile(), Equals, "/var/lib/snapd/features/hidden-snap-folder")
 	c.Check(features.MoveSnapHomeDir.ControlFile(), Equals, "/var/lib/snapd/features/move-snap-home-dir")
 	c.Check(features.RefreshAppAwarenessUX.ControlFile(), Equals, "/var/lib/snapd/features/refresh-app-awareness-ux")
+	c.Check(features.Confdbs.ControlFile(), Equals, "/var/lib/snapd/features/confdbs")
+	c.Check(features.AppArmorPrompting.ControlFile(), Equals, "/var/lib/snapd/features/apparmor-prompting")
 	// Features that are not exported don't have a control file.
 	c.Check(features.Layouts.ControlFile, PanicMatches, `cannot compute the control file of feature "layouts" because that feature is not exported`)
-	c.Check(features.AspectsConfiguration.ControlFile(), Equals, "/var/lib/snapd/features/aspects-configuration")
 }
 
 func (*featureSuite) TestConfigOptionLayouts(c *C) {
@@ -215,4 +295,95 @@ func (s *featureSuite) TestFlag(c *C) {
 	c.Assert(tr.Set("core", "experimental.layouts", "banana"), IsNil)
 	_, err = features.Flag(tr, features.Layouts)
 	c.Assert(err, ErrorMatches, `layouts can only be set to 'true' or 'false', got "banana"`)
+}
+
+func (s *featureSuite) TestAll(c *C) {
+	st := state.New(nil)
+	st.Lock()
+	defer st.Unlock()
+	tr := config.NewTransaction(st)
+
+	fakeFeature := features.SnapdFeature(features.NumberOfFeatures())
+	fakeFeatureUnsupported := features.SnapdFeature(features.NumberOfFeatures() + 1)
+	fakeFeatureUnsetNoCallback := features.SnapdFeature(features.NumberOfFeatures() + 2)
+	fakeFeatureDisabled := features.SnapdFeature(features.NumberOfFeatures() + 3)
+	fakeFeatureBadFlag := features.SnapdFeature(features.NumberOfFeatures() + 4)
+	fakeFeatureUnsupportedUnset := features.SnapdFeature(features.NumberOfFeatures() + 5)
+
+	restore1 := features.MockKnownFeaturesImpl(func() []features.SnapdFeature {
+		return []features.SnapdFeature{fakeFeature, fakeFeatureUnsupported, fakeFeatureUnsetNoCallback, fakeFeatureDisabled, fakeFeatureBadFlag, fakeFeatureUnsupportedUnset}
+	})
+	defer restore1()
+
+	restore2 := features.MockFeatureNames(map[features.SnapdFeature]string{
+		fakeFeature:                 "fake-feature",
+		fakeFeatureUnsupported:      "fake-feature-unsupported",
+		fakeFeatureUnsetNoCallback:  "fake-feature-disabled",
+		fakeFeatureDisabled:         "fake-feature-set-disabled",
+		fakeFeatureBadFlag:          "fake-feature-bad-flag",
+		fakeFeatureUnsupportedUnset: "fake-feature-unsupported-unset",
+	})
+	defer restore2()
+
+	unsupportedReason := "foo"
+	restore3 := features.MockFeaturesSupportedCallbacks(map[features.SnapdFeature]func() (bool, string){
+		fakeFeature:                 func() (bool, string) { return true, unsupportedReason },
+		fakeFeatureUnsupported:      func() (bool, string) { return false, unsupportedReason },
+		fakeFeatureDisabled:         func() (bool, string) { return true, unsupportedReason },
+		fakeFeatureBadFlag:          func() (bool, string) { return true, unsupportedReason },
+		fakeFeatureUnsupportedUnset: func() (bool, string) { return false, unsupportedReason },
+	})
+	defer restore3()
+
+	// Enable the two enabled fake features
+	c.Assert(tr.Set("core", "experimental."+fakeFeature.String(), "true"), IsNil)
+	c.Assert(tr.Set("core", "experimental."+fakeFeatureUnsupported.String(), "true"), IsNil)
+	c.Assert(tr.Set("core", "experimental."+fakeFeatureDisabled.String(), "false"), IsNil)
+	c.Assert(tr.Set("core", "experimental."+fakeFeatureBadFlag.String(), "banana"), IsNil)
+
+	allFeaturesInfo := features.All(tr)
+
+	c.Assert(len(allFeaturesInfo), Equals, 5)
+
+	// Feature flags are included even if value unset
+	fakeFeatureInfo, exists := allFeaturesInfo[fakeFeatureUnsetNoCallback.String()]
+	c.Assert(exists, Equals, true)
+	// Feature flags are supported even if no callback defined.
+	c.Check(fakeFeatureInfo.Supported, Equals, true)
+	// Feature flags have a value even if unset.
+	c.Check(fakeFeatureInfo.Enabled, Equals, false)
+
+	// A feature can be both unset and unsupported
+	fakeFeatureInfo, exists = allFeaturesInfo[fakeFeatureUnsupportedUnset.String()]
+	c.Assert(exists, Equals, true)
+	c.Check(fakeFeatureInfo.Supported, Equals, false)
+	c.Check(fakeFeatureInfo.Enabled, Equals, false)
+
+	// Feature flags with defined supported callbacks work correctly.
+
+	// Feature flags can be enabled but unsupported.
+	fakeFeatureInfo, exists = allFeaturesInfo[fakeFeatureUnsupported.String()]
+	c.Assert(exists, Equals, true)
+	// Callbacks which return false result in Supported: false
+	c.Check(fakeFeatureInfo.Supported, Equals, false)
+	c.Check(fakeFeatureInfo.UnsupportedReason, Matches, unsupportedReason)
+	c.Check(fakeFeatureInfo.Enabled, Equals, true)
+
+	// Callbacks which return true result in Supported: true
+	fakeFeatureInfo, exists = allFeaturesInfo[fakeFeature.String()]
+	c.Assert(exists, Equals, true)
+	c.Check(fakeFeatureInfo.Supported, Equals, true)
+	c.Check(fakeFeatureInfo.UnsupportedReason, Equals, "")
+	c.Check(fakeFeatureInfo.Enabled, Equals, true)
+
+	// Feature flags can be disabled but supported.
+	fakeFeatureInfo, exists = allFeaturesInfo[fakeFeatureDisabled.String()]
+	c.Assert(exists, Equals, true)
+	c.Check(fakeFeatureInfo.Supported, Equals, true)
+	c.Check(fakeFeatureInfo.UnsupportedReason, Equals, "")
+	c.Check(fakeFeatureInfo.Enabled, Equals, false)
+
+	// Feature flags with bad values are omitted, even if supported.
+	fakeFeatureInfo, exists = allFeaturesInfo[fakeFeatureBadFlag.String()]
+	c.Assert(exists, Equals, false)
 }

@@ -4,8 +4,9 @@ details: |
   The test verifies that snap-device-helper correctly modifies the cgroups
 
 systems:
-  #TODO: bpftool is not available on core22 and tests.device-cgroup needs it for cgroups v2
+  #TODO: bpftool is not available on core22+ and tests.device-cgroup needs it for cgroups v2
   - -ubuntu-core-22-*
+  - -ubuntu-core-24-*
 
 environment:
     # note that /dev/full has well known major:minor which is 1:7
@@ -23,7 +24,14 @@ debug: |
 execute: |
     #shellcheck source=tests/lib/systems.sh
     . "$TESTSLIB/systems.sh"
+
+    # In essence we need to use the helper from snap, as it's the only location
+    # which is now carrying the potentially modified code (since snapd package
+    # is installed from distribution repos and so it contains older, already merged code).
     libexecdir=$(os.paths libexec-dir)
+    if tests.info is-snapd-from-archive; then
+        libexecdir="/snap/snapd/current$libexecdir"
+    fi
 
     echo "Given a snap is installed"
     "$TESTSTOOLS"/snaps-state install-local test-strict-cgroup-helper
@@ -54,7 +62,7 @@ execute: |
         # ensure the right apparmor_parser is used
         APPARMOR_PARSER="apparmor_parser"
         if snap debug sandbox-features --required apparmor:parser:snapd-internal; then
-          APPARMOR_PARSER="/snap/snapd/current/usr/lib/snapd/apparmor_parser --config-file /snap/snapd/current/usr/lib/snapd/apparmor/parser.conf -b /snap/snapd/current/usr/lib/snapd/apparmor.d --policy-features /snap/snapd/current/usr/lib/snapd/apparmor.d/abi/3.0"
+          APPARMOR_PARSER="/snap/snapd/current/usr/lib/snapd/apparmor_parser --config-file /snap/snapd/current/usr/lib/snapd/apparmor/parser.conf -b /snap/snapd/current/usr/lib/snapd/apparmor.d --policy-features /snap/snapd/current/usr/lib/snapd/apparmor.d/abi/4.0"
         fi
         $APPARMOR_PARSER -r /var/lib/snapd/apparmor/profiles/snap.test-strict-cgroup-helper.sh
     fi

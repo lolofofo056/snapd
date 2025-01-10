@@ -1,5 +1,10 @@
 summary: Check that try command works
 
+details: |
+    The snap try command can be used to install a snap without creating the
+    squashfs file, which for large snaps is very costly. The test shows that
+    snap try works for snaps using strict, devmode and classic confinement.
+
 # s390x does not have /dev/kmsg
 # ubuntu-14.04: systemd-run not supported
 systems: [-ubuntu-core-*, -fedora-*, -opensuse-*, -arch-*, -ubuntu-*-s390x, -centos-*, -ubuntu-14.04*]
@@ -10,15 +15,21 @@ environment:
     SERVICE_NAME: "test-service"
 
 prepare: |
+    tests.exec is-skipped && exit 0
+
     # shellcheck source=tests/lib/network.sh
     . "$TESTSLIB"/network.sh
     make_network_service "$SERVICE_NAME" "$PORT"
 
 restore: |
+    tests.exec is-skipped && exit 0
+
     systemctl stop "$SERVICE_NAME"
     rm -f "$READABLE_FILE"
 
 execute: |
+    tests.exec is-skipped && exit 0
+
     echo "Given a buildable snap in a known directory"
     echo "When try is executed on that directory"
     snap try "$TESTSLIB"/snaps/test-snapd-tools

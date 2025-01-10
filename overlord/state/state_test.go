@@ -833,7 +833,10 @@ func (ss *stateSuite) TestPrune(c *C) {
 	state.MockTaskTimes(t5, now.Add(-pruneWait), now.Add(-pruneWait))
 
 	// two warnings, one expired
-	st.AddWarning("hello", now, never, time.Nanosecond, state.DefaultRepeatAfter)
+	st.AddWarning("hello", &state.AddWarningOptions{
+		Time:        now.Add(-state.DefaultWarningExpireAfter),
+		RepeatAfter: state.DefaultWarningRepeatAfter,
+	})
 	st.Warnf("hello again")
 
 	past := time.Now().AddDate(-1, 0, 0)
@@ -1129,12 +1132,13 @@ func (ss *stateSuite) TestTaskChangedHandler(c *C) {
 	defer st.Unlock()
 
 	var taskObservedChanges []taskAndStatus
-	oId := st.AddTaskStatusChangedHandler(func(t *state.Task, old, new state.Status) {
+	oId := st.AddTaskStatusChangedHandler(func(t *state.Task, old, new state.Status) bool {
 		taskObservedChanges = append(taskObservedChanges, taskAndStatus{
 			t:   t,
 			old: old,
 			new: new,
 		})
+		return false
 	})
 
 	t1 := st.NewTask("foo", "...")
@@ -1164,6 +1168,37 @@ func (ss *stateSuite) TestTaskChangedHandler(c *C) {
 			t:   t1,
 			old: state.DoingStatus,
 			new: state.DoneStatus,
+		},
+	})
+}
+
+func (ss *stateSuite) TestTaskChangedHandlerCanRemoveItself(c *C) {
+	st := state.New(nil)
+	st.Lock()
+	defer st.Unlock()
+
+	var transitions []taskAndStatus
+	st.AddTaskStatusChangedHandler(func(t *state.Task, old, new state.Status) bool {
+		transitions = append(transitions, taskAndStatus{t: t, old: old, new: new})
+		return new == state.ErrorStatus
+	})
+
+	t1 := st.NewTask("foo", "...")
+	t1.SetStatus(state.DoingStatus)
+	// should remove handler after this transition
+	t1.SetStatus(state.ErrorStatus)
+	t1.SetStatus(state.UndoneStatus)
+
+	c.Check(transitions, DeepEquals, []taskAndStatus{
+		{
+			t:   t1,
+			old: state.DefaultStatus,
+			new: state.DoingStatus,
+		},
+		{
+			t:   t1,
+			old: state.DoingStatus,
+			new: state.ErrorStatus,
 		},
 	})
 }

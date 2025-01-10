@@ -82,11 +82,11 @@ AS_IF([test "x$with_unit_tests" = "xyes"], [
 
 # Check if apparmor userspace library is available.
 AS_IF([test "x$enable_apparmor" = "xyes"], [
-    # Expect AppArmor3 when building as a snap under snapcraft
+    # Expect AppArmor4 when building as a snap under snapcraft
     AS_IF([test "x$SNAPCRAFT_PROJECT_NAME" = "xsnapd"], [
-        PKG_CHECK_MODULES([APPARMOR3], [libapparmor = 3.0.8], [
-            AC_DEFINE([HAVE_APPARMOR], [1], [Build with apparmor3 support])], [
-            AC_MSG_ERROR([unable to find apparmor3 for snap build of snapd])])], [
+        PKG_CHECK_MODULES([APPARMOR4], [libapparmor = 4.0.2], [
+            AC_DEFINE([HAVE_APPARMOR], [1], [Build with apparmor4 support])], [
+            AC_MSG_ERROR([unable to find apparmor4 for snap build of snapd])])], [
         PKG_CHECK_MODULES([APPARMOR], [libapparmor], [
       AC_DEFINE([HAVE_APPARMOR], [1], [Build with apparmor support])])])
 ], [
@@ -153,14 +153,15 @@ AS_IF([test "x$enable_merged_usr" = "xyes"], [
     AC_DEFINE([MERGED_USR], [1],
         [Support for merged /usr directory])])
 
-SNAP_MOUNT_DIR="/snap"
+# Keep the --with-snap-mount-dir= option name the same for ease of transition.
+STATIC_SNAP_MOUNT_DIR="/snap"
 AC_ARG_WITH([snap-mount-dir],
-    AS_HELP_STRING([--with-snap-mount-dir=DIR], [Use an alternate snap mount directory]),
-    [SNAP_MOUNT_DIR="$withval"])
-AC_SUBST(SNAP_MOUNT_DIR)
-AC_DEFINE_UNQUOTED([SNAP_MOUNT_DIR], "${SNAP_MOUNT_DIR}", [Location of the snap mount points])
+    AS_HELP_STRING([--with-snap-mount-dir=DIR], [Use an alternate static snap mount directory]),
+    [STATIC_SNAP_MOUNT_DIR="$withval"])
+AC_SUBST(STATIC_SNAP_MOUNT_DIR)
+AC_DEFINE_UNQUOTED([STATIC_SNAP_MOUNT_DIR], "${STATIC_SNAP_MOUNT_DIR}", [Static location of the snap mount points])
 
-SNAP_MOUNT_DIR_SYSTEMD_UNIT="$(systemd-escape -p "$SNAP_MOUNT_DIR")"
+SNAP_MOUNT_DIR_SYSTEMD_UNIT="$(systemd-escape -p "$STATIC_SNAP_MOUNT_DIR")"
 AC_SUBST([SNAP_MOUNT_DIR_SYSTEMD_UNIT])
 AC_DEFINE_UNQUOTED([SNAP_MOUNT_DIR_SYSTEMD_UNIT], "${SNAP_MOUNT_DIR_SYSTEMD_UNIT}", [Systemd unit name for snap mount points location])
 
@@ -219,13 +220,27 @@ AC_ARG_WITH([host-arch-32bit-triplet],
 AC_SUBST(HOST_ARCH32_TRIPLET)
 AC_DEFINE_UNQUOTED([HOST_ARCH32_TRIPLET], "${HOST_ARCH32_TRIPLET}", [Arch triplet for 32bit libraries])
 
-SYSTEMD_SYSTEM_GENERATOR_DIR="$($PKG_CONFIG --variable=systemdsystemgeneratordir systemd)"
-AS_IF([test "x$SYSTEMD_SYSTEM_GENERATOR_DIR" = "x"], [SYSTEMD_SYSTEM_GENERATOR_DIR=/lib/systemd/system-generators])
-AC_SUBST(SYSTEMD_SYSTEM_GENERATOR_DIR)
+dnl FIXME: Use PKG_CHECK_VAR when we have dropped Trusty (14.04)
+AC_ARG_VAR([SYSTEMD_SYSTEM_GENERATOR_DIR], [value for systemdsystemgeneratordir (overriding pkg-config)])
+if test -z "${SYSTEMD_SYSTEM_GENERATOR_DIR}"; then
+  SYSTEMD_SYSTEM_GENERATOR_DIR="$($PKG_CONFIG --variable=systemdsystemgeneratordir systemd)"
+  if test -z "${SYSTEMD_SYSTEM_GENERATOR_DIR}"; then
+    SYSTEMD_SYSTEM_GENERATOR_DIR="${prefix}/lib/systemd/system-generators"
+  fi
+fi
 
-# FIXME: get this via something like pkgconf once it is defined there
-SYSTEMD_SYSTEM_ENV_GENERATOR_DIR="${prefix}/lib/systemd/system-environment-generators"
-AC_SUBST(SYSTEMD_SYSTEM_ENV_GENERATOR_DIR)
+dnl FIXME: get this via something like pkgconf once it is defined there
+dnl FIXME: Use PKG_CHECK_VAR when we have dropped Trusty (14.04)
+AC_ARG_VAR([SYSTEMD_PREFIX], [value for systemd prefix (overriding pkg-config)])
+if test -z "${SYSTEMD_PREFIX}"; then
+  SYSTEMD_PREFIX="$($PKG_CONFIG --variable=prefix systemd)"
+fi
+if test -n "${SYSTEMD_PREFIX}"; then
+  SYSTEMD_SYSTEM_ENV_GENERATOR_DIR="${SYSTEMD_PREFIX}/lib/systemd/system-environment-generators"
+else
+  SYSTEMD_SYSTEM_ENV_GENERATOR_DIR="${prefix}/lib/systemd/system-environment-generators"
+fi
+AC_SUBST([SYSTEMD_SYSTEM_ENV_GENERATOR_DIR])
 
 AC_ARG_ENABLE([bpf],
 AS_HELP_STRING([--enable-bpf], [Enable BPF support]),
@@ -274,6 +289,20 @@ struct { const char* a; int b; } b[] = { {.a = ""}, {} };
   CFLAGS="${save_CFLAGS}"
 ])
 
+AC_ARG_ENABLE([host-binaries],
+    AS_HELP_STRING([--enable-host-binaries], [Build binaries needed on host (not in snap)]),
+    [case "$enableval" in
+        yes)
+          build_host_binaries=yes
+          ;;
+        no)
+          build_host_binaries=no
+          ;;
+        *) AC_MSG_ERROR([bad value ${enableval} for --enable-host-binaries])
+    esac],
+    [build_host_binaries=yes])
+AM_CONDITIONAL([BUILD_HOST_BINARIES], [test "x$build_host_binaries" = "xyes"])
+
 AX_APPEND_COMPILE_FLAGS([ dnl
   -Wall dnl
   -Wextra dnl
@@ -289,6 +318,16 @@ AS_IF([test "x$snapd_cv_missing_field_initializers_works" = "xno"], [
 AS_IF([test "x$with_unit_tests" = "xyes"], [
   AX_APPEND_COMPILE_FLAGS([-Werror], [CHECK_CFLAGS])
 ])
+
+AC_ARG_WITH([apparmorconfigdir],
+    [AS_HELP_STRING([--with-apparmorconfigdir], [path to apparmor.d configuration directory])], [
+  APPARMOR_SYSCONFIG="${withval}"
+], [
+  APPARMOR_SYSCONFIG="${sysconfdir}/apparmor.d"
+])
+AC_SUBST([APPARMOR_SYSCONFIG])
+
+AC_SUBST([snapdstatedir], "${localstatedir}/lib/snapd")
 
 AC_CONFIG_FILES([Makefile])
 AC_OUTPUT

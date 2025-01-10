@@ -59,13 +59,21 @@ create_test_user(){
     echo >> /etc/sudoers
     echo 'test ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
 
-    chown test.test -R "$SPREAD_PATH"
-    chown test.test "$SPREAD_PATH/../"
+    chown test:test -R "$SPREAD_PATH"
+    chown test:test "$SPREAD_PATH/../"
 }
 
 build_deb(){
+    newver="$(dpkg-parsechangelog --show-field Version)"
+
+    case "$SPREAD_SYSTEM" in
+        ubuntu-fips-*)
+            newver="${newver}+fips"
+            FIPS_BUILD_OPTION=fips
+            ;;
+    esac
     # Use fake version to ensure we are always bigger than anything else
-    dch --newversion "1337.$(dpkg-parsechangelog --show-field Version)" "testing build"
+    dch --newversion "1337.$newver" "testing build"
 
     if os.query is-debian sid; then
         # ensure we really build without vendored packages
@@ -73,7 +81,7 @@ build_deb(){
     fi
 
     unshare -n -- \
-            su -l -c "cd $PWD && DEB_BUILD_OPTIONS='nocheck testkeys' dpkg-buildpackage -tc -b -Zgzip -uc -us" test
+            su -l -c "cd $PWD && DEB_BUILD_OPTIONS='nocheck testkeys ${FIPS_BUILD_OPTION}' dpkg-buildpackage -tc -b -Zgzip -uc -us" test
     # put our debs to a safe place
     cp ../*.deb "$GOHOME"
 
@@ -94,7 +102,6 @@ build_rpm() {
         distro=amzn
         release=2023
     fi
-    arch=x86_64
     base_version="$(head -1 debian/changelog | awk -F '[()]' '{print $2}')"
     version="1337.$base_version"
     packaging_path=packaging/$distro-$release
@@ -122,13 +129,17 @@ build_rpm() {
 
     # Cleanup all artifacts from previous builds
     rm -rf "$rpm_dir"/BUILD/*
+    # Install build dependencies
+    distro_install_package rpmdevtools
+    # XXX we should pass --with testkeys for completeness, but older versions of
+    # rpmspec do not support it, and in any case testkeys does not result in any
+    # additional build packages
+    # shellcheck disable=SC2046
+    distro_install_package $(rpmspec -q --buildrequires "$packaging_path/snapd.spec")
 
     # Build our source package
     unshare -n -- \
             rpmbuild --with testkeys -bs "$rpm_dir/SOURCES/snapd.spec"
-
-    # .. and we need all necessary build dependencies available
-    install_snapd_rpm_dependencies "$rpm_dir"/SRPMS/snapd-1337.*.src.rpm
 
     # And now build our binary package
     unshare -n -- \
@@ -186,34 +197,6 @@ build_arch_pkg() {
     cp /tmp/pkg/snapd*.pkg.tar.* "${GOPATH%%:*}"
 }
 
-download_from_published(){
-    local published_version="$1"
-
-    curl -s -o pkg_page "https://launchpad.net/ubuntu/+source/snapd/$published_version"
-
-    arch=$(dpkg --print-architecture)
-    build_id=$(sed -n 's|<a href="/ubuntu/+source/snapd/'"$published_version"'/+build/\(.*\)">'"$arch"'</a>|\1|p' pkg_page | sed -e 's/^[[:space:]]*//')
-
-    # we need to download snap-confine and ubuntu-core-launcher for versions < 2.23
-    for pkg in snapd snap-confine ubuntu-core-launcher; do
-        file="${pkg}_${published_version}_${arch}.deb"
-        curl -L -o "$GOHOME/$file" "https://launchpad.net/ubuntu/+source/snapd/${published_version}/+build/${build_id}/+files/${file}"
-    done
-}
-
-download_from_gce_bucket(){
-    curl -o "${SPREAD_SYSTEM}.tar" "https://storage.googleapis.com/snapd-spread-tests/snapd-tests/packages/${SPREAD_SYSTEM}.tar"
-    tar -xf "${SPREAD_SYSTEM}.tar" -C "$PROJECT_PATH"/..
-}
-
-install_dependencies_from_published(){
-    local published_version="$1"
-
-    for dep in snap-confine ubuntu-core-launcher; do
-        dpkg -i "$GOHOME/${dep}_${published_version}_$(dpkg --print-architecture).deb"
-    done
-}
-
 install_snapd_rpm_dependencies(){
     SRC_PATH=$1
     deps=()
@@ -249,6 +232,16 @@ install_dependencies_gce_bucket(){
 ###
 
 prepare_project() {
+    # we install chrony on xenial (as its also used in later distros), so the
+    # ntp service was in conflict, degrading the systemd unit and sometimes breaking
+    # NTP syncs
+    if os.query is-xenial; then
+      systemctl stop ntp.service
+      systemctl disable ntp.service
+      apt-get remove --purge -y ntp
+      systemctl reset-failed
+    fi
+
     if os.query is-ubuntu && os.query is-classic; then
         apt-get remove --purge -y lxd lxcfs || true
         apt-get autoremove --purge -y
@@ -265,6 +258,8 @@ prepare_project() {
     # no need to modify anything further for autopkgtest
     # we want to run as pristine as possible
     if [ "$SPREAD_BACKEND" = autopkgtest ]; then
+        create_test_user
+        systemctl enable --now snapd.socket
         exit 0
     fi
 
@@ -284,15 +279,19 @@ prepare_project() {
     # declare the "quiet" wrapper
 
     if [ "$SPREAD_BACKEND" = "external" ]; then
-        chown test.test -R "$PROJECT_PATH"
+        chown test:test -R "$PROJECT_PATH"
         exit 0
     fi
 
     if [ "$SPREAD_BACKEND" = "testflinger" ]; then
-        adduser --uid 12345 --extrausers --quiet --disabled-password --gecos '' test
+        if os.query is-core-ge 24; then
+            useradd --uid 12345 --create-home --extrausers test
+        else
+            adduser --uid 12345 --extrausers --quiet --disabled-password --gecos '' test
+        fi
         echo test:ubuntu | sudo chpasswd
         echo 'test ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/create-user-test
-        chown test.test -R "$PROJECT_PATH"
+        chown test:test -R "$PROJECT_PATH"
         exit 0
     fi
 
@@ -319,6 +318,19 @@ prepare_project() {
     create_test_user
 
     distro_update_package_db
+    # XXX this should be part of the image update in spread-images
+    # remove any packages that are marked for auto removal before running any tests
+    distro_auto_remove_packages
+
+    if os.query is-amazon-linux 2023; then
+        # perform system upgrade to the latest release
+        if [[ "$SPREAD_REBOOT" == 0 ]]; then
+            if distro_upgrade | MATCH "reboot"; then
+                echo "system upgraded, reboot required"
+                REBOOT
+            fi
+        fi
+    fi
 
     if os.query is-arch-linux; then
         # perform system upgrade on Arch so that we run with most recent kernel
@@ -372,7 +384,7 @@ prepare_project() {
         rm -rf vendor/*/
 
         # and create a fake upstream tarball
-        tar -c -z -f ../snapd_"$(dpkg-parsechangelog --show-field Version|cut -d- -f1)".orig.tar.gz --exclude=./debian --exclude=./.git .
+        tar -c -z -f ../snapd_"$(dpkg-parsechangelog --show-field Version|cut -d- -f1)".orig.tar.gz --exclude=./debian --exclude=./.git --exclude='*.pyc' .
 
         # and build a source package - this will be used during the sbuild test
         dpkg-buildpackage -S -uc -us
@@ -472,14 +484,16 @@ prepare_project() {
     esac
 
     restart_logind=
-    if [ "$(systemctl --version | awk '/systemd [0-9]+/ { print $2 }')" -lt 246 ]; then
+    local systemd_ver
+    systemd_ver="$(systemctl --version | awk '/systemd [0-9]+/ { print $2 }' | cut -f1 -d"~")"
+    if [ "$systemd_ver" -lt 246 ]; then
         restart_logind=maybe
     fi
 
     install_pkg_dependencies
 
     if [ "$restart_logind" = maybe ]; then
-        if [ "$(systemctl --version | awk '/systemd [0-9]+/ { print $2 }')" -ge 246 ]; then
+        if [ "$systemd_ver" -ge 246 ]; then
             restart_logind=yes
         else
             restart_logind=
@@ -533,6 +547,17 @@ prepare_project() {
     case "$SPREAD_SYSTEM" in
         debian-*|ubuntu-*)
             best_golang=golang-1.18
+            case "$SPREAD_SYSTEM" in
+                ubuntu-fips-*)
+                    # we are limited by the FIPS variants of go toolchain
+                    # available from the PPA, and we need to match the Go
+                    # version expected by during FIPS build of the deb, which
+                    # currently expects 1.21, see:
+                    # https://launchpad.net/~ubuntu-toolchain-r/+archive/ubuntu/golang-fips
+                    best_golang=golang-1.21
+                    quiet apt install -y golang-1.21
+                    ;;
+            esac
             # in 16.04: "apt build-dep -y ./" would also work but not on 14.04
             gdebi --quiet --apt-line ./debian/control >deps.txt
             quiet xargs -r eatmydata apt-get install -y < deps.txt
@@ -546,24 +571,19 @@ prepare_project() {
     esac
 
     # Retry go mod vendor to minimize the number of connection errors during the sync
-    for _ in $(seq 10); do
-        if go mod vendor; then
-            break
-        fi
-        sleep 1
-    done
+    retry -n 10 go mod vendor
     # Update C dependencies
-    for _ in $(seq 10); do
-        if (cd c-vendor && ./vendor.sh); then
-            break
-        fi
-        sleep 1
-    done
+    ( cd c-vendor && retry -n 10 ./vendor.sh )
 
     # go mod runs as root and will leave strange permissions
-    chown test.test -R "$SPREAD_PATH"
+    chown test:test -R "$SPREAD_PATH"
 
-    if [ "$BUILD_SNAPD_FROM_CURRENT" = true ]; then
+    # We are testing snapd snap on top of snapd from the archive
+    # of the tested distribution. Download snapd and snap-confine
+    # as they exist in the archive for further use.
+    if tests.info is-snapd-from-archive; then
+        ( cd "${GOHOME}" && tests.pkgs download snapd snap-confine)
+    else
         case "$SPREAD_SYSTEM" in
             ubuntu-*|debian-*)
                 build_deb
@@ -579,12 +599,6 @@ prepare_project() {
                 exit 1
                 ;;
         esac
-    elif [ -n "$SNAPD_PUBLISHED_VERSION" ]; then
-        download_from_published "$SNAPD_PUBLISHED_VERSION"
-        install_dependencies_from_published "$SNAPD_PUBLISHED_VERSION"
-    else
-        download_from_gce_bucket
-        install_dependencies_gce_bucket
     fi
 
     # Build fakestore.
@@ -626,7 +640,9 @@ prepare_project_each() {
 prepare_suite() {
     # shellcheck source=tests/lib/prepare.sh
     . "$TESTSLIB"/prepare.sh
-    if os.query is-core; then
+    # os.query cannot be used because first time the suite is prepared, the current system
+    # is classic ubuntu, so it is needed to check the system set in $SPREAD_SYSTEM
+    if is_test_target_core; then
         prepare_ubuntu_core
     else
         prepare_classic
@@ -654,6 +670,16 @@ prepare_suite_each() {
 
     # Save all the installed packages
     if os.query is-classic; then
+        # lxd-installer is in cloud images starting from 24.04. This package
+        # installs lxd when any lxc command is run. This caused problems
+        # because if we install snapcraft & lxd, in the restore step lxd is
+        # removed, and after that snapcraft is removed. However, snapcraft's
+        # remove hook calls lxd and triggers a new installation of lxd, and in
+        # turn when we try to remove core22, it fails as lxd has been
+        # re-installed and depends on that base. Therefore, we remove it to
+        # prevent these issues, and we do that before we get the list of
+        # installed packages to make sure we do not re-install it again.
+        apt remove -y --purge lxd-installer || true
         tests.pkgs list-installed > installed-initial.pkgs
     fi
 
@@ -661,7 +687,7 @@ prepare_suite_each() {
     tests.backup prepare
 
     # save the job which is going to be executed in the system
-    echo -n "$SPREAD_JOB " >> "$RUNTIME_STATE_PATH/runs"
+    echo -n "${SPREAD_JOB:-} " >> "$RUNTIME_STATE_PATH/runs"
 
     # Restart journal log and reset systemd journal cursor.
     systemctl reset-failed systemd-journald.service
@@ -681,11 +707,14 @@ prepare_suite_each() {
     fi
 
     if [[ "$variant" = full ]]; then
+        # shellcheck source=tests/lib/prepare.sh
+        . "$TESTSLIB"/prepare.sh
         if os.query is-classic; then
-            # shellcheck source=tests/lib/prepare.sh
-            . "$TESTSLIB"/prepare.sh
             prepare_each_classic
+        else
+            prepare_each_core
         fi
+        
     fi
 
     case "$SPREAD_SYSTEM" in
@@ -752,9 +781,13 @@ restore_suite_each() {
     done
 
     if [[ "$variant" = full ]]; then
-        # reset the failed status of snapd, snapd.socket, and snapd.failure.socket
-        # to prevent hitting the system restart rate-limit for these services
-        systemctl reset-failed snapd.service snapd.socket snapd.failure.service
+        # Reset the failed status of snapd, snapd.socket, and snapd.failure.socket
+        # to prevent hitting the system restart rate-limit for these services.
+        systemctl reset-failed snapd.service snapd.socket
+        # This unit may not be present, it is masked on some systems.
+        if systemctl status snapd.failure.service; then
+            systemctl reset-failed snapd.failure.service
+        fi
     fi
 
     if [[ "$variant" = full ]]; then

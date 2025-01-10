@@ -20,17 +20,19 @@
 package servicestate
 
 import (
-	"encoding/json"
+	"context"
 	"errors"
 	"fmt"
 	"io"
-	"os/user"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/snapcore/snapd/client"
+	"github.com/snapcore/snapd/client/clientutil"
+	"github.com/snapcore/snapd/osutil/user"
 	"github.com/snapcore/snapd/overlord/cmdstate"
 	"github.com/snapcore/snapd/overlord/configstate/config"
 	"github.com/snapcore/snapd/overlord/hookstate"
@@ -41,118 +43,15 @@ import (
 	"github.com/snapcore/snapd/snap/quota"
 	"github.com/snapcore/snapd/strutil"
 	"github.com/snapcore/snapd/systemd"
+	usc "github.com/snapcore/snapd/usersession/client"
 	"github.com/snapcore/snapd/wrappers"
 )
 
-type UserSelection int
-
-const (
-	UserSelectionList UserSelection = iota
-	UserSelectionSelf
-	UserSelectionAll
-)
-
-// UserSelector is a support structure for correctly translating a way of
-// representing both a list of user-names, and specific keywords like "self"
-// and "all" for JSON marshalling.
-//
-// When "Selector == UserSelectionList" then Names is used as the data source and
-// the data is treated like a list of strings.
-// When "Selector == UserSelectionSelf|UserSelectionAll", then the data source will
-// be a single string that represent this in the form of "self|all".
-type UserSelector struct {
-	Names    []string
-	Selector UserSelection
-}
-
-// UserList returns a decoded list of users which takes any keyword into account.
-// Takes the current user to be able to handle special keywords like 'user'.
-func (us *UserSelector) UserList(currentUser *user.User) ([]string, error) {
-	switch us.Selector {
-	case UserSelectionList:
-		return us.Names, nil
-	case UserSelectionSelf:
-		if currentUser == nil {
-			return nil, fmt.Errorf(`internal error: for "self" the current user must be provided`)
-		}
-		if currentUser.Uid == "0" {
-			return nil, fmt.Errorf(`cannot use "self" for root user`)
-		}
-		return []string{currentUser.Username}, nil
-	case UserSelectionAll:
-		// Empty list indicates all.
-		return nil, nil
-	}
-	return nil, fmt.Errorf("internal error: unsupported selector %d specified", us.Selector)
-}
-
-func (us UserSelector) MarshalJSON() ([]byte, error) {
-	switch us.Selector {
-	case UserSelectionList:
-		return json.Marshal(us.Names)
-	case UserSelectionSelf:
-		return json.Marshal("self")
-	case UserSelectionAll:
-		return json.Marshal("all")
-	default:
-		return nil, fmt.Errorf("internal error: unsupported selector %d specified", us.Selector)
-	}
-}
-
-func (us *UserSelector) UnmarshalJSON(b []byte) error {
-	// Try treating it as a list of usernames first
-	var users []string
-	if err := json.Unmarshal(b, &users); err == nil {
-		us.Names = users
-		us.Selector = UserSelectionList
-		return nil
-	}
-
-	// Fallback to string, which would indicate a keyword
-	var s string
-	if err := json.Unmarshal(b, &s); err != nil {
-		return fmt.Errorf("cannot unmarshal, expected a string or a list of strings")
-	}
-
-	switch s {
-	case "self":
-		us.Selector = UserSelectionSelf
-	case "all":
-		us.Selector = UserSelectionAll
-	default:
-		return fmt.Errorf(`cannot unmarshal, expected one of: "self", "all"`)
-	}
-	return nil
-}
-
-type ScopeSelector []string
-
-func (ss *ScopeSelector) UnmarshalJSON(b []byte) error {
-	var scopes []string
-	if err := json.Unmarshal(b, &scopes); err != nil {
-		return fmt.Errorf("cannot unmarshal, expected a list of strings")
-	}
-
-	if len(scopes) > 2 {
-		return fmt.Errorf("unexpected number of scopes: %v", scopes)
-	}
-
-	for _, s := range scopes {
-		switch s {
-		case "system", "user":
-		default:
-			return fmt.Errorf(`cannot unmarshal, expected one of: "system", "user"`)
-		}
-	}
-	*ss = scopes
-	return nil
-}
-
 type Instruction struct {
-	Action string        `json:"action"`
-	Names  []string      `json:"names"`
-	Scope  ScopeSelector `json:"scope"`
-	Users  UserSelector  `json:"users"`
+	Action string               `json:"action"`
+	Names  []string             `json:"names"`
+	Scope  client.ScopeSelector `json:"scope"`
+	Users  client.UserSelector  `json:"users"`
 	client.StartOptions
 	client.StopOptions
 	client.RestartOptions
@@ -195,10 +94,10 @@ func (i *Instruction) EnsureDefaultScopeForUser(u *user.User) {
 	if len(i.Scope) == 0 {
 		// If root is making this request, implied scopes are all
 		if u.Uid == "0" {
-			i.Scope = ScopeSelector{"system", "user"}
+			i.Scope = client.ScopeSelector{"system", "user"}
 		} else {
 			// Otherwise imply the service scope only
-			i.Scope = ScopeSelector{"system"}
+			i.Scope = client.ScopeSelector{"system"}
 		}
 	}
 }
@@ -216,7 +115,7 @@ func (i *Instruction) validateScope(u *user.User, apps []*snap.AppInfo) error {
 
 func (i *Instruction) validateUsers(u *user.User, apps []*snap.AppInfo) error {
 	// Perform some additional user checks
-	if i.Users.Selector == UserSelectionList && len(i.Users.Names) == 0 {
+	if i.Users.Selector == client.UserSelectionList && len(i.Users.Names) == 0 {
 		// It is an error for a non-root to not specify any users if we are targeting
 		// user daemons
 		if u.Uid != "0" && i.hasUserService(apps) {
@@ -455,15 +354,35 @@ func Control(st *state.State, appInfos []*snap.AppInfo, inst *Instruction, cu *u
 type StatusDecorator struct {
 	sysd           systemd.Systemd
 	globalUserSysd systemd.Systemd
+	context        context.Context
+	uid            string
 }
 
 // NewStatusDecorator returns a new StatusDecorator.
+//
+// Using NewStatusDecorator will only allow for global status of user-services
+// as StatusDecorator is designed to contain a single set of results for a single
+// user.
 func NewStatusDecorator(rep interface {
 	Notify(string)
-}) *StatusDecorator {
+}) clientutil.StatusDecorator {
 	return &StatusDecorator{
 		sysd:           systemd.New(systemd.SystemMode, rep),
 		globalUserSysd: systemd.New(systemd.GlobalUserMode, rep),
+	}
+}
+
+// NewStatusDecoratorForUid returns a new StatusDecorator, but configured
+// for a specific uid. This allows the StatusDecorator to get statuses for
+// user-services for a specific user.
+func NewStatusDecoratorForUid(rep interface {
+	Notify(string)
+}, context context.Context, uid string) clientutil.StatusDecorator {
+	return &StatusDecorator{
+		sysd:           systemd.New(systemd.SystemMode, rep),
+		globalUserSysd: systemd.New(systemd.GlobalUserMode, rep),
+		context:        context,
+		uid:            uid,
 	}
 }
 
@@ -479,6 +398,69 @@ func (sd *StatusDecorator) hasEnabledActivator(appInfo *client.AppInfo) bool {
 	return false
 }
 
+// queryUserServiceStatus returns a list of service-statuses for the configured users.
+func (sd *StatusDecorator) queryUserServiceStatus(units []string) ([]*systemd.UnitStatus, error) {
+	// Avoid any expensive call if there are no user daemons
+	if len(units) == 0 {
+		return nil, nil
+	}
+
+	uid, err := strconv.Atoi(sd.uid)
+	if err != nil {
+		return nil, err
+	}
+
+	cli := usc.NewForUids(uid)
+	sts, failures, err := cli.ServiceStatus(sd.context, units)
+	if err != nil {
+		return nil, err
+	}
+
+	// Return the first service failure, if any failures were reported
+	if len(failures[uid]) > 0 {
+		return nil, fmt.Errorf("cannot retrieve service %q status: %v",
+			failures[uid][0].Service, failures[uid][0].Error)
+	}
+
+	// Convert the received unit statuses to systemd-unit statuses
+	var sysdStatuses []*systemd.UnitStatus
+	for _, sts := range sts[uid] {
+		sysdStatuses = append(sysdStatuses, sts.SystemdUnitStatus())
+	}
+	return sysdStatuses, nil
+}
+
+func (sd *StatusDecorator) queryServiceStatus(scope snap.DaemonScope, units []string) ([]*systemd.UnitStatus, error) {
+	var sts []*systemd.UnitStatus
+	var err error
+	switch scope {
+	case snap.SystemDaemon:
+		// sysd.Status() makes sure that we get only the units we asked
+		// for and raises an error otherwise.
+		sts, err = sd.sysd.Status(units)
+	case snap.UserDaemon:
+		// Support the previous behavior of retrieving the global enablement
+		// status of user services if no uid is configured for this status
+		// decorator.
+		if sd.uid != "" {
+			sts, err = sd.queryUserServiceStatus(units)
+		} else {
+			sts, err = sd.globalUserSysd.Status(units)
+		}
+	default:
+		return nil, fmt.Errorf("internal error: unknown daemon-scope %q", scope)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// ensure we get the correct unit count, otherwise report an error.
+	if len(sts) != len(units) {
+		return nil, fmt.Errorf("expected %d results, got %d", len(units), len(sts))
+	}
+	return sts, nil
+}
+
 // DecorateWithStatus adds service status information to the given
 // client.AppInfo associated with the given snap.AppInfo.
 // If the snap is inactive or the app is not service it does nothing.
@@ -489,15 +471,6 @@ func (sd *StatusDecorator) DecorateWithStatus(appInfo *client.AppInfo, snapApp *
 	if !snapApp.Snap.IsActive() || !snapApp.IsService() {
 		// nothing to do
 		return nil
-	}
-	var sysd systemd.Systemd
-	switch snapApp.DaemonScope {
-	case snap.SystemDaemon:
-		sysd = sd.sysd
-	case snap.UserDaemon:
-		sysd = sd.globalUserSysd
-	default:
-		return fmt.Errorf("internal error: unknown daemon-scope %q", snapApp.DaemonScope)
 	}
 
 	// collect all services for a single call to systemctl
@@ -519,15 +492,11 @@ func (sd *StatusDecorator) DecorateWithStatus(appInfo *client.AppInfo, snapApp *
 		serviceNames = append(serviceNames, timerUnit)
 	}
 
-	// sysd.Status() makes sure that we get only the units we asked
-	// for and raises an error otherwise
-	sts, err := sysd.Status(serviceNames)
+	sts, err := sd.queryServiceStatus(snapApp.DaemonScope, serviceNames)
 	if err != nil {
 		return fmt.Errorf("cannot get status of services of app %q: %v", appInfo.Name, err)
 	}
-	if len(sts) != len(serviceNames) {
-		return fmt.Errorf("cannot get status of services of app %q: expected %d results, got %d", appInfo.Name, len(serviceNames), len(sts))
-	}
+
 	for _, st := range sts {
 		switch filepath.Ext(st.Name) {
 		case ".service":

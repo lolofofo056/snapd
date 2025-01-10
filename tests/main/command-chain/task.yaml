@@ -1,5 +1,12 @@
 summary: Check that command-chain is properly supported
 
+details: |
+    Verify the command-chain feature works as expected for hooks, apps, and
+    services. Rather than running the hook, app, or service directly, the
+    command-chain should be prefixed to the target command. Additionally verify
+    that the command-chain is executed when running a snap with `snap run
+    --shell`.
+
 environment:
     # Ensure that running purely from the deb (without re-exec) works
     # correctly
@@ -9,11 +16,24 @@ environment:
     ENVDUMP: /var/snap/command-chain/current/env
 
 prepare: |
+    if [ "$SNAP_REEXEC" = "0" ] && tests.info is-snapd-from-archive; then
+        tests.exec skip-test "No need to test when the snapd pkg is from the repository and reexec is disabled" && exit 0
+    fi
+
     echo "Build command chain snap"
     snap pack command-chain
     snap install --dangerous command-chain_1.0_all.snap
+    SNAP_MOUNT_DIR="$(os.paths snap-mount-dir)"
+    if [ "$SNAP_REEXEC" = "1" ] && [ "$SNAP_MOUNT_DIR" != "/snap" ] && [ ! -L /snap ]; then
+        # reexec expects to find the snapd snap under /snap, enable it to do so
+        # on distros using /var/lib/snapd/snap
+        ln -sf "$SNAP_MOUNT_DIR" /snap
+        tests.cleanup defer rm -f /snap
+    fi
 
 execute: |
+    tests.exec is-skipped && exit 0
+
     echo "Test that command-chain runs for hooks"
     [ "$(cat "$BREADCRUMB")" = "chain1 chain2 configure" ]
     MATCH '^CHAIN_1_RAN=1$' < "$ENVDUMP"

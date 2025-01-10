@@ -42,6 +42,7 @@
 #include "../libsnap-confine-private/infofile.h"
 #include "../libsnap-confine-private/locking.h"
 #include "../libsnap-confine-private/secure-getenv.h"
+#include "../libsnap-confine-private/snap-dir.h"
 #include "../libsnap-confine-private/snap.h"
 #include "../libsnap-confine-private/string-utils.h"
 #include "../libsnap-confine-private/tool.h"
@@ -320,9 +321,17 @@ static void enter_non_classic_execution_environment(sc_invocation * inv,
 
 int main(int argc, char **argv)
 {
-	log_startup_stage("snap-confine enter");
-	// Use our super-defensive parser to figure out what we've been asked to do.
 	sc_error *err = NULL;
+
+	log_startup_stage("snap-confine enter");
+
+	// Figure out what is the SNAP_MOUNT_DIR in practice.
+	sc_probe_snap_mount_dir_from_pid_1_mount_ns(AT_FDCWD, &err);
+	sc_die_on_error(err);
+
+	debug("SNAP_MOUNT_DIR (probed): %s", sc_snap_mount_dir(NULL));
+
+	// Use our super-defensive parser to figure out what we've been asked to do.
 	struct sc_args *args SC_CLEANUP(sc_cleanup_args) = NULL;
 	sc_preserved_process_state proc_state
 	    SC_CLEANUP(sc_cleanup_preserved_process_state) = {
@@ -350,7 +359,12 @@ int main(int argc, char **argv)
 	if (snap_instance_name_env == NULL) {
 		die("SNAP_INSTANCE_NAME is not set");
 	}
-	sc_init_invocation(&invocation, args, snap_instance_name_env);
+	// SNAP_COMPONENT_NAME might not be set by the environment, so callers
+	// should be prepared to handle NULL.
+	const char *snap_component_name_env = getenv("SNAP_COMPONENT_NAME");
+
+	sc_init_invocation(&invocation, args, snap_instance_name_env,
+			   snap_component_name_env);
 
 	// Who are we?
 	uid_t real_uid, effective_uid, saved_uid;
@@ -538,11 +552,7 @@ int main(int argc, char **argv)
 	}
 	// Now that we've dropped and regained SYS_ADMIN, we can load the
 	// seccomp profiles.
-	if (sc_apply_seccomp_profile_for_security_tag(invocation.security_tag)) {
-		// If the process is not explicitly unconfined then load the
-		// global profile as well.
-		sc_apply_global_seccomp_profile();
-	}
+	sc_apply_seccomp_profile_for_security_tag(invocation.security_tag);
 	// Even though we set inheritable to 0, let's clear SYS_ADMIN
 	// explicitly
 	if (keep_sys_admin) {
@@ -627,8 +637,18 @@ static void enter_classic_execution_environment(const sc_invocation *inv,
 /* max wait time for /var/lib/snapd/cgroup/<snap>.devices to appear */
 static const size_t DEVICES_FILE_MAX_WAIT = 120;
 
-static bool is_device_cgroup_self_managed(const sc_invocation *inv)
+struct sc_device_cgroup_options {
+	bool self_managed;
+	bool non_strict;
+};
+
+static void sc_get_device_cgroup_setup(const sc_invocation *inv, struct sc_device_cgroup_options
+				       *devsetup)
 {
+	if (devsetup == NULL) {
+		die("internal error: devsetup is NULL");
+	}
+
 	char info_path[PATH_MAX] = { 0 };
 	sc_must_snprintf(info_path,
 			 sizeof info_path,
@@ -648,14 +668,22 @@ static bool is_device_cgroup_self_managed(const sc_invocation *inv)
 		die("cannot open %s", info_path);
 	}
 
+	sc_error *err SC_CLEANUP(sc_cleanup_error) = NULL;
 	char *self_managed_value SC_CLEANUP(sc_cleanup_string) = NULL;
-	sc_error *err = NULL;
 	if (sc_infofile_get_key
 	    (stream, "self-managed", &self_managed_value, &err) < 0) {
 		sc_die_on_error(err);
 	}
+	rewind(stream);
 
-	return sc_streq(self_managed_value, "true");
+	char *non_strict_value SC_CLEANUP(sc_cleanup_string) = NULL;
+	if (sc_infofile_get_key(stream, "non-strict", &non_strict_value, &err) <
+	    0) {
+		sc_die_on_error(err);
+	}
+
+	devsetup->self_managed = sc_streq(self_managed_value, "true");
+	devsetup->non_strict = sc_streq(non_strict_value, "true");
 }
 
 static sc_device_cgroup_mode device_cgroup_mode_for_snap(sc_invocation *inv)
@@ -682,6 +710,7 @@ static sc_device_cgroup_mode device_cgroup_mode_for_snap(sc_invocation *inv)
 			break;
 		}
 	}
+
 	return mode;
 }
 
@@ -703,6 +732,19 @@ static void enter_non_classic_execution_environment(sc_invocation *inv,
 
 	// Do per-snap initialization.
 	int snap_lock_fd = sc_lock_snap(inv->snap_instance);
+
+	// This is a workaround for systemd v237 (used by Ubuntu 18.04) for non-root users
+	// where a transient scope cgroup is not created for a snap hence it cannot be tracked
+	// before the freezer cgroup is created (and joined) below.
+	if (sc_snap_is_inhibited
+	    (inv->snap_instance, SC_SNAP_HINT_INHIBITED_FOR_REMOVE)) {
+		// Prevent starting new snap processes when snap is being removed until
+		// the freezer cgroup is created below and the snap lock is released so
+		// that remove change can track running processes through pids under the
+		// freezer cgroup.
+		die("snap is currently being removed");
+	}
+
 	debug("initializing mount namespace: %s", inv->snap_instance);
 	struct sc_mount_ns *group = NULL;
 	group = sc_open_mount_ns(inv->snap_instance);
@@ -712,11 +754,18 @@ static void enter_non_classic_execution_environment(sc_invocation *inv,
 
 	// Set up a device cgroup, unless the snap has been allowed to manage the
 	// device cgroup by itself.
-	if (!is_device_cgroup_self_managed(inv)) {
+	struct sc_device_cgroup_options cgdevopts = { false, false };
+	sc_get_device_cgroup_setup(inv, &cgdevopts);
+	bool in_container = sc_is_in_container();
+	if (cgdevopts.self_managed) {
+		debug("device cgroup is self-managed by the snap");
+	} else if (cgdevopts.non_strict) {
+		debug("device cgroup skipped, snap in non-strict confinement");
+	} else if (in_container) {
+		debug("device cgroup skipped, executing inside a container");
+	} else {
 		sc_device_cgroup_mode mode = device_cgroup_mode_for_snap(inv);
 		sc_setup_device_cgroup(inv->security_tag, mode);
-	} else {
-		debug("device cgroup is self-managed by the snap");
 	}
 
 	/**

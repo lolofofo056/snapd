@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2021-2022 Canonical Ltd
+ * Copyright (C) 2021-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -27,7 +27,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -65,6 +64,7 @@ var (
 	bootMakeRunnableStandalone           = boot.MakeRunnableStandaloneSystem
 	bootMakeRunnableAfterDataReset       = boot.MakeRunnableSystemAfterDataReset
 	bootEnsureNextBootToRunMode          = boot.EnsureNextBootToRunMode
+	bootMakeRecoverySystemBootable       = boot.MakeRecoverySystemBootable
 	installRun                           = install.Run
 	installFactoryReset                  = install.FactoryReset
 	installMountVolumes                  = install.MountVolumes
@@ -274,16 +274,36 @@ func (m *DeviceManager) doSetupRunSystem(t *state.Task, _ *tomb.Tomb) error {
 	var installedSystem *install.InstalledSystemSideData
 	// run the create partition code
 	logger.Noticef("create and deploy partitions")
+
+	// Load seed to find out kernel-modules components in run mode
+	systemAndSnaps, mntPtForType, mntPtForComps, unmount,
+		err := m.loadAndMountSystemLabelSnapsUnlock(st, m.seedLabel, []snap.Type{snap.TypeKernel})
+	if err != nil {
+		return err
+	}
+	defer unmount()
+
+	kernMntPoint := mntPtForType[snap.TypeKernel]
+	isCore := !deviceCtx.Classic()
+	kSnapInfo, bootKMods := kModsInfo(systemAndSnaps, kernMntPoint, mntPtForComps, isCore)
+
 	timings.Run(perfTimings, "install-run", "Install the run system", func(tm timings.Measurer) {
 		st.Unlock()
 		defer st.Lock()
-		installedSystem, err = installRun(model, gadgetDir, kernelDir, "", bopts, installObserver, tm)
+		installedSystem, err = installRun(model, gadgetDir, kSnapInfo, "", bopts, installObserver, tm)
 	})
 	if err != nil {
 		return fmt.Errorf("cannot install system: %v", err)
 	}
 
 	if trustedInstallObserver != nil {
+		// We are required to call ObserveExistingTrustedRecoveryAssets on trusted observers
+		if err := trustedInstallObserver.ObserveExistingTrustedRecoveryAssets(boot.InitramfsUbuntuSeedDir); err != nil {
+			return fmt.Errorf("cannot observe existing trusted recovery assets: %v", err)
+		}
+	}
+
+	if useEncryption {
 		if err := installLogic.PrepareEncryptedSystemData(model, installedSystem.KeyForRole, trustedInstallObserver); err != nil {
 			return err
 		}
@@ -310,6 +330,7 @@ func (m *DeviceManager) doSetupRunSystem(t *state.Task, _ *tomb.Tomb) error {
 		UnpackedGadgetDir: gadgetDir,
 
 		RecoverySystemLabel: modeEnv.RecoverySystem,
+		KernelMods:          bootKMods,
 	}
 	timings.Run(perfTimings, "boot-make-runnable", "Make target system runnable", func(timings.Measurer) {
 		err = bootMakeRunnable(deviceCtx.Model(), bootWith, trustedInstallObserver)
@@ -519,7 +540,7 @@ func (m *DeviceManager) doFactoryResetRunSystem(t *state.Task, _ *tomb.Tomb) err
 		return fmt.Errorf("cannot use gadget: %v", err)
 	}
 
-	var trustedInstallObserver *boot.TrustedAssetsInstallObserver
+	var trustedInstallObserver boot.TrustedAssetsInstallObserver
 	// get a nice nil interface by default
 	var installObserver gadget.ContentObserver
 	trustedInstallObserver, err = boot.TrustedAssetsInstallObserverForModel(model, gadgetDir, useEncryption)
@@ -535,13 +556,25 @@ func (m *DeviceManager) doFactoryResetRunSystem(t *state.Task, _ *tomb.Tomb) err
 		}
 	}
 
-	var installedSystem *install.InstalledSystemSideData
+	// Load seed to find out kernel-modules components in run mode
+	systemAndSnaps, mntPtForType, mntPtForComps, unmount,
+		err := m.loadAndMountSystemLabelSnapsUnlock(st, m.seedLabel, []snap.Type{snap.TypeKernel})
+	if err != nil {
+		return err
+	}
+	defer unmount()
+
+	kernMntPoint := mntPtForType[snap.TypeKernel]
+	isCore := !deviceCtx.Classic()
+	kSnapInfo, bootKMods := kModsInfo(systemAndSnaps, kernMntPoint, mntPtForComps, isCore)
+
 	// run the create partition code
 	logger.Noticef("create and deploy partitions")
+	var installedSystem *install.InstalledSystemSideData
 	timings.Run(perfTimings, "factory-reset", "Factory reset", func(tm timings.Measurer) {
 		st.Unlock()
 		defer st.Lock()
-		installedSystem, err = installFactoryReset(model, gadgetDir, kernelDir, "", bopts, installObserver, tm)
+		installedSystem, err = installFactoryReset(model, gadgetDir, kSnapInfo, "", bopts, installObserver, tm)
 	})
 	if err != nil {
 		return fmt.Errorf("cannot perform factory reset: %v", err)
@@ -549,6 +582,13 @@ func (m *DeviceManager) doFactoryResetRunSystem(t *state.Task, _ *tomb.Tomb) err
 	logger.Noticef("devs: %+v", installedSystem.DeviceForRole)
 
 	if trustedInstallObserver != nil {
+		// We are required to call ObserveExistingTrustedRecoveryAssets on trusted observers
+		if err := trustedInstallObserver.ObserveExistingTrustedRecoveryAssets(boot.InitramfsUbuntuSeedDir); err != nil {
+			return fmt.Errorf("cannot observe existing trusted recovery assets: %v", err)
+		}
+	}
+
+	if useEncryption {
 		// at this point we removed boot and data. sealed fallback key
 		// for ubuntu-data is becoming useless
 		err := os.Remove(device.FallbackDataSealedKeyUnder(boot.InitramfsSeedEncryptionKeyDir))
@@ -619,6 +659,7 @@ func (m *DeviceManager) doFactoryResetRunSystem(t *state.Task, _ *tomb.Tomb) err
 		UnpackedGadgetDir: gadgetDir,
 
 		RecoverySystemLabel: modeEnv.RecoverySystem,
+		KernelMods:          bootKMods,
 	}
 	timings.Run(perfTimings, "boot-make-runnable", "Make target system runnable", func(timings.Measurer) {
 		err = bootMakeRunnableAfterDataReset(deviceCtx.Model(), bootWith, trustedInstallObserver)
@@ -818,7 +859,7 @@ func verifyFactoryResetMarkerInRun(marker string, hasEncryption bool) error {
 }
 
 func rotateEncryptionKeys() error {
-	kd, err := ioutil.ReadFile(filepath.Join(dirs.SnapFDEDir, "ubuntu-save.key"))
+	kd, err := os.ReadFile(filepath.Join(dirs.SnapFDEDir, "ubuntu-save.key"))
 	if err != nil {
 		return fmt.Errorf("cannot open encryption key file: %v", err)
 	}
@@ -833,17 +874,17 @@ type encryptionSetupDataKey struct {
 	systemLabel string
 }
 
-func mountSeedSnap(seedSn *seed.Snap) (mountpoint string, unmount func() error, err error) {
-	mountpoint = filepath.Join(dirs.SnapRunDir, "snap-content", string(seedSn.EssentialType))
+func mountSeedContainer(filePath, subdir string) (mountpoint string, unmount func() error, err error) {
+	mountpoint = filepath.Join(dirs.SnapRunDir, "snap-content", subdir)
 	if err := os.MkdirAll(mountpoint, 0755); err != nil {
 		return "", nil, err
 	}
 
 	// temporarily mount the filesystem
-	logger.Debugf("mounting %q in %q", seedSn.Path, mountpoint)
+	logger.Debugf("mounting %q in %q", filePath, mountpoint)
 	sd := systemd.New(systemd.SystemMode, progress.Null)
-	if err := sd.Mount(seedSn.Path, mountpoint); err != nil {
-		return "", nil, fmt.Errorf("cannot mount %q at %q: %v", seedSn.Path, mountpoint, err)
+	if err := sd.Mount(filePath, mountpoint); err != nil {
+		return "", nil, fmt.Errorf("cannot mount %q at %q: %v", filePath, mountpoint, err)
 	}
 	return mountpoint,
 		func() error {
@@ -853,12 +894,16 @@ func mountSeedSnap(seedSn *seed.Snap) (mountpoint string, unmount func() error, 
 		nil
 }
 
-func (m *DeviceManager) loadAndMountSystemLabelSnaps(systemLabel string) (*systemAndEssentialSnaps, map[snap.Type]string, func(), error) {
+func (m *DeviceManager) loadAndMountSystemLabelSnapsUnlock(st *state.State, systemLabel string, essentialTypes []snap.Type) (*systemAndEssentialSnaps, map[snap.Type]string, map[string]string, func(), error) {
+	st.Unlock()
+	defer st.Lock()
+	return m.loadAndMountSystemLabelSnaps(systemLabel, essentialTypes)
+}
 
-	essentialTypes := []snap.Type{snap.TypeKernel, snap.TypeBase, snap.TypeGadget}
-	systemAndSnaps, err := m.loadSystemAndEssentialSnaps(systemLabel, essentialTypes)
+func (m *DeviceManager) loadAndMountSystemLabelSnaps(systemLabel string, essentialTypes []snap.Type) (*systemAndEssentialSnaps, map[snap.Type]string, map[string]string, func(), error) {
+	systemAndSnaps, err := m.loadSystemAndEssentialSnaps(systemLabel, essentialTypes, "run")
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	// Unset revision here actually means that the snap is local.
 	// Assign then a local revision as seeding/installing the snap would do.
@@ -868,7 +913,7 @@ func (m *DeviceManager) loadAndMountSystemLabelSnaps(systemLabel string) (*syste
 		}
 	}
 
-	// Mount gadget and kernel
+	// Mount gadget, kernel and kernel-modules components
 	var unmountFuncs []func() error
 	mntPtForType := make(map[snap.Type]string)
 	unmount := func() {
@@ -881,17 +926,75 @@ func (m *DeviceManager) loadAndMountSystemLabelSnaps(systemLabel string) (*syste
 
 	seedSnaps := systemAndSnaps.SeedSnapsByType
 
-	for _, seedSn := range []*seed.Snap{seedSnaps[snap.TypeGadget], seedSnaps[snap.TypeKernel]} {
-		mntPt, unmountSnap, err := mountSeedSnap(seedSn)
+	// We might need mount for kernel and gadget only
+	for _, typ := range essentialTypes {
+		if typ != snap.TypeGadget && typ != snap.TypeKernel {
+			continue
+		}
+
+		seedSn := seedSnaps[typ]
+		mntPt, unmountSnap, err := mountSeedContainer(seedSn.Path, string(seedSn.EssentialType))
 		if err != nil {
 			unmount()
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		unmountFuncs = append(unmountFuncs, unmountSnap)
 		mntPtForType[seedSn.EssentialType] = mntPt
 	}
 
-	return systemAndSnaps, mntPtForType, unmount, nil
+	mntPtForComp := make(map[string]string)
+	for _, seedComp := range systemAndSnaps.CompsByType[snap.TypeKernel] {
+		if seedComp.CompInfo.Type != snap.KernelModulesComponent {
+			continue
+		}
+
+		mntPt, unmountComp, err := mountSeedContainer(seedComp.CompSeed.Path,
+			seedComp.CompInfo.FullName())
+		if err != nil {
+			unmount()
+			return nil, nil, nil, nil, err
+		}
+		unmountFuncs = append(unmountFuncs, unmountComp)
+		mntPtForComp[seedComp.CompInfo.FullName()] = mntPt
+	}
+
+	return systemAndSnaps, mntPtForType, mntPtForComp, unmount, nil
+}
+
+func kModsInfo(systemAndSnaps *systemAndEssentialSnaps, kernMntPoint string, mntPtForComps map[string]string, isCore bool) (*install.KernelSnapInfo, []boot.BootableKModsComponents) {
+	kernInfo := systemAndSnaps.InfosByType[snap.TypeKernel]
+
+	// Find out kernel-modules components in the seed
+	compSeedInfos := systemAndSnaps.CompsByType[snap.TypeKernel]
+	bootKMods := make([]boot.BootableKModsComponents, 0, len(compSeedInfos))
+	modulesComps := make([]install.KernelModulesComponentInfo, 0, len(compSeedInfos))
+	for _, compSeedInfo := range compSeedInfos {
+		ci := compSeedInfo.CompInfo
+		if ci.Type == snap.KernelModulesComponent {
+			cpi := snap.MinimalComponentContainerPlaceInfo(ci.Component.ComponentName,
+				ci.Revision, kernInfo.SnapName())
+			modulesComps = append(modulesComps, install.KernelModulesComponentInfo{
+				Name:       ci.Component.ComponentName,
+				Revision:   ci.Revision,
+				MountPoint: mntPtForComps[ci.FullName()],
+			})
+			bootKMods = append(bootKMods, boot.BootableKModsComponents{
+				CompPlaceInfo: cpi,
+				CompPath:      compSeedInfo.CompSeed.Path,
+			})
+		}
+	}
+
+	kSnapInfo := &install.KernelSnapInfo{
+		Name:             kernInfo.SnapName(),
+		Revision:         kernInfo.Revision,
+		MountPoint:       kernMntPoint,
+		IsCore:           isCore,
+		ModulesComps:     modulesComps,
+		NeedsDriversTree: snapstate.NeedsKernelSetup(systemAndSnaps.Model),
+	}
+
+	return kSnapInfo, bootKMods
 }
 
 // doInstallFinish performs the finish step of the install. It will
@@ -929,9 +1032,8 @@ func (m *DeviceManager) doInstallFinish(t *state.Task, _ *tomb.Tomb) error {
 		}
 	}
 
-	st.Unlock()
-	systemAndSnaps, mntPtForType, unmount, err := m.loadAndMountSystemLabelSnaps(systemLabel)
-	st.Lock()
+	systemAndSnaps, mntPtForType, mntPtForComps, unmount, err := m.loadAndMountSystemLabelSnapsUnlock(
+		st, systemLabel, []snap.Type{snap.TypeKernel, snap.TypeBase, snap.TypeGadget})
 	if err != nil {
 		return err
 	}
@@ -989,18 +1091,30 @@ func (m *DeviceManager) doInstallFinish(t *state.Task, _ *tomb.Tomb) error {
 	if useEncryption {
 		encType = secboot.EncryptionTypeLUKS
 	}
+	kernMntPoint := mntPtForType[snap.TypeKernel]
 	allLaidOutVols, err := gadget.LaidOutVolumesFromGadget(mergedVols,
-		mntPtForType[snap.TypeGadget], mntPtForType[snap.TypeKernel],
+		mntPtForType[snap.TypeGadget], kernMntPoint,
 		encType, volToGadgetToDiskStruct)
 	if err != nil {
 		return fmt.Errorf("on finish install: cannot layout volumes: %v", err)
 	}
 
+	snapInfos := systemAndSnaps.InfosByType
+	snapSeeds := systemAndSnaps.SeedSnapsByType
+	deviceCtx, err := DeviceCtx(st, t, nil)
+	if err != nil {
+		return fmt.Errorf("cannot get device context: %v", err)
+	}
+
+	// Find out kernel-modules components in the seed
+	isCore := !deviceCtx.Classic()
+	kSnapInfo, bootKMods := kModsInfo(systemAndSnaps, kernMntPoint, mntPtForComps, isCore)
+
 	logger.Debugf("writing content to partitions")
 	timings.Run(perfTimings, "install-content", "Writing content to partitions", func(tm timings.Measurer) {
 		st.Unlock()
 		defer st.Lock()
-		_, err = installWriteContent(mergedVols, allLaidOutVols, encryptSetupData, installObserver, perfTimings)
+		_, err = installWriteContent(mergedVols, allLaidOutVols, encryptSetupData, kSnapInfo, installObserver, perfTimings)
 	})
 	if err != nil {
 		return fmt.Errorf("cannot write content: %v", err)
@@ -1013,20 +1127,43 @@ func (m *DeviceManager) doInstallFinish(t *state.Task, _ *tomb.Tomb) error {
 	}
 	defer unmountParts()
 
-	if !systemAndSnaps.Model.Classic() {
+	hasSystemSeed := gadget.VolumesHaveRole(mergedVols, gadget.SystemSeed)
+	if hasSystemSeed {
 		copier, ok := systemAndSnaps.Seed.(seed.Copier)
 		if !ok {
 			return fmt.Errorf("internal error: seed does not support copying: %s", systemAndSnaps.Label)
 		}
 
+		var optional *seed.OptionalContainers
+		if t.Has("optional-install") {
+			var oc OptionalContainers
+			if err := t.Get("optional-install", &oc); err != nil {
+				return err
+			}
+			optional = &seed.OptionalContainers{
+				Snaps:      oc.Snaps,
+				Components: oc.Components,
+			}
+		}
+
 		logger.Debugf("copying label %q to seed partition", systemAndSnaps.Label)
-		if err := copier.Copy(seedMntDir, systemAndSnaps.Label, perfTimings); err != nil {
+		if err := copier.Copy(seedMntDir, seed.CopyOptions{
+			Label:              systemAndSnaps.Label,
+			OptionalContainers: optional,
+		}, perfTimings); err != nil {
 			return fmt.Errorf("cannot copy seed: %w", err)
 		}
 	}
 
 	if err := installSaveStorageTraits(systemAndSnaps.Model, mergedVols, encryptSetupData); err != nil {
 		return err
+	}
+
+	if trustedInstallObserver != nil {
+		// We are required to call ObserveExistingTrustedRecoveryAssets on trusted observers
+		if err := trustedInstallObserver.ObserveExistingTrustedRecoveryAssets(boot.InitramfsUbuntuSeedDir); err != nil {
+			return fmt.Errorf("cannot observe existing trusted recovery assets: %v", err)
+		}
 	}
 
 	if useEncryption {
@@ -1036,9 +1173,6 @@ func (m *DeviceManager) doInstallFinish(t *state.Task, _ *tomb.Tomb) error {
 			}
 		}
 	}
-
-	snapInfos := systemAndSnaps.InfosByType
-	snapSeeds := systemAndSnaps.SeedSnapsByType
 
 	bootWith := &boot.BootableSet{
 		Base:              snapInfos[snap.TypeBase],
@@ -1050,6 +1184,7 @@ func (m *DeviceManager) doInstallFinish(t *state.Task, _ *tomb.Tomb) error {
 		UnpackedGadgetDir: mntPtForType[snap.TypeGadget],
 
 		RecoverySystemLabel: systemLabel,
+		KernelMods:          bootKMods,
 	}
 
 	// installs in system-seed{,-null} partition: grub.cfg, grubenv
@@ -1062,6 +1197,27 @@ func (m *DeviceManager) doInstallFinish(t *state.Task, _ *tomb.Tomb) error {
 	}
 	if err := bootMakeBootablePartition(seedMntDir, opts, bootWith, boot.ModeRun, nil); err != nil {
 		return err
+	}
+
+	if hasSystemSeed {
+		// get the path of the kernel snap relative to the original seed's
+		// directory. since we're not renaming the seed, this will be the same
+		// relative path as if we're working under the new seed's directory
+		kernelRelPath, err := filepath.Rel(dirs.SnapSeedDir, snapSeeds[snap.TypeKernel].Path)
+		if err != nil {
+			return err
+		}
+
+		// this will make the newly copied seed bootable as a recovery system by
+		// writing a grubenv file to the seed.
+		err = bootMakeRecoverySystemBootable(systemAndSnaps.Model, seedMntDir, filepath.Join("systems", systemLabel), &boot.RecoverySystemBootableSet{
+			Kernel:          snapInfos[snap.TypeKernel],
+			KernelPath:      filepath.Join(seedMntDir, kernelRelPath),
+			GadgetSnapOrDir: snapSeeds[snap.TypeGadget].Path,
+		})
+		if err != nil {
+			return err
+		}
 	}
 
 	// writes the model etc
@@ -1095,9 +1251,8 @@ func (m *DeviceManager) doInstallSetupStorageEncryption(t *state.Task, _ *tomb.T
 	}
 	logger.Debugf("install-setup-storage-encryption for %q on %v", systemLabel, onVolumes)
 
-	st.Unlock()
-	systemAndSeeds, mntPtForType, unmount, err := m.loadAndMountSystemLabelSnaps(systemLabel)
-	st.Lock()
+	systemAndSeeds, mntPtForType, _, unmount, err := m.loadAndMountSystemLabelSnapsUnlock(
+		st, systemLabel, []snap.Type{snap.TypeKernel, snap.TypeBase, snap.TypeGadget})
 	if err != nil {
 		return err
 	}

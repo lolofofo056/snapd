@@ -8,13 +8,14 @@ details: |
   requires a base that was not previously installed on the system. A remodel of
   this kind requires snaps to be installed in a specific order.
 
-systems: [ubuntu-20.04-64, ubuntu-22.04-64]
+systems: [ubuntu-2*]
 
 environment:
   NESTED_CUSTOM_MODEL: $TESTSLIB/assertions/valid-for-testing-pc-{VERSION}.model
   NESTED_ENABLE_TPM: true
   NESTED_ENABLE_SECURE_BOOT: true
   NESTED_BUILD_SNAPD_FROM_CURRENT: true
+  NESTED_UBUNTU_SEED_SIZE: 1500M
 
 prepare: |
     tests.nested build-image core

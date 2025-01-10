@@ -21,29 +21,20 @@ package devicestate
 import (
 	"errors"
 	"fmt"
-	"os/exec"
 	"time"
 
 	"gopkg.in/tomb.v2"
 
 	"github.com/snapcore/snapd/interfaces"
-	"github.com/snapcore/snapd/kernel"
-	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/overlord/restart"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
-	"github.com/snapcore/snapd/snap"
 )
 
 func (m *DeviceManager) doMarkPreseeded(t *state.Task, _ *tomb.Tomb) error {
 	st := t.State()
 	st.Lock()
 	defer st.Unlock()
-
-	snaps, err := snapstate.All(st)
-	if err != nil {
-		return err
-	}
 
 	systemKey, err := interfaces.RecordedSystemKey()
 	if err != nil {
@@ -63,25 +54,9 @@ func (m *DeviceManager) doMarkPreseeded(t *state.Task, _ *tomb.Tomb) error {
 		if !preseeded {
 			preseeded = true
 			t.Set("preseeded", preseeded)
-			// unmount all snaps
-			// TODO: move to snapstate.UnmountAllSnaps.
-			for _, snapSt := range snaps {
-				info, err := snapSt.CurrentInfo()
-				if err != nil {
-					return err
-				}
-				logger.Debugf("unmounting snap %s at %s", info.InstanceName(), info.MountDir())
-				if _, err := exec.Command("umount", "-d", "-l", info.MountDir()).CombinedOutput(); err != nil {
-					return err
-				}
-				// Remove early mount for the kernel snap
-				if tp, _ := snapSt.Type(); tp == snap.TypeKernel {
-					earlyMntPt := kernel.EarlyKernelMountDir(info.RealName, info.Revision)
-					if _, err := exec.Command("umount", "-d", "-l",
-						earlyMntPt).CombinedOutput(); err != nil {
-						return err
-					}
-				}
+
+			if err := snapstate.UnmountAllSnaps(st); err != nil {
+				return err
 			}
 
 			st.Set("preseeded", preseeded)

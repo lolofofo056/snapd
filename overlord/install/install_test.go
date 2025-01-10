@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2021-2023 Canonical Ltd
+ * Copyright (C) 2021-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -23,7 +23,6 @@ import (
 	"bytes"
 	"crypto"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -51,6 +50,7 @@ import (
 	"github.com/snapcore/snapd/seed/seedtest"
 	"github.com/snapcore/snapd/seed/seedwriter"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
 	"github.com/snapcore/snapd/snap/snaptest"
 	"github.com/snapcore/snapd/sysconfig"
 	"github.com/snapcore/snapd/testutil"
@@ -568,6 +568,7 @@ func (s *installSuite) TestEncryptionSupportInfoGadgetIncompatibleWithEncryption
 			"storage-safety": tc.storageSafety,
 		})
 
+		gadget.SetEnclosingVolumeInStructs(tc.gadgetInfo.Volumes)
 		res, err := install.GetEncryptionSupportInfo(mockModel, secboot.TPMProvisionFull, kernelInfo, tc.gadgetInfo, nil)
 		c.Assert(err, IsNil)
 		c.Check(res, DeepEquals, tc.expected, Commentf("%v", tc))
@@ -814,7 +815,7 @@ func (s *installSuite) mockBootloader(c *C, trustedAssets bool, managedAssets bo
 	if trustedAssets || managedAssets {
 		tab := bootloadertest.Mock("trusted", bootloaderRootdir).WithTrustedAssets()
 		if trustedAssets {
-			tab.TrustedAssetsList = []string{"trusted-asset"}
+			tab.TrustedAssetsMap = map[string]string{"trusted-asset": "trusted-asset"}
 		}
 		if managedAssets {
 			tab.ManagedAssetsList = []string{"managed-asset"}
@@ -890,6 +891,10 @@ func (s *installSuite) TestPrepareEncryptedSystemData(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(to, NotNil)
 
+	// We are required to call ObserveExistingTrustedRecoveryAssets on trusted observers
+	err = to.ObserveExistingTrustedRecoveryAssets(boot.InitramfsUbuntuSeedDir)
+	c.Assert(err, IsNil)
+
 	keyForRole := map[string]keys.EncryptionKey{
 		gadget.SystemData: dataEncryptionKey,
 		gadget.SystemSave: saveKey,
@@ -898,13 +903,13 @@ func (s *installSuite) TestPrepareEncryptedSystemData(c *C) {
 	c.Assert(err, IsNil)
 
 	c.Check(filepath.Join(filepath.Join(dirs.GlobalRootDir, "/run/mnt/ubuntu-data/system-data/var/lib/snapd/device/fde"), "ubuntu-save.key"), testutil.FileEquals, []byte(saveKey))
-	marker, err := ioutil.ReadFile(filepath.Join(filepath.Join(dirs.GlobalRootDir, "/run/mnt/ubuntu-data/system-data/var/lib/snapd/device/fde"), "marker"))
+	marker, err := os.ReadFile(filepath.Join(filepath.Join(dirs.GlobalRootDir, "/run/mnt/ubuntu-data/system-data/var/lib/snapd/device/fde"), "marker"))
 	c.Assert(err, IsNil)
 	c.Check(marker, HasLen, 32)
 	c.Check(filepath.Join(boot.InstallHostFDESaveDir, "marker"), testutil.FileEquals, marker)
 
 	// the assets cache was written to
-	l, err := ioutil.ReadDir(filepath.Join(dirs.SnapBootAssetsDir, "trusted"))
+	l, err := os.ReadDir(filepath.Join(dirs.SnapBootAssetsDir, "trusted"))
 	c.Assert(err, IsNil)
 	c.Assert(l, HasLen, 1)
 }
@@ -1185,6 +1190,15 @@ func (s *installSuite) setupCore20Seed(c *C) *asserts.Model {
 	s.mountedGadget(c)
 	optSnapPath := snaptest.MakeTestSnapWithFiles(c, seedtest.SampleSnapYaml["optional20-a"], nil)
 
+	compRevs := map[string]snap.Revision{
+		"comp1": snap.R(2),
+		"comp2": snap.R(3),
+	}
+	s.MakeAssertedSnapWithComps(
+		c, seedtest.SampleSnapYaml["required20"], nil,
+		snap.R(1), compRevs, "canonical", s.StoreSigning.Database,
+	)
+
 	model := map[string]interface{}{
 		"display-name": "my model",
 		"architecture": "amd64",
@@ -1212,7 +1226,15 @@ func (s *installSuite) setupCore20Seed(c *C) *asserts.Model {
 				"name": "core20",
 				"id":   s.AssertedSnapID("core20"),
 				"type": "base",
-			}},
+			},
+			map[string]interface{}{
+				"name": "required20",
+				"id":   s.AssertedSnapID("required20"),
+				"components": map[string]interface{}{
+					"comp1": "required",
+				},
+			},
+		},
 	}
 
 	return s.MakeSeed(c, "20220401", "my-brand", "my-model", model, []*seedwriter.OptionsSnap{{Path: optSnapPath}})
@@ -1238,8 +1260,8 @@ func (s *installSuite) mockPreseedAssertion(c *C, brandID, modelName, series, pr
 	}
 
 	f, err := os.Create(preseedAsPath)
-	defer f.Close()
 	c.Assert(err, IsNil)
+	defer f.Close()
 	enc := asserts.NewEncoder(f)
 	c.Assert(enc.Encode(preseedAs), IsNil)
 }
@@ -1268,6 +1290,17 @@ func (s *installSuite) TestApplyPreseededData(c *C) {
 		map[string]interface{}{"name": "core20", "id": s.AssertedSnapID("core20"), "revision": "1"},
 		map[string]interface{}{"name": "pc-kernel", "id": s.AssertedSnapID("pc-kernel"), "revision": "1"},
 		map[string]interface{}{"name": "pc", "id": s.AssertedSnapID("pc"), "revision": "1"},
+		map[string]interface{}{
+			"name":     "required20",
+			"id":       s.AssertedSnapID("required20"),
+			"revision": "1",
+			"components": []interface{}{
+				map[string]interface{}{
+					"name":     "comp1",
+					"revision": "2",
+				},
+			},
+		},
 		map[string]interface{}{"name": "optional20-a"},
 	}
 	sha3_384, _, err := osutil.FileDigest(preseedArtifact, crypto.SHA3_384)
@@ -1308,6 +1341,8 @@ func (s *installSuite) TestApplyPreseededData(c *C) {
 		{"core20/1", "core20_1.snap"},
 		{"pc-kernel/1", "pc-kernel_1.snap"},
 		{"pc/1", "pc_1.snap"},
+		{"required20/1", "required20_1.snap"},
+		{"required20/components/mnt/comp1", "required20+comp1_2.comp"},
 		{"optional20-a/x1", "optional20-a_x1.snap"},
 	} {
 		c.Assert(osutil.FileExists(filepath.Join(writableDir, dirs.StripRootDir(dirs.SnapMountDir), seedSnap.name)), Equals, true, &dumpDirContents{c, writableDir})
@@ -1443,8 +1478,9 @@ func (s *installSuite) TestApplyPreseededDataSnapMismatch(c *C) {
 		c.Assert(err, ErrorMatches, tc.err)
 	}
 
-	// mode-snap is presend in the seed but missing in the preseed assertion; add other-snap to preseed assertion
-	// to satisfy the check for number of snaps.
+	// mode-snap is preseeded in the seed but missing in the preseed assertion;
+	// add other-snap to preseed assertion to satisfy the check for number of
+	// snaps.
 	preseedAsSnaps := []interface{}{
 		map[string]interface{}{"name": "essential-snap", "id": "id111111111111111111111111111111", "revision": "1"},
 		map[string]interface{}{"name": "other-snap", "id": "id333222222222222222222222222222", "revision": "2"},
@@ -1453,6 +1489,183 @@ func (s *installSuite) TestApplyPreseededDataSnapMismatch(c *C) {
 	s.mockPreseedAssertion(c, model.BrandID(), model.Model(), "16", preseedAsPath, sysLabel, digest, preseedAsSnaps)
 	err = install.ApplyPreseededData(sysSeed, writableDir)
 	c.Assert(err, ErrorMatches, `snap "mode-snap" not present in the preseed assertion`)
+}
+
+func (s *installSuite) TestApplyPreseededDataComponentMismatchWrongRevision(c *C) {
+	preseed := []interface{}{
+		map[string]interface{}{
+			"name":     "essential-snap",
+			"id":       snaptest.AssertedSnapID("essential-snap"),
+			"revision": "1",
+			"components": []interface{}{
+				map[string]interface{}{
+					"name":     "comp1",
+					"revision": "5",
+				},
+			},
+		},
+		map[string]interface{}{
+			"name":     "mode-snap",
+			"id":       snaptest.AssertedSnapID("mode-snap"),
+			"revision": "3",
+			"components": []interface{}{
+				map[string]interface{}{
+					"name":     "comp2",
+					"revision": "4",
+				},
+			},
+		},
+	}
+	const message = `component "essential-snap\+comp1" has wrong revision 2 \(expected: 5\)`
+	s.testApplyPreseededDataComponentMismatch(c, preseededDataComponentMismatchOpts{
+		preseed: preseed,
+		errMsg:  message,
+	})
+}
+
+func (s *installSuite) TestApplyPreseededDataComponentMismatchMissingComponent(c *C) {
+	preseed := []interface{}{
+		map[string]interface{}{
+			"name":     "essential-snap",
+			"id":       snaptest.AssertedSnapID("essential-snap"),
+			"revision": "1",
+			"components": []interface{}{
+				map[string]interface{}{
+					"name":     "comp1",
+					"revision": "2",
+				},
+				map[string]interface{}{
+					"name":     "comp3",
+					"revision": "5",
+				},
+			},
+		},
+		map[string]interface{}{
+			"name":     "mode-snap",
+			"id":       snaptest.AssertedSnapID("mode-snap"),
+			"revision": "3",
+			"components": []interface{}{
+				map[string]interface{}{
+					"name":     "comp2",
+					"revision": "4",
+				},
+			},
+		},
+	}
+	const message = `seed is missing components expected by preseed assertion: "essential-snap\+comp3"`
+	s.testApplyPreseededDataComponentMismatch(c, preseededDataComponentMismatchOpts{
+		preseed: preseed,
+		errMsg:  message,
+	})
+}
+
+func (s *installSuite) TestApplyPreseededDataComponentMismatchExtraComponent(c *C) {
+	preseed := []interface{}{
+		map[string]interface{}{
+			"name":     "essential-snap",
+			"id":       snaptest.AssertedSnapID("essential-snap"),
+			"revision": "1",
+			"components": []interface{}{
+				map[string]interface{}{
+					"name":     "comp1",
+					"revision": "2",
+				},
+			},
+		},
+		map[string]interface{}{
+			"name":     "mode-snap",
+			"id":       snaptest.AssertedSnapID("mode-snap"),
+			"revision": "3",
+			"components": []interface{}{
+				map[string]interface{}{
+					"name":     "comp2",
+					"revision": "4",
+				},
+			},
+		},
+	}
+	const message = `component "essential-snap\+comp3" not present in the preseed assertion`
+	s.testApplyPreseededDataComponentMismatch(c, preseededDataComponentMismatchOpts{
+		preseed: preseed,
+		errMsg:  message,
+		extraSeedComponents: []seed.Component{{
+			CompSideInfo: snap.ComponentSideInfo{
+				Revision:  snap.R(5),
+				Component: naming.NewComponentRef("essential-snap", "comp3"),
+			},
+		}},
+	})
+}
+
+type preseededDataComponentMismatchOpts struct {
+	preseed             []interface{}
+	errMsg              string
+	extraSeedComponents []seed.Component
+}
+
+func (s *installSuite) testApplyPreseededDataComponentMismatch(c *C, opts preseededDataComponentMismatchOpts) {
+	mockTarCmd := testutil.MockCommand(c, "tar", "")
+	defer mockTarCmd.Restore()
+
+	snapPath1 := filepath.Join(dirs.GlobalRootDir, "essential-snap_1.snap")
+	snapPath2 := filepath.Join(dirs.GlobalRootDir, "mode-snap_3.snap")
+	c.Assert(os.WriteFile(snapPath1, nil, 0644), IsNil)
+	c.Assert(os.WriteFile(snapPath2, nil, 0644), IsNil)
+
+	ubuntuSeedDir := filepath.Join(dirs.GlobalRootDir, "run/mnt/ubuntu-seed")
+	sysLabel := "20220105"
+	writableDir := filepath.Join(dirs.GlobalRootDir, "run/mnt/ubuntu-data/system-data")
+	preseedArtifact := filepath.Join(ubuntuSeedDir, "systems", sysLabel, "preseed.tgz")
+	c.Assert(os.MkdirAll(filepath.Join(ubuntuSeedDir, "systems", sysLabel), 0755), IsNil)
+	c.Assert(os.MkdirAll(writableDir, 0755), IsNil)
+	c.Assert(os.WriteFile(preseedArtifact, nil, 0644), IsNil)
+
+	model := s.mockModel(map[string]interface{}{
+		"grade": "dangerous",
+	})
+
+	sysSeed := &fakeSeed{
+		model:           model,
+		preseedArtifact: true,
+		sysDir:          filepath.Join(ubuntuSeedDir, "systems", sysLabel),
+		essentialSnaps: []*seed.Snap{{
+			Path: snapPath1,
+			SideInfo: &snap.SideInfo{RealName: "essential-snap",
+				Revision: snap.R(1),
+				SnapID:   snaptest.AssertedSnapID("essential-snap"),
+			},
+			Components: append([]seed.Component{{
+				CompSideInfo: snap.ComponentSideInfo{
+					Revision:  snap.R(2),
+					Component: naming.NewComponentRef("essential-snap", "comp1"),
+				},
+			}}, opts.extraSeedComponents...),
+		}},
+		modeSnaps: []*seed.Snap{{
+			Path: snapPath2,
+			SideInfo: &snap.SideInfo{RealName: "mode-snap",
+				Revision: snap.R(3),
+				SnapID:   snaptest.AssertedSnapID("mode-snap"),
+			},
+			Components: []seed.Component{{
+				CompSideInfo: snap.ComponentSideInfo{
+					Revision:  snap.R(4),
+					Component: naming.NewComponentRef("mode-snap", "comp2"),
+				},
+			}},
+		}},
+	}
+
+	sha3_384, _, err := osutil.FileDigest(preseedArtifact, crypto.SHA3_384)
+	c.Assert(err, IsNil)
+	digest, err := asserts.EncodeDigest(crypto.SHA3_384, sha3_384)
+	c.Assert(err, IsNil)
+
+	preseedAsPath := filepath.Join(ubuntuSeedDir, "systems", sysLabel, "preseed")
+
+	s.mockPreseedAssertion(c, model.BrandID(), model.Model(), "16", preseedAsPath, sysLabel, digest, opts.preseed)
+	err = install.ApplyPreseededData(sysSeed, writableDir)
+	c.Assert(err, ErrorMatches, opts.errMsg)
 }
 
 func (s *installSuite) TestApplyPreseededDataWrongDigest(c *C) {
@@ -1538,11 +1751,11 @@ func (*fakeSeed) LoadEssentialMeta(essentialTypes []snap.Type, tm timings.Measur
 	return nil
 }
 
-func (*fakeSeed) LoadEssentialMetaWithSnapHandler([]snap.Type, seed.SnapHandler, timings.Measurer) error {
+func (*fakeSeed) LoadEssentialMetaWithSnapHandler([]snap.Type, seed.ContainerHandler, timings.Measurer) error {
 	return nil
 }
 
-func (*fakeSeed) LoadMeta(string, seed.SnapHandler, timings.Measurer) error {
+func (*fakeSeed) LoadMeta(string, seed.ContainerHandler, timings.Measurer) error {
 	return nil
 }
 
@@ -1558,6 +1771,10 @@ func (fs *fakeSeed) EssentialSnaps() []*seed.Snap {
 
 func (fs *fakeSeed) ModeSnaps(mode string) ([]*seed.Snap, error) {
 	return fs.modeSnaps, nil
+}
+
+func (s *fakeSeed) ModeSnap(snapName, mode string) (*seed.Snap, error) {
+	return nil, nil
 }
 
 func (*fakeSeed) NumSnaps() int {

@@ -154,6 +154,10 @@ const fwupdPermanentSlotAppArmor = `
   /sys/devices/**/psp_vbflash rw,
   /sys/devices/**/psp_vbflash_status r,
 
+  # Required by plugin thunderbolt
+  /sys/devices/**/nvm_non_active*/nvmem a,
+  /sys/devices/**/nvm_active*/nvmem r,
+
   # DBus accesses
   #include <abstractions/dbus-strict>
   dbus (send)
@@ -416,7 +420,7 @@ func (iface *fwupdInterface) AppArmorConnectedPlug(spec *apparmor.Specification,
 	if implicitSystemConnectedSlot(slot) {
 		new = "unconfined"
 	} else {
-		new = spec.SnapAppSet().SlotLabelExpression(slot)
+		new = slot.LabelExpression()
 	}
 	snippet := strings.Replace(fwupdConnectedPlugAppArmor, old, new, -1)
 	spec.AddSnippet(snippet)
@@ -460,7 +464,7 @@ func (iface *fwupdInterface) MountPermanentSlot(spec *mount.Specification, slot 
 func (iface *fwupdInterface) AppArmorConnectedSlot(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
 	if !implicitSystemConnectedSlot(slot) {
 		old := "###PLUG_SECURITY_TAGS###"
-		new := spec.SnapAppSet().PlugLabelExpression(plug)
+		new := plug.LabelExpression()
 		snippet := strings.Replace(fwupdConnectedSlotAppArmor, old, new, -1)
 		spec.AddSnippet(snippet)
 	}

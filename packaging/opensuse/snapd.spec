@@ -82,7 +82,7 @@
 
 
 Name:           snapd
-Version:        2.61.3
+Version:        2.67
 Release:        0
 Summary:        Tools enabling systems to work with .snap files
 License:        GPL-3.0
@@ -204,6 +204,8 @@ with_core_bits = 0
 with_alt_snap_mount_dir = %{!?with_alt_snap_mount_dir:0}%{?with_alt_snap_mount_dir:1}
 with_apparmor = %{with apparmor}
 with_testkeys = %{with_testkeys}
+# Disable DWARF and symbol table
+EXTRA_GO_LDFLAGS = -w -s
 __DEFINES__
 
 # Set the version that is compiled into the various executables/
@@ -306,10 +308,6 @@ ln -sf %{_sbindir}/service %{buildroot}%{_sbindir}/rcsnapd.seeded
 ln -sf %{_sbindir}/service %{buildroot}%{_sbindir}/rcsnapd.apparmor
 %endif
 
-# Install Polkit configuration.
-# TODO: This should be handled by data makefile.
-install -m 644 -D %{indigo_srcdir}/data/polkit/io.snapcraft.snapd.policy %{buildroot}%{_datadir}/polkit-1/actions
-
 # Install the "info" data file with snapd version
 # TODO: This should be handled by data makefile.
 install -m 644 -D %{indigo_srcdir}/data/info %{buildroot}%{_libexecdir}/snapd/info
@@ -403,6 +401,7 @@ fi
 %dir %{_sharedstatedir}/snapd/desktop
 %dir %{_sharedstatedir}/snapd/desktop/applications
 %dir %{_sharedstatedir}/snapd/device
+%dir %{_sharedstatedir}/snapd/environment
 %dir %{_sharedstatedir}/snapd/hostfs
 %dir %{_sharedstatedir}/snapd/inhibit
 %dir %{_sharedstatedir}/snapd/lib

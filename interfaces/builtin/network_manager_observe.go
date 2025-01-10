@@ -52,7 +52,7 @@ dbus (receive)
     bus=system
     path="/org/freedesktop/NetworkManager"
     interface="org.freedesktop.NetworkManager"
-    member="Get{,All}Devices"
+    member="Get{Devices,AllDevices,DeviceByIpIface}"
     peer=(label=###PLUG_SECURITY_TAGS###),
 dbus (receive)
     bus=system
@@ -113,7 +113,7 @@ dbus (send)
     bus=system
     path="/org/freedesktop/NetworkManager"
     interface="org.freedesktop.NetworkManager"
-    member="GetDevices"
+    member="Get{Devices,AllDevices,DeviceByIpIface}"
     peer=(label=###SLOT_SECURITY_TAGS###),
 dbus (send)
     bus=system
@@ -201,7 +201,7 @@ func (iface *networkManagerObserveInterface) AppArmorConnectedPlug(spec *apparmo
 		// of the OS and will run unconfined.
 		new = "unconfined"
 	} else {
-		new = spec.SnapAppSet().SlotLabelExpression(slot)
+		new = slot.LabelExpression()
 	}
 	snippet := strings.Replace(networkManagerObserveConnectedPlugAppArmor, old, new, -1)
 	spec.AddSnippet(snippet)
@@ -211,7 +211,7 @@ func (iface *networkManagerObserveInterface) AppArmorConnectedPlug(spec *apparmo
 func (iface *networkManagerObserveInterface) AppArmorConnectedSlot(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
 	if !release.OnClassic {
 		old := "###PLUG_SECURITY_TAGS###"
-		new := spec.SnapAppSet().PlugLabelExpression(plug)
+		new := plug.LabelExpression()
 		snippet := strings.Replace(networkManagerObserveConnectedSlotAppArmor, old, new, -1)
 		spec.AddSnippet(snippet)
 	}

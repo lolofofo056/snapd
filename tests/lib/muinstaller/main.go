@@ -3,7 +3,7 @@
 // +build !nosecboot
 
 /*
- * Copyright (C) 2022 Canonical Ltd
+ * Copyright (C) 2022-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -23,9 +23,10 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -75,7 +76,7 @@ func emptyFixedBlockDevices() (devices []string, err error) {
 	}
 devicesLoop:
 	for _, removableAttr := range removable {
-		val, err := ioutil.ReadFile(removableAttr)
+		val, err := os.ReadFile(removableAttr)
 		if err != nil || string(val) != "0\n" {
 			// removable, ignore
 			continue
@@ -266,7 +267,7 @@ func nodeForPartLabel(dgpairs []*gadget.OnDiskAndGadgetStructurePair, name strin
 // TODO laidoutStructs is used to get the devices, when encryption is
 // happening maybe we need to find the information differently.
 func postSystemsInstallFinish(cli *client.Client,
-	details *client.SystemDetails, bootDevice string,
+	details *client.SystemDetails, bootDevice string, optionalInstallPath string,
 	dgpairs []*gadget.OnDiskAndGadgetStructurePair) error {
 
 	vols := make(map[string]*gadget.Volume)
@@ -283,10 +284,16 @@ func postSystemsInstallFinish(cli *client.Client,
 		vols[volName] = gadgetVol
 	}
 
+	optionalInstall, err := maybeGetOptionalInstall(optionalInstallPath)
+	if err != nil {
+		return err
+	}
+
 	// Finish steps does the writing of assets
 	opts := &client.InstallSystemOptions{
-		Step:      client.InstallStepFinish,
-		OnVolumes: vols,
+		Step:            client.InstallStepFinish,
+		OnVolumes:       vols,
+		OptionalInstall: optionalInstall,
 	}
 	chgId, err := cli.InstallSystem(details.Label, opts)
 	if err != nil {
@@ -294,6 +301,25 @@ func postSystemsInstallFinish(cli *client.Client,
 	}
 	fmt.Printf("Change %s created\n", chgId)
 	return waitChange(chgId)
+}
+
+func maybeGetOptionalInstall(path string) (*client.OptionalInstallRequest, error) {
+	if path == "" {
+		return nil, nil
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var req client.OptionalInstallRequest
+	if err := json.NewDecoder(f).Decode(&req); err != nil {
+		return nil, err
+	}
+
+	return &req, nil
 }
 
 // createAndMountFilesystems creates and mounts filesystems. It returns
@@ -498,7 +524,7 @@ func fillPartiallyDefinedVolume(vol *gadget.Volume, bootDevice string) error {
 	return nil
 }
 
-func run(seedLabel, bootDevice, rootfsCreator string) error {
+func run(seedLabel, bootDevice, rootfsCreator, optionalInstallPath string) error {
 	isCore := rootfsCreator == ""
 	logger.Noticef("installing on %q", bootDevice)
 
@@ -552,7 +578,7 @@ func run(seedLabel, bootDevice, rootfsCreator string) error {
 	if err := unmountFilesystems(mntPts); err != nil {
 		return fmt.Errorf("cannot unmount filesystems: %v", err)
 	}
-	if err := postSystemsInstallFinish(cli, details, bootDevice, dgpairs); err != nil {
+	if err := postSystemsInstallFinish(cli, details, bootDevice, optionalInstallPath, dgpairs); err != nil {
 		return fmt.Errorf("cannot finalize install: %v", err)
 	}
 	// TODO: reboot here automatically (optional)
@@ -561,25 +587,25 @@ func run(seedLabel, bootDevice, rootfsCreator string) error {
 }
 
 func main() {
-	if len(os.Args) < 3 || len(os.Args) > 4 {
-		fmt.Fprintf(os.Stderr, "Usage: %s <seed-label> <target-device> [rootfs-creator]\n"+
-			"If [rootfs-creator] is specified, classic Ubuntu with core boot will be installed.\n"+
-			"Otherwise, Ubuntu Core will be installed\n", os.Args[0])
+	seedLabel := flag.String("label", "", "seed label (required)")
+	bootDevice := flag.String("device", "", "target device (required)")
+	rootfsCreator := flag.String("rootfs-creator", "", "rootfs creator (optional). If specified, classic Ubuntu with core boot will be installed.\nOtherwise, Ubuntu Core will be installed")
+	optionalInstallPath := flag.String("optional", "", "path to optional snaps and components JSON file (optional)")
+
+	flag.Parse()
+
+	if *seedLabel == "" || *bootDevice == "" {
+		flag.Usage()
 		os.Exit(1)
 	}
-	logger.SimpleSetup()
 
-	seedLabel := os.Args[1]
-	bootDevice := os.Args[2]
-	rootfsCreator := ""
-	if len(os.Args) > 3 {
-		rootfsCreator = os.Args[3]
-	}
-	if bootDevice == "auto" {
-		bootDevice = waitForDevice()
+	logger.SimpleSetup(nil)
+
+	if *bootDevice == "auto" {
+		*bootDevice = waitForDevice()
 	}
 
-	if err := run(seedLabel, bootDevice, rootfsCreator); err != nil {
+	if err := run(*seedLabel, *bootDevice, *rootfsCreator, *optionalInstallPath); err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err)
 		os.Exit(1)
 	}

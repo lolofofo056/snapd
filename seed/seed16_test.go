@@ -487,14 +487,25 @@ func (s *seed16Suite) TestLoadMetaCore16(c *C) {
 	pi = essSnaps[2].PlaceInfo()
 	c.Check(pi.Filename(), Equals, "pc_1.snap")
 
-	c.Check(runSnaps, DeepEquals, []*seed.Snap{
-		{
-			Path:     s.expectedPath("required"),
-			SideInfo: &s.AssertedSnapInfo("required").SideInfo,
-			Required: true,
-			Channel:  "stable",
-		},
-	})
+	requiredExpect := &seed.Snap{
+		Path:     s.expectedPath("required"),
+		SideInfo: &s.AssertedSnapInfo("required").SideInfo,
+		Required: true,
+		Channel:  "stable",
+	}
+	c.Check(runSnaps, DeepEquals, []*seed.Snap{requiredExpect})
+
+	requiredSnap, err := s.seed16.ModeSnap("required", "run")
+	c.Assert(err, IsNil)
+	c.Check(requiredSnap, DeepEquals, requiredExpect)
+
+	notExistsSnap, err := s.seed16.ModeSnap("not-exists", "run")
+	c.Assert(notExistsSnap, IsNil)
+	c.Assert(err, ErrorMatches, "snap not-exists not found in seed")
+
+	requiredSnap, err = s.seed16.ModeSnap("required", "ephemeral")
+	c.Assert(requiredSnap, IsNil)
+	c.Assert(err, ErrorMatches, "internal error: Core 16/18 have only run mode, got: ephemeral")
 }
 
 func (s *seed16Suite) TestLoadMetaCore18Minimal(c *C) {
@@ -1022,10 +1033,10 @@ func (s *seed16Suite) TestLoadMetaCore18SnapHandler(c *C) {
 	})
 
 	c.Check(h.asserted, DeepEquals, map[string]string{
-		"snapd":     "snaps/snapd_1.0_all.snap:snapd:1",
-		"pc-kernel": "snaps/pc-kernel_1.0_all.snap:kernel:1",
-		"core18":    "snaps/core18_1.0_all.snap:base:1",
-		"pc":        "snaps/pc_1.0_all.snap:gadget:1",
+		"snapd":     "snaps/snapd_1.0_all.snap",
+		"pc-kernel": "snaps/pc-kernel_1.0_all.snap",
+		"core18":    "snaps/core18_1.0_all.snap",
+		"pc":        "snaps/pc_1.0_all.snap",
 	})
 	c.Check(h.unasserted, DeepEquals, map[string]string{
 		"required18": "snaps/required18_1.0_all.snap",
@@ -1103,10 +1114,10 @@ func (s *seed16Suite) TestLoadMetaCore18SnapHandlerChangePath(c *C) {
 	})
 
 	c.Check(h.asserted, DeepEquals, map[string]string{
-		"snapd":     "snaps/snapd_1.0_all.snap:snapd:1",
-		"pc-kernel": "snaps/pc-kernel_1.0_all.snap:kernel:1",
-		"core18":    "snaps/core18_1.0_all.snap:base:1",
-		"pc":        "snaps/pc_1.0_all.snap:gadget:1",
+		"snapd":     "snaps/snapd_1.0_all.snap",
+		"pc-kernel": "snaps/pc-kernel_1.0_all.snap",
+		"core18":    "snaps/core18_1.0_all.snap",
+		"pc":        "snaps/pc_1.0_all.snap",
 	})
 	c.Check(h.unasserted, DeepEquals, map[string]string{
 		"required18": "snaps/required18_1.0_all.snap",
@@ -1467,10 +1478,10 @@ func (s *seed16Suite) TestLoadEssentialMetaWithSnapHandlerCore18(c *C) {
 	c.Check(essSnaps, DeepEquals, expected)
 
 	c.Check(h.asserted, DeepEquals, map[string]string{
-		"snapd":     "snaps/snapd_1.0_all.snap:snapd:1",
-		"pc-kernel": "snaps/pc-kernel_1.0_all.snap:kernel:1",
-		"core18":    "snaps/core18_1.0_all.snap:base:1",
-		"pc":        "snaps/pc_1.0_all.snap:gadget:1",
+		"snapd":     "snaps/snapd_1.0_all.snap",
+		"pc-kernel": "snaps/pc-kernel_1.0_all.snap",
+		"core18":    "snaps/core18_1.0_all.snap",
+		"pc":        "snaps/pc_1.0_all.snap",
 	})
 }
 

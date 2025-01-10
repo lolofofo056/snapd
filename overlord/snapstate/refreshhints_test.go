@@ -21,6 +21,7 @@ package snapstate_test
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	. "gopkg.in/check.v1"
@@ -34,10 +35,12 @@ import (
 	"github.com/snapcore/snapd/overlord/configstate/config"
 	"github.com/snapcore/snapd/overlord/ifacestate/ifacerepo"
 	"github.com/snapcore/snapd/overlord/snapstate"
+	"github.com/snapcore/snapd/overlord/snapstate/sequence"
 	"github.com/snapcore/snapd/overlord/snapstate/snapstatetest"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/release"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
 	"github.com/snapcore/snapd/snap/snaptest"
 	"github.com/snapcore/snapd/store"
 	"github.com/snapcore/snapd/store/storetest"
@@ -48,6 +51,7 @@ type recordingStore struct {
 	storetest.Store
 
 	ops            []string
+	opOpts         []store.RefreshOptions
 	refreshedSnaps []*snap.Info
 }
 
@@ -66,11 +70,29 @@ func (r *recordingStore) SnapAction(ctx context.Context, currentSnaps []*store.C
 			panic("expected refresh actions")
 		}
 	}
+	actionOpts := store.RefreshOptions{}
+	if opts != nil {
+		actionOpts = *opts
+	}
+
 	r.ops = append(r.ops, "list-refresh")
+	r.opOpts = append(r.opOpts, actionOpts)
 
 	res := []store.SnapActionResult{}
 	for _, rs := range r.refreshedSnaps {
-		res = append(res, store.SnapActionResult{Info: rs})
+		result := store.SnapActionResult{Info: rs}
+		for _, comp := range rs.Components {
+			result.Resources = append(result.Resources, store.SnapResourceResult{
+				Name:      comp.Name,
+				Type:      fmt.Sprintf("component/%s", string(comp.Type)),
+				Version:   "1.0",
+				CreatedAt: "2024-01-01T00:00:00Z",
+				// just using the snap revision here, this should be fine for
+				// most testing
+				Revision: rs.Revision.N,
+			})
+		}
+		res = append(res, result)
 	}
 	return res, nil, nil
 }
@@ -116,7 +138,7 @@ func (s *refreshHintsTestSuite) SetUpTest(c *C) {
 	restoreModel := snapstatetest.MockDeviceModel(DefaultModel())
 	s.AddCleanup(restoreModel)
 	restoreEnforcedValidationSets := snapstate.MockEnforcedValidationSets(func(st *state.State, extraVss ...*asserts.ValidationSet) (*snapasserts.ValidationSets, error) {
-		return nil, nil
+		return snapasserts.NewValidationSets(), nil
 	})
 	s.AddCleanup(restoreEnforcedValidationSets)
 	s.AddCleanup(func() {
@@ -126,11 +148,34 @@ func (s *refreshHintsTestSuite) SetUpTest(c *C) {
 	})
 }
 
-func (s *refreshHintsTestSuite) TestLastRefresh(c *C) {
+func (s *refreshHintsTestSuite) TestListRefresh(c *C) {
 	rh := snapstate.NewRefreshHints(s.state)
 	err := rh.Ensure()
 	c.Check(err, IsNil)
 	c.Check(s.store.ops, DeepEquals, []string{"list-refresh"})
+	c.Check(s.store.opOpts, DeepEquals, []store.RefreshOptions{
+		{PrivacyKey: "privacy-key"},
+	})
+}
+
+func (s *refreshHintsTestSuite) TestListRefreshReportsManaged(c *C) {
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	tr := config.NewTransaction(s.state)
+	err := tr.Set("core", "refresh.timer", "managed")
+	c.Assert(err, IsNil)
+	tr.Commit()
+
+	s.state.Unlock()
+	rh := snapstate.NewRefreshHints(s.state)
+	err = rh.Ensure()
+	s.state.Lock()
+	c.Check(err, IsNil)
+	c.Check(s.store.ops, DeepEquals, []string{"list-refresh"})
+	c.Check(s.store.opOpts, DeepEquals, []store.RefreshOptions{
+		{RefreshManaged: true, PrivacyKey: "privacy-key"},
+	})
 }
 
 func (s *refreshHintsTestSuite) TestLastRefreshNoRefreshNeeded(c *C) {
@@ -201,11 +246,21 @@ func (s *refreshHintsTestSuite) TestRefreshHintsStoresRefreshCandidates(c *C) {
 	}
 	ifacerepo.Replace(s.state, repo)
 
+	seq := snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
+		{RealName: "other-snap", Revision: snap.R(1), SnapID: "other-snap-id"},
+	})
+
+	seq.AddComponentForRevision(snap.R(1), &sequence.ComponentState{
+		SideInfo: &snap.ComponentSideInfo{
+			Component: naming.NewComponentRef("other-snap", "comp1"),
+			Revision:  snap.R(1),
+		},
+		CompType: snap.StandardComponent,
+	})
+
 	snapstate.Set(s.state, "other-snap", &snapstate.SnapState{
-		Active: true,
-		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
-			{RealName: "other-snap", Revision: snap.R(1), SnapID: "other-snap-id"},
-		}),
+		Active:          true,
+		Sequence:        seq,
 		Current:         snap.R(1),
 		SnapType:        "app",
 		TrackingChannel: "devel",
@@ -220,9 +275,16 @@ func (s *refreshHintsTestSuite) TestRefreshHintsStoresRefreshCandidates(c *C) {
 		SideInfo: snap.SideInfo{
 			RealName: "other-snap",
 			Revision: snap.R(2),
+			SnapID:   "other-snap-id",
 		},
 		DownloadInfo: snap.DownloadInfo{
 			Size: int64(88),
+		},
+		Components: map[string]*snap.Component{
+			"comp1": {
+				Type: snap.StandardComponent,
+				Name: "comp1",
+			},
 		},
 	}
 	plugs := map[string]*snap.PlugInfo{
@@ -235,7 +297,8 @@ func (s *refreshHintsTestSuite) TestRefreshHintsStoresRefreshCandidates(c *C) {
 				"content":          "some-content",
 			},
 			Apps: map[string]*snap.AppInfo{},
-		}}
+		},
+	}
 	info2.Plugs = plugs
 
 	s.store.refreshedSnaps = []*snap.Info{{
@@ -246,11 +309,24 @@ func (s *refreshHintsTestSuite) TestRefreshHintsStoresRefreshCandidates(c *C) {
 		SideInfo: snap.SideInfo{
 			RealName: "some-snap",
 			Revision: snap.R(1),
+			SnapID:   "some-snap-id",
 		},
 		DownloadInfo: snap.DownloadInfo{
 			Size: int64(99),
 		},
 	}, info2}
+
+	restore := snapstate.MockReadComponentInfo(func(compMntDir string, info *snap.Info, csi *snap.ComponentSideInfo) (*snap.ComponentInfo, error) {
+		c.Check(csi.Component.ComponentName, Equals, "comp1")
+		c.Check(csi.Component.SnapName, Equals, "other-snap")
+		return &snap.ComponentInfo{
+			Component:         csi.Component,
+			Type:              snap.StandardComponent,
+			CompVersion:       "1.0",
+			ComponentSideInfo: *csi,
+		}, nil
+	})
+	defer restore()
 
 	rh := snapstate.NewRefreshHints(s.state)
 	err := rh.Ensure()
@@ -279,12 +355,15 @@ func (s *refreshHintsTestSuite) TestRefreshHintsStoresRefreshCandidates(c *C) {
 	c.Check(cand2.Type(), Equals, snap.TypeApp)
 	c.Check(cand2.DownloadSize(), Equals, int64(88))
 	c.Check(cand2.Version, Equals, "v1")
+	c.Check(cand2.Components, HasLen, 1)
+	c.Check(cand2.Components[0].CompSideInfo.Component, Equals, naming.NewComponentRef("other-snap", "comp1"))
+	c.Check(cand2.Components[0].CompSideInfo.Revision, Equals, snap.R(2))
 
 	var snapst1 snapstate.SnapState
 	err = snapstate.Get(s.state, "some-snap", &snapst1)
 	c.Assert(err, IsNil)
 
-	sup, snapst, err := cand1.SnapSetupForUpdate(s.state, nil, 0, nil, nil)
+	sup, snapst, err := cand1.SnapSetupForUpdate(s.state, nil)
 	c.Assert(err, IsNil)
 	c.Check(sup, DeepEquals, &snapstate.SnapSetup{
 		Base:    "some-base",
@@ -293,6 +372,7 @@ func (s *refreshHintsTestSuite) TestRefreshHintsStoresRefreshCandidates(c *C) {
 		SideInfo: &snap.SideInfo{
 			RealName: "some-snap",
 			Revision: snap.R(1),
+			SnapID:   "some-snap-id",
 		},
 		PlugsOnly: true,
 		CohortKey: "cohort",
@@ -310,7 +390,7 @@ func (s *refreshHintsTestSuite) TestRefreshHintsStoresRefreshCandidates(c *C) {
 	err = snapstate.Get(s.state, "other-snap", &snapst2)
 	c.Assert(err, IsNil)
 
-	sup, snapst, err = cand2.SnapSetupForUpdate(s.state, nil, 0, nil, nil)
+	sup, snapst, err = cand2.SnapSetupForUpdate(s.state, nil)
 	c.Assert(err, IsNil)
 	c.Check(sup, DeepEquals, &snapstate.SnapSetup{
 		Type:    "app",
@@ -318,6 +398,7 @@ func (s *refreshHintsTestSuite) TestRefreshHintsStoresRefreshCandidates(c *C) {
 		SideInfo: &snap.SideInfo{
 			RealName: "other-snap",
 			Revision: snap.R(2),
+			SnapID:   "other-snap-id",
 		},
 		Prereq:             []string{"foo-snap"},
 		PrereqContentAttrs: map[string][]string{"foo-snap": {"some-content"}},

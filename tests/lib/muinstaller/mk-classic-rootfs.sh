@@ -1,6 +1,6 @@
 #!/bin/bash
 
-set -e
+set -ex
 
 # uncomment for better debug messages
 #set -x
@@ -17,7 +17,7 @@ prepare_classic_rootfs() {
         echo "internal error: prepare_classic_rootfs called without 'ROLE'"
         exit 1
     fi
-    
+
     # Create basic devices to be able to install packages
     [ -e "$DESTDIR"/dev/null ] || sudo mknod -m 666 "$DESTDIR"/dev/null c 1 3
     [ -e "$DESTDIR"/dev/zero ] || sudo mknod -m 666 "$DESTDIR"/dev/zero c 1 5
@@ -63,9 +63,13 @@ EOF
 		 "DEBIAN_FRONTEND=noninteractive apt install -y /var/cache/apt/archives/$(basename "$package")"
 	fi
     fi
-        
-    # ensure we can login
+
+    # ensure we can login.
     sudo chroot "$DESTDIR" /usr/sbin/adduser --disabled-password --gecos "" user1
+    # since when booting into recovery mode, we import users from the host
+    # system that are in the sudo and admin groups, we make sure to add our user
+    # to the sudo group.
+    sudo chroot "$DESTDIR" /usr/sbin/adduser user1 sudo
     printf "ubuntu\nubuntu\n" | sudo chroot "$DESTDIR" /usr/bin/passwd user1
     echo "user1 ALL=(ALL) NOPASSWD:ALL" | sudo tee -a "$DESTDIR"/etc/sudoers
 
@@ -100,7 +104,19 @@ if [ -f /cdrom/casper/base.squashfs ]; then
 else
     BASETAR=ubuntu-base.tar.gz
     # important to use "-q" to avoid journalctl suppressing  log output
-    wget -q -c http://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04.1-base-amd64.tar.gz -O "$BASETAR"
+    release=$(lsb_release -r -s)
+    case "$release" in
+        22.04)
+            pointrel=.4
+            ;;
+        24.04)
+            pointrel=.1
+            ;;
+        *)
+            pointrel=
+            ;;
+    esac
+    wget -q -c http://cdimage.ubuntu.com/ubuntu-base/releases/"$release"/release/ubuntu-base-"$release""$pointrel"-base-amd64.tar.gz -O "$BASETAR"
     sudo tar -C "$DST" -xf "$BASETAR"
     ROLE=spread
 fi

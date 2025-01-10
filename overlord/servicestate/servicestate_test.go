@@ -21,12 +21,11 @@ package servicestate_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
-	"os/user"
 	"path/filepath"
 	"strings"
 
@@ -35,6 +34,7 @@ import (
 	"github.com/snapcore/snapd/client"
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/gadget/quantity"
+	"github.com/snapcore/snapd/osutil/user"
 	"github.com/snapcore/snapd/overlord/configstate/config"
 	"github.com/snapcore/snapd/overlord/servicestate"
 	"github.com/snapcore/snapd/overlord/servicestate/servicestatetest"
@@ -46,16 +46,41 @@ import (
 	"github.com/snapcore/snapd/snap/snaptest"
 	"github.com/snapcore/snapd/systemd"
 	"github.com/snapcore/snapd/testutil"
+	"github.com/snapcore/snapd/usersession/agent"
 	"github.com/snapcore/snapd/wrappers"
 )
 
-type statusDecoratorSuite struct{}
+type statusDecoratorSuite struct {
+	testutil.DBusTest
+	tempdir string
+	agent   *agent.SessionAgent
+}
 
 var _ = Suite(&statusDecoratorSuite{})
 
+func (s *statusDecoratorSuite) SetUpTest(c *C) {
+	s.DBusTest.SetUpTest(c)
+	s.tempdir = c.MkDir()
+	dirs.SetRootDir(s.tempdir)
+
+	xdgRuntimeDir := fmt.Sprintf("%s/%d", dirs.XdgRuntimeDirBase, os.Getuid())
+	err := os.MkdirAll(xdgRuntimeDir, 0700)
+	c.Assert(err, IsNil)
+	s.agent, err = agent.New()
+	c.Assert(err, IsNil)
+	s.agent.Start()
+}
+
+func (s *statusDecoratorSuite) TearDownTest(c *C) {
+	if s.agent != nil {
+		err := s.agent.Stop()
+		c.Check(err, IsNil)
+	}
+	dirs.SetRootDir("")
+	s.DBusTest.TearDownTest(c)
+}
+
 func (s *statusDecoratorSuite) TestDecorateWithStatus(c *C) {
-	dirs.SetRootDir(c.MkDir())
-	defer dirs.SetRootDir("")
 	snp := &snap.Info{
 		SideInfo: snap.SideInfo{
 			RealName: "foo",
@@ -229,7 +254,8 @@ NeedDaemonReload=no
 			{Name: "org.example.Svc", Type: "dbus", Active: true, Enabled: true},
 		})
 
-		// No state is currently extracted for user daemons
+		// When using a decorator without any uid provided, the global status is
+		// fetched, which is only enablement
 		app = &client.AppInfo{
 			Snap:   snp.InstanceName(),
 			Name:   "svc",
@@ -276,159 +302,112 @@ NeedDaemonReload=no
 	}
 }
 
-type userSelectorSuite struct{}
-
-var _ = Suite(&userSelectorSuite{})
-
-func (s *userSelectorSuite) TestUserScopeMarshalListOfUsernames(c *C) {
-	us := servicestate.UserSelector{
-		Names: []string{"user", "user-two"},
+func (s *statusDecoratorSuite) TestUserServiceDecorateWithStatus(c *C) {
+	snp := &snap.Info{
+		SideInfo: snap.SideInfo{
+			RealName: "foo",
+			Revision: snap.R(1),
+		},
 	}
-	b, err := json.Marshal(us)
+	err := os.MkdirAll(snp.MountDir(), 0755)
 	c.Assert(err, IsNil)
-	c.Check(string(b), Equals, `["user","user-two"]`)
-}
-
-func (s *userSelectorSuite) TestUserScopeMarshalStringKeyword(c *C) {
-	us := servicestate.UserSelector{
-		Selector: servicestate.UserSelectionSelf,
-	}
-	b, err := json.Marshal(us)
+	err = os.Symlink(snp.Revision.String(), filepath.Join(filepath.Dir(snp.MountDir()), "current"))
 	c.Assert(err, IsNil)
-	c.Check(string(b), Equals, `"self"`)
-}
 
-func (s *userSelectorSuite) TestUserScopeMarshalInvalidSelector(c *C) {
-	us := servicestate.UserSelector{
-		Selector: 42,
-	}
-	_, err := json.Marshal(us)
-	c.Assert(err, ErrorMatches, `.* internal error: unsupported selector 42 specified`)
-}
+	disabled := false
+	r := systemd.MockSystemctl(func(args ...string) (buf []byte, err error) {
+		c.Check(args[0], Equals, "--user")
+		c.Check(args[1], Equals, "show")
+		unit := args[3]
 
-func (s *userSelectorSuite) TestUserScopeUnmarshalInvalidType(c *C) {
-	const userScopeJson = `1`
-	var us servicestate.UserSelector
-	err := json.Unmarshal([]byte(userScopeJson), &us)
-	c.Assert(err, ErrorMatches, `cannot unmarshal, expected a string or a list of strings`)
-}
+		activeState, unitState := "active", "enabled"
+		if disabled {
+			activeState = "inactive"
+			unitState = "disabled"
+		}
 
-func (s *userSelectorSuite) TestUserScopeUnmarshalListOfUsernames(c *C) {
-	const userScopeJson = `["my-user","other-user"]`
-	var us servicestate.UserSelector
-	err := json.Unmarshal([]byte(userScopeJson), &us)
-	c.Assert(err, IsNil)
-	c.Check(us, DeepEquals, servicestate.UserSelector{
-		Names: []string{"my-user", "other-user"},
+		if strings.HasSuffix(unit, ".timer") || strings.HasSuffix(unit, ".socket") || strings.HasSuffix(unit, ".target") {
+			// Units using the baseProperties query
+			return []byte(fmt.Sprintf(`Id=%s
+Names=%[1]s
+ActiveState=%s
+UnitFileState=%s
+`, unit, activeState, unitState)), nil
+		} else {
+			// Units using the extendedProperties query
+			return []byte(fmt.Sprintf(`Id=%s
+Names=%[1]s
+Type=simple
+ActiveState=%s
+UnitFileState=%s
+NeedDaemonReload=no
+`, unit, activeState, unitState)), nil
+		}
 	})
-}
+	defer r()
 
-func (s *userSelectorSuite) TestUserScopeUnmarshalStringKeyword(c *C) {
-	const userScopeJson = `"all"`
-	var us servicestate.UserSelector
-	err := json.Unmarshal([]byte(userScopeJson), &us)
+	curr, err := user.Current()
 	c.Assert(err, IsNil)
-	c.Check(us, DeepEquals, servicestate.UserSelector{
-		Selector: servicestate.UserSelectionAll,
-	})
-}
 
-func (s *userSelectorSuite) TestUserListCurrentUser(c *C) {
-	us := servicestate.UserSelector{
-		Selector: servicestate.UserSelectionSelf,
+	sd := servicestate.NewStatusDecoratorForUid(nil, context.Background(), curr.Uid)
+
+	// not a service
+	app := &client.AppInfo{
+		Snap: "foo",
+		Name: "app",
 	}
+	snapApp := &snap.AppInfo{Snap: snp, Name: "app"}
 
-	users, err := us.UserList(&user.User{
-		Uid:      "1000",
-		Username: "my-user",
-	})
+	err = sd.DecorateWithStatus(app, snapApp)
 	c.Assert(err, IsNil)
-	c.Check(users, DeepEquals, []string{"my-user"})
-}
 
-func (s *userSelectorSuite) TestUserListCurrentUserInvalidNil(c *C) {
-	us := servicestate.UserSelector{
-		Selector: servicestate.UserSelectionSelf,
+	for _, enabled := range []bool{true, false} {
+		disabled = !enabled
+
+		app = &client.AppInfo{
+			Snap:   snp.InstanceName(),
+			Name:   "svc",
+			Daemon: "simple",
+		}
+		snapApp = &snap.AppInfo{
+			Snap:        snp,
+			Name:        "svc",
+			Daemon:      "simple",
+			DaemonScope: snap.UserDaemon,
+		}
+		snapApp.Sockets = map[string]*snap.SocketInfo{
+			"socket1": {
+				App:          snapApp,
+				Name:         "socket1",
+				ListenStream: "a.socket",
+			},
+		}
+		snapApp.Timer = &snap.TimerInfo{
+			App:   snapApp,
+			Timer: "10:00",
+		}
+		snapApp.ActivatesOn = []*snap.SlotInfo{
+			{
+				Snap:      snp,
+				Name:      "dbus-slot",
+				Interface: "dbus",
+				Attrs: map[string]interface{}{
+					"bus":  "session",
+					"name": "org.example.Svc",
+				},
+			},
+		}
+
+		err = sd.DecorateWithStatus(app, snapApp)
+		c.Assert(err, IsNil)
+		c.Check(app.Active, Equals, enabled)
+		c.Check(app.Enabled, Equals, true) // when a service is slot activated its always enabled
+		c.Check(app.Activators, DeepEquals, []client.AppActivator{
+			{Name: "socket1", Type: "socket", Active: enabled, Enabled: enabled},
+			{Name: "svc", Type: "timer", Active: enabled, Enabled: enabled},
+			{Name: "org.example.Svc", Type: "dbus", Active: true, Enabled: true},
+		})
 	}
-
-	users, err := us.UserList(nil)
-	c.Assert(err, ErrorMatches, `internal error: for "self" the current user must be provided`)
-	c.Check(users, IsNil)
-}
-
-func (s *userSelectorSuite) TestUserListCurrentUserNotValidForRoot(c *C) {
-	us := servicestate.UserSelector{
-		Selector: servicestate.UserSelectionSelf,
-	}
-
-	users, err := us.UserList(&user.User{
-		Uid:      "0",
-		Username: "my-user",
-	})
-	c.Assert(err, ErrorMatches, `cannot use "self" for root user`)
-	c.Check(users, IsNil)
-}
-
-func (s *userSelectorSuite) TestUserListInvalidSelector(c *C) {
-	us := servicestate.UserSelector{
-		Selector: 42,
-	}
-
-	users, err := us.UserList(nil)
-	c.Assert(err, ErrorMatches, `internal error: unsupported selector 42 specified`)
-	c.Check(users, IsNil)
-}
-
-func (s *userSelectorSuite) TestUserListUsersReturnsEmpty(c *C) {
-	us := servicestate.UserSelector{
-		Selector: servicestate.UserSelectionAll,
-	}
-
-	users, err := us.UserList(nil)
-	c.Assert(err, IsNil)
-	c.Check(users, IsNil)
-}
-
-type scopeSelectorSuite struct{}
-
-var _ = Suite(&scopeSelectorSuite{})
-
-func (s *scopeSelectorSuite) TestScopeUnmarshalInvalidType(c *C) {
-	const userScopeJson = `1`
-	var us servicestate.ScopeSelector
-	err := json.Unmarshal([]byte(userScopeJson), &us)
-	c.Assert(err, ErrorMatches, `cannot unmarshal, expected a list of strings`)
-}
-
-func (s *scopeSelectorSuite) TestScopeUnmarshalInvalidKeyword(c *C) {
-	const userScopeJson = `["all"]`
-	var us servicestate.ScopeSelector
-	err := json.Unmarshal([]byte(userScopeJson), &us)
-	c.Assert(err, ErrorMatches, `cannot unmarshal, expected one of: "system", "user"`)
-}
-
-func (s *scopeSelectorSuite) TestScopeUnmarshalNone(c *C) {
-	const userScopeJson = `[]`
-	var us servicestate.ScopeSelector
-	err := json.Unmarshal([]byte(userScopeJson), &us)
-	c.Assert(err, IsNil)
-	c.Check(us, DeepEquals, servicestate.ScopeSelector{})
-}
-
-func (s *scopeSelectorSuite) TestScopeUnmarshalSystem(c *C) {
-	const userScopeJson = `["system"]`
-	var us servicestate.ScopeSelector
-	err := json.Unmarshal([]byte(userScopeJson), &us)
-	c.Assert(err, IsNil)
-	c.Check(us, DeepEquals, servicestate.ScopeSelector{"system"})
-}
-
-func (s *scopeSelectorSuite) TestScopeUnmarshalUser(c *C) {
-	const userScopeJson = `["user"]`
-	var us servicestate.ScopeSelector
-	err := json.Unmarshal([]byte(userScopeJson), &us)
-	c.Assert(err, IsNil)
-	c.Check(us, DeepEquals, servicestate.ScopeSelector{"user"})
 }
 
 type instructionSuite struct {
@@ -486,7 +465,7 @@ func (s *instructionSuite) TestUnmarshalEmpty(c *C) {
 	// Scope and users has custom unmarshal logic, test they are set
 	// to expected empty values
 	c.Check(us.Scope, HasLen, 0)
-	c.Check(us.Users.Selector, Equals, servicestate.UserSelectionList)
+	c.Check(us.Users.Selector, Equals, client.UserSelectionList)
 	c.Check(us.Users.Names, HasLen, 0)
 }
 
@@ -506,7 +485,7 @@ func (s *instructionSuite) TestUnmarshalSimple(c *C) {
 	// Scope and users has custom unmarshal logic, test they are set
 	// to expected empty values
 	c.Check(us.Scope, HasLen, 0)
-	c.Check(us.Users.Selector, Equals, servicestate.UserSelectionList)
+	c.Check(us.Users.Selector, Equals, client.UserSelectionList)
 	c.Check(us.Users.Names, HasLen, 0)
 }
 
@@ -522,8 +501,8 @@ func (s *instructionSuite) TestUnmarshalWithScopes(c *C) {
 			Reload: true,
 		},
 		Scope: []string{"user"},
-		Users: servicestate.UserSelector{
-			Selector: servicestate.UserSelectionAll,
+		Users: client.UserSelector{
+			Selector: client.UserSelectionAll,
 		},
 	})
 }
@@ -531,25 +510,25 @@ func (s *instructionSuite) TestUnmarshalWithScopes(c *C) {
 func (s *instructionSuite) TestEnsureDefaultScopeForUserDefaultRoot(c *C) {
 	inst := &servicestate.Instruction{}
 	inst.EnsureDefaultScopeForUser(s.rootUser)
-	c.Check(inst.Scope, DeepEquals, servicestate.ScopeSelector{"system", "user"})
+	c.Check(inst.Scope, DeepEquals, client.ScopeSelector{"system", "user"})
 }
 
 func (s *instructionSuite) TestEnsureDefaultScopeForUserAlreadySetDoesNothingRoot(c *C) {
-	inst := &servicestate.Instruction{Scope: servicestate.ScopeSelector{"system"}}
+	inst := &servicestate.Instruction{Scope: client.ScopeSelector{"system"}}
 	inst.EnsureDefaultScopeForUser(s.rootUser)
-	c.Check(inst.Scope, DeepEquals, servicestate.ScopeSelector{"system"})
+	c.Check(inst.Scope, DeepEquals, client.ScopeSelector{"system"})
 }
 
 func (s *instructionSuite) TestEnsureDefaultScopeForUserDefaultNonRoot(c *C) {
 	inst := &servicestate.Instruction{}
 	inst.EnsureDefaultScopeForUser(s.defaultUser)
-	c.Check(inst.Scope, DeepEquals, servicestate.ScopeSelector{"system"})
+	c.Check(inst.Scope, DeepEquals, client.ScopeSelector{"system"})
 }
 
 func (s *instructionSuite) TestEnsureDefaultScopeForUserAlreadySetDoesNothingNonRoot(c *C) {
-	inst := &servicestate.Instruction{Scope: servicestate.ScopeSelector{"user"}}
+	inst := &servicestate.Instruction{Scope: client.ScopeSelector{"user"}}
 	inst.EnsureDefaultScopeForUser(s.defaultUser)
-	c.Check(inst.Scope, DeepEquals, servicestate.ScopeSelector{"user"})
+	c.Check(inst.Scope, DeepEquals, client.ScopeSelector{"user"})
 }
 
 func (s *instructionSuite) TestValidateNoScopesForRootOnlySystemServicesHappy(c *C) {
@@ -574,34 +553,34 @@ func (s *instructionSuite) TestValidateNoScopesForNonRootMixServicesFails(c *C) 
 
 func (s *instructionSuite) TestValidateNoUsersForRootOnlySystemServicesHappy(c *C) {
 	// Provide scopes to avoid hitting any checks in validateScope
-	inst := &servicestate.Instruction{Scope: servicestate.ScopeSelector{"system", "user"}}
+	inst := &servicestate.Instruction{Scope: client.ScopeSelector{"system", "user"}}
 	c.Check(inst.Validate(s.rootUser, s.systemServices), IsNil)
 }
 
 func (s *instructionSuite) TestValidateNoUsersForRootMixServicesHappy(c *C) {
 	// Provide scopes to avoid hitting any checks in validateScope
-	inst := &servicestate.Instruction{Scope: servicestate.ScopeSelector{"system", "user"}}
+	inst := &servicestate.Instruction{Scope: client.ScopeSelector{"system", "user"}}
 	c.Check(inst.Validate(s.rootUser, s.mixServices), IsNil)
 }
 
 func (s *instructionSuite) TestValidateNoUsersForNonRootOnlySystemServicesHappy(c *C) {
 	// Provide scopes to avoid hitting any checks in validateScope
-	inst := &servicestate.Instruction{Scope: servicestate.ScopeSelector{"system", "user"}}
+	inst := &servicestate.Instruction{Scope: client.ScopeSelector{"system", "user"}}
 	c.Check(inst.Validate(s.defaultUser, s.systemServices), IsNil)
 }
 
 func (s *instructionSuite) TestValidateAllUsersForNonRootHappy(c *C) {
 	// Provide scopes to avoid hitting any checks in validateScope
 	inst := &servicestate.Instruction{
-		Scope: servicestate.ScopeSelector{"system", "user"},
-		Users: servicestate.UserSelector{Selector: servicestate.UserSelectionAll},
+		Scope: client.ScopeSelector{"system", "user"},
+		Users: client.UserSelector{Selector: client.UserSelectionAll},
 	}
 	c.Check(inst.Validate(s.defaultUser, s.mixServices), IsNil)
 }
 
 func (s *instructionSuite) TestValidateNoUsersForNonRootMixServicesFails(c *C) {
 	// Provide scopes to avoid hitting any checks in validateScope
-	inst := &servicestate.Instruction{Scope: servicestate.ScopeSelector{"system", "user"}}
+	inst := &servicestate.Instruction{Scope: client.ScopeSelector{"system", "user"}}
 	c.Check(inst.Validate(s.defaultUser, s.mixServices), ErrorMatches, `non-root users must specify users when targeting user services`)
 }
 
@@ -842,8 +821,8 @@ func (s *snapServiceOptionsSuite) TestServiceControlServiceAction(c *C) {
 		{
 			&servicestate.Instruction{
 				Action: "start",
-				Scope:  servicestate.ScopeSelector{"user"},
-				Users:  servicestate.UserSelector{Names: []string{"my-user"}},
+				Scope:  client.ScopeSelector{"user"},
+				Users:  client.UserSelector{Names: []string{"my-user"}},
 				StartOptions: client.StartOptions{
 					Enable: true,
 				},
@@ -862,8 +841,8 @@ func (s *snapServiceOptionsSuite) TestServiceControlServiceAction(c *C) {
 		{
 			&servicestate.Instruction{
 				Action: "restart",
-				Scope:  servicestate.ScopeSelector{"user"},
-				Users:  servicestate.UserSelector{Names: []string{"foo"}},
+				Scope:  client.ScopeSelector{"user"},
+				Users:  client.UserSelector{Names: []string{"foo"}},
 			},
 			&servicestate.ServiceAction{
 				SnapName:                "foo",
@@ -879,7 +858,7 @@ func (s *snapServiceOptionsSuite) TestServiceControlServiceAction(c *C) {
 		{
 			&servicestate.Instruction{
 				Action: "restart",
-				Scope:  servicestate.ScopeSelector{"system"},
+				Scope:  client.ScopeSelector{"system"},
 				Names:  []string{"foo.svc2"},
 			},
 			&servicestate.ServiceAction{
@@ -898,8 +877,8 @@ func (s *snapServiceOptionsSuite) TestServiceControlServiceAction(c *C) {
 				Action:         "restart",
 				RestartOptions: client.RestartOptions{Reload: true},
 				Names:          []string{"foo.svc2", "foo.svc1"},
-				Scope:          servicestate.ScopeSelector{"system", "user"},
-				Users:          servicestate.UserSelector{Names: []string{"foo"}},
+				Scope:          client.ScopeSelector{"system", "user"},
+				Users:          client.UserSelector{Names: []string{"foo"}},
 			},
 			&servicestate.ServiceAction{
 				SnapName:                "foo",
@@ -916,8 +895,8 @@ func (s *snapServiceOptionsSuite) TestServiceControlServiceAction(c *C) {
 			&servicestate.Instruction{
 				Action: "stop",
 				Names:  []string{"foo.svc1"},
-				Scope:  servicestate.ScopeSelector{"user"},
-				Users:  servicestate.UserSelector{Names: []string{"baz"}},
+				Scope:  client.ScopeSelector{"user"},
+				Users:  client.UserSelector{Names: []string{"baz"}},
 			},
 			&servicestate.ServiceAction{
 				SnapName:         "foo",
@@ -975,7 +954,7 @@ func (s *snapServiceOptionsSuite) TestLogReader(c *C) {
 		c.Check(n, Equals, 100)
 		c.Check(follow, Equals, false)
 		c.Check(namespaces, Equals, false)
-		return ioutil.NopCloser(strings.NewReader("")), nil
+		return io.NopCloser(strings.NewReader("")), nil
 	})
 	defer restore()
 
@@ -1053,7 +1032,7 @@ func (s *snapServiceOptionsSuite) TestLogReaderNamespaces(c *C) {
 		c.Check(n, Equals, 100)
 		c.Check(follow, Equals, false)
 		c.Check(namespaces, Equals, true)
-		return ioutil.NopCloser(strings.NewReader("")), nil
+		return io.NopCloser(strings.NewReader("")), nil
 	})
 	defer restore()
 

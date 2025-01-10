@@ -2277,15 +2277,20 @@ func (s *ValidateSuite) TestSimplePrereqTracker(c *C) {
 		c.Assert(repo.AddInterface(i), IsNil)
 	}
 
-	slotSnap := &Info{SuggestedName: "slot-snap"}
+	slotSnap := &Info{SuggestedName: "slot-snap", Slots: map[string]*SlotInfo{}, Version: "1"}
 	barSlot := &SlotInfo{
 		Snap:      slotSnap,
 		Name:      "visual-themes",
 		Interface: "content",
 		Attrs:     map[string]interface{}{"content": "bar"},
 	}
-	err := repo.AddSlot(barSlot)
+	slotSnap.Slots["visual-themes"] = barSlot
+
+	slotSnapAppSet, err := interfaces.NewSnapAppSet(slotSnap, nil)
 	c.Assert(err, IsNil)
+	err = repo.AddAppSet(slotSnapAppSet)
+	c.Assert(err, IsNil)
+
 	providerContentAttrs = prqt.MissingProviderContentTags(info, repo)
 	c.Check(providerContentAttrs, HasLen, 2)
 	c.Check(providerContentAttrs["common-themes"], DeepEquals, []string{"foo"})
@@ -2589,11 +2594,11 @@ func (s *ValidateSuite) TestValidateComponentNames(c *C) {
 version: 1.0
 components:
   comp-1:
-    type: test
+    type: standard
     summary: short summary
     description: some loooong description
   comp-long123-1-name:
-    type: test
+    type: standard
 `))
 	c.Assert(err, IsNil)
 
@@ -2606,7 +2611,7 @@ func (s *ValidateSuite) TestDetectInvalidComponentName(c *C) {
 version: 1.0
 components:
   comp_1:
-    type: test
+    type: standard
 `))
 	c.Assert(err, IsNil)
 
@@ -2619,7 +2624,7 @@ func (s *ValidateSuite) TestDetectInvalidComponentTextFields(c *C) {
 version: 1.0
 components:
   comp1:
-    type: test
+    type: standard
     %s: %s
 `
 
@@ -2641,7 +2646,7 @@ func (s *ValidateSuite) TestDetectInvalidComponentHooks(c *C) {
 version: 1.0
 components:
   test:
-    type: test
+    type: standard
     hooks:
       install:
         command-chain: [">_>"]

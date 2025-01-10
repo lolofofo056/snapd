@@ -22,7 +22,6 @@ package pack
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 
@@ -162,7 +161,7 @@ func snapPath(info *snap.Info, targetDir, snapName string) string {
 }
 
 func excludesFile() (filename string, err error) {
-	tmpf, err := ioutil.TempFile("", ".snap-pack-exclude-")
+	tmpf, err := os.CreateTemp("", ".snap-pack-exclude-")
 	if err != nil {
 		return "", err
 	}
@@ -252,7 +251,7 @@ func packSnap(sourceDir string, yaml []byte, opts *Options) (string, error) {
 
 func packComponent(sourceDir string, yaml []byte, opts *Options) (string, error) {
 	cont := snapdir.New(sourceDir)
-	ci, err := snap.ReadComponentInfoFromContainer(cont)
+	ci, err := snap.InfoFromComponentYaml(yaml)
 	if err != nil {
 		return "", err
 	}
@@ -296,8 +295,16 @@ func mksquashfs(sourceDir, fName, snapType string, opts *Options) error {
 
 func componentPath(ci *snap.ComponentInfo, targetDir, compName string) string {
 	if compName == "" {
+		// Note that here we do not know the version of the snap, so if
+		// there is no version in component.yaml we will get names like
+		// "<snap>+<comap>_.comp"
 		// TODO should we consider architecture as with snaps?
-		compName = fmt.Sprintf("%s_%s.comp", ci.FullName(), ci.Version)
+		compVersion := ci.Version("")
+		if compVersion == "" {
+			compName = fmt.Sprintf("%s.comp", ci.FullName())
+		} else {
+			compName = fmt.Sprintf("%s_%s.comp", ci.FullName(), compVersion)
+		}
 	}
 	if targetDir != "" && !filepath.IsAbs(compName) {
 		compName = filepath.Join(targetDir, compName)

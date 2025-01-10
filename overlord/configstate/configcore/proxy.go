@@ -21,11 +21,11 @@
 package configcore
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/snapcore/snapd/asserts"
 	"github.com/snapcore/snapd/dirs"
@@ -36,6 +36,7 @@ import (
 
 var (
 	devicestateResetSession = devicestate.ResetSession
+	envFilePath             = "/etc/environment"
 )
 
 var proxyConfigKeys = map[string]bool{
@@ -55,7 +56,7 @@ func init() {
 }
 
 func etcEnvironment() string {
-	return filepath.Join(dirs.GlobalRootDir, "/etc/environment")
+	return filepath.Join(dirs.GlobalRootDir, envFilePath)
 }
 
 func updateEtcEnvironmentConfig(path string, config map[string]string) error {
@@ -72,7 +73,11 @@ func updateEtcEnvironmentConfig(path string, config map[string]string) error {
 	if toWrite != nil {
 		// XXX: would be great to atomically write but /etc/environment
 		//      is a single bind mount :/
-		return os.WriteFile(path, []byte(strings.Join(toWrite, "\n")), 0644)
+		var buf bytes.Buffer
+		for _, entry := range toWrite {
+			fmt.Fprintln(&buf, entry)
+		}
+		return os.WriteFile(path, buf.Bytes(), 0644)
 	}
 
 	return nil

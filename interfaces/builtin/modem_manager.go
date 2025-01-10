@@ -1328,10 +1328,10 @@ KERNEL=="cdc-wdm[0-9]*", SUBSYSTEM=="usbmisc", ENV{ID_MM_CANDIDATE}="1"
 SUBSYSTEMS=="usb", GOTO="mm_candidate_end"
 SUBSYSTEM=="wwan", ENV{DEVTYPE}=="wwan_dev", GOTO="mm_candidate_end"
 SUBSYSTEM=="wwan", ENV{ID_MM_CANDIDATE}="1"
-SUBSYSTEM=="wwan", KERNEL=="*MBIM", ENV{ID_MM_PORT_TYPE_MBIM}="1"
-SUBSYSTEM=="wwan", KERNEL=="*QMI", ENV{ID_MM_PORT_TYPE_QMI}="1"
-SUBSYSTEM=="wwan", KERNEL=="*AT", ENV{ID_MM_PORT_TYPE_AT_PRIMARY}="1"
-SUBSYSTEM=="wwan", KERNEL=="*QCDM", ENV{ID_MM_PORT_TYPE_QCDM}="1"
+SUBSYSTEM=="wwan", KERNEL=="*MBIM|*mbim[0-9]*", ENV{ID_MM_PORT_TYPE_MBIM}="1"
+SUBSYSTEM=="wwan", KERNEL=="*QMI|*qmi[0-9]*", ENV{ID_MM_PORT_TYPE_QMI}="1"
+SUBSYSTEM=="wwan", KERNEL=="*AT|*at[0-9]*", ENV{ID_MM_PORT_TYPE_AT_PRIMARY}="1"
+SUBSYSTEM=="wwan", KERNEL=="*QCDM|*qcdm[0-9]*", ENV{ID_MM_PORT_TYPE_QCDM}="1"
 
 LABEL="mm_candidate_end"
 `
@@ -1352,7 +1352,7 @@ func (iface *modemManagerInterface) StaticInfo() interfaces.StaticInfo {
 
 func (iface *modemManagerInterface) AppArmorConnectedPlug(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
 	old := "###SLOT_SECURITY_TAGS###"
-	new := spec.SnapAppSet().SlotLabelExpression(slot)
+	new := slot.LabelExpression()
 	spec.AddSnippet(strings.Replace(modemManagerConnectedPlugAppArmor, old, new, -1))
 	if release.OnClassic {
 		// Let confined apps access unconfined ofono on classic
@@ -1373,13 +1373,13 @@ func (iface *modemManagerInterface) DBusPermanentSlot(spec *dbus.Specification, 
 
 func (iface *modemManagerInterface) UDevPermanentSlot(spec *udev.Specification, slot *snap.SlotInfo) error {
 	spec.AddSnippet(modemManagerPermanentSlotUDev)
-	spec.TagDevice(`KERNEL=="rfcomm*|tty[a-zA-Z]*[0-9]*|cdc-wdm[0-9]*|*MBIM|*QMI|*AT|*QCDM"`)
+	spec.TagDevice(`KERNEL=="rfcomm*|tty[a-zA-Z]*[0-9]*|cdc-wdm[0-9]*|*MBIM|*QMI|*AT|*QCDM|*mbim[0-9]*|*qmi[0-9]*|*at[0-9]*|*qcdm[0-9]*"`)
 	return nil
 }
 
 func (iface *modemManagerInterface) AppArmorConnectedSlot(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
 	old := "###PLUG_SECURITY_TAGS###"
-	new := spec.SnapAppSet().PlugLabelExpression(plug)
+	new := plug.LabelExpression()
 	snippet := strings.Replace(modemManagerConnectedSlotAppArmor, old, new, -1)
 	spec.AddSnippet(snippet)
 	return nil

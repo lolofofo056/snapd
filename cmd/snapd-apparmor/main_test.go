@@ -46,6 +46,7 @@ var _ = Suite(&mainSuite{})
 
 func (s *mainSuite) SetUpTest(c *C) {
 	dirs.SetRootDir(c.MkDir())
+	s.AddCleanup(mockWSL(0))
 }
 
 func (s *mainSuite) TearDownTest(c *C) {
@@ -69,9 +70,12 @@ func mockWSL(version int) (restore func()) {
 	}
 }
 
-func (s *mainSuite) TestIsContainerWithInternalPolicy(c *C) {
-	// since "apparmorfs" is not present within our test root dir setup
-	// we expect this to return false
+func (s *mainSuite) TestIsContainerWithInternalPolicy_NotContainer(c *C) {
+	// since "apparmorfs" is not present within our test root dir setup we
+	// expect this to return false
+	restore := mockWSL(0)
+	defer restore()
+
 	c.Assert(snapd_apparmor.IsContainerWithInternalPolicy(), Equals, false)
 
 	appArmorSecurityFSPath := filepath.Join(dirs.GlobalRootDir, "/sys/kernel/security/apparmor/")
@@ -79,15 +83,40 @@ func (s *mainSuite) TestIsContainerWithInternalPolicy(c *C) {
 	c.Assert(err, IsNil)
 
 	c.Assert(snapd_apparmor.IsContainerWithInternalPolicy(), Equals, false)
+}
 
-	// simulate being inside WSL
+func (s *mainSuite) TestIsContainerWithInternalPolicy_WSL1(c *C) {
 	restore := mockWSL(1)
-	c.Assert(snapd_apparmor.IsContainerWithInternalPolicy(), Equals, true)
-	restore()
+	defer restore()
 
-	restore = mockWSL(2)
+	c.Assert(snapd_apparmor.IsContainerWithInternalPolicy(), Equals, false)
+}
+
+func (s *mainSuite) TestIsContainerWithInternalPolicy_WSL2(c *C) {
+	restore := mockWSL(2)
+	defer restore()
+
+	c.Assert(snapd_apparmor.IsContainerWithInternalPolicy(), Equals, false)
+}
+
+func (s *mainSuite) TestIsContainerWithInternalPolicy_WSL2WithSecurityFS(c *C) {
+	restore := mockWSL(2)
+	defer restore()
+
+	appArmorSecurityFSPath := filepath.Join(dirs.GlobalRootDir, "/sys/kernel/security/apparmor/")
+	err := os.MkdirAll(appArmorSecurityFSPath, 0755)
+	c.Assert(err, IsNil)
+
 	c.Assert(snapd_apparmor.IsContainerWithInternalPolicy(), Equals, true)
-	restore()
+}
+
+func (s *mainSuite) TestIsContainerWithInternalPolicy_LinuxContainers(c *C) {
+	restore := mockWSL(0)
+	defer restore()
+
+	appArmorSecurityFSPath := filepath.Join(dirs.GlobalRootDir, "/sys/kernel/security/apparmor/")
+	err := os.MkdirAll(appArmorSecurityFSPath, 0755)
+	c.Assert(err, IsNil)
 
 	for _, prefix := range []string{"lxc", "lxd", "incus"} {
 		// simulate being inside a container environment
@@ -134,6 +163,10 @@ func (s *mainSuite) TestLoadAppArmorProfiles(c *C) {
 	err = os.WriteFile(profile, nil, 0644)
 	c.Assert(err, IsNil)
 
+	// pretend that the host apparmor has a 3.0 abi file.
+	c.Assert(os.MkdirAll(filepath.Join(dirs.GlobalRootDir, "/etc/apparmor.d/abi"), 0755), IsNil)
+	c.Assert(os.WriteFile(filepath.Join(dirs.GlobalRootDir, "/etc/apparmor.d/abi/3.0"), nil, 0644), IsNil)
+
 	// ensure SNAPD_DEBUG is set in the environment so then --quiet
 	// will *not* be included in the apparmor_parser arguments (since
 	// when these test are run in via CI SNAPD_DEBUG is set)
@@ -143,9 +176,9 @@ func (s *mainSuite) TestLoadAppArmorProfiles(c *C) {
 
 	// check arguments to the parser are as expected
 	c.Assert(parserCmd.Calls(), DeepEquals, [][]string{
-		{"apparmor_parser", "--replace", "--write-cache",
-			fmt.Sprintf("--cache-loc=%s/var/cache/apparmor", dirs.GlobalRootDir),
-			profile}})
+		{"apparmor_parser", "--policy-features", filepath.Join(dirs.GlobalRootDir, "/etc/apparmor.d/abi/3.0"),
+			"--replace", "--write-cache",
+			fmt.Sprintf("--cache-loc=%s/var/cache/apparmor", dirs.GlobalRootDir), profile}})
 
 	// test error case
 	parserCmd = testutil.MockCommand(c, "apparmor_parser", "echo mocked parser failed > /dev/stderr; exit 1")
@@ -231,6 +264,7 @@ type integrationSuite struct {
 var _ = Suite(&integrationSuite{})
 
 func (s *integrationSuite) SetUpTest(c *C) {
+	s.AddCleanup(mockWSL(0))
 	dirs.SetRootDir(c.MkDir())
 	s.AddCleanup(func() { dirs.SetRootDir("/") })
 
@@ -267,8 +301,8 @@ func (s *integrationSuite) TestRunInContainerWithInternalPolicyLoadsProfiles(c *
 	err := snapd_apparmor.Run()
 	c.Assert(err, IsNil)
 	c.Check(s.logBuf.String(), testutil.Contains, "DEBUG: inside container environment")
-	c.Check(s.logBuf.String(), Not(testutil.Contains), "Inside container environment without internal policy")
-	c.Assert(s.parserCmd.Calls(), HasLen, 1)
+	c.Check(s.logBuf.String(), testutil.Contains, "Inside container environment without internal policy")
+	c.Assert(s.parserCmd.Calls(), HasLen, 0)
 }
 
 func (s *integrationSuite) TestRunNormalLoadsProfiles(c *C) {

@@ -1,5 +1,11 @@
 summary: Verify that validation-sets are working and correctly tracked after seeding
 
+details: |
+    Snapd offers a way to ensure a good set of snaps is installed in a given
+    system, ensuring that refreshes move between one good set and another. This
+    system is known as validation sets. The test verifies that a validation set
+    is effective immediately after seeding.
+
 systems: [ubuntu-20.04-64]
 
 environment:
@@ -34,11 +40,8 @@ prepare: |
     }
 
     # install pre-reqs which we need to adjust various bits
-    snap install jq remarshal
     snap install test-snapd-swtpm --edge
     tests.cleanup defer snap remove test-snapd-swtpm
-    tests.cleanup defer snap remove remarshal
-    tests.cleanup defer snap remove jq
 
     # download snaps for the model
     snap download core

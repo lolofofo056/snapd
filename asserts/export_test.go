@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/snapcore/snapd/asserts/internal"
+	"github.com/snapcore/snapd/confdb"
 	"github.com/snapcore/snapd/testutil"
 )
 
@@ -310,11 +311,12 @@ func (gkm *GPGKeypairManager) ParametersForGenerate(passphrase string, name stri
 
 // constraint tests
 
-func CompileAttrMatcher(constraints interface{}, allowedOperations []string) (func(attrs map[string]interface{}, helper AttrMatchContext) error, error) {
+func CompileAttrMatcher(constraints interface{}, allowedOperations, allowedRefs []string) (func(attrs map[string]interface{}, helper AttrMatchContext) error, error) {
 	// XXX adjust
 	cc := compileContext{
 		opts: &compileAttrMatcherOptions{
 			allowedOperations: allowedOperations,
+			allowedRefs:       allowedRefs,
 		},
 	}
 	matcher, err := compileAttrMatcher(cc, constraints)
@@ -366,4 +368,9 @@ func MockAssertionPrereqs(f func(a Assertion) []*Ref) func() {
 	r := testutil.Backup(&assertionPrereqs)
 	assertionPrereqs = f
 	return r
+}
+
+// ConfdbControl.operators exposed for tests
+func (cc *ConfdbControl) Operators() map[string]*confdb.Operator {
+	return cc.operators
 }

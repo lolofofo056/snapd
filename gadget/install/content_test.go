@@ -22,7 +22,7 @@ package install_test
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"syscall"
 
@@ -34,7 +34,11 @@ import (
 	"github.com/snapcore/snapd/gadget/gadgettest"
 	"github.com/snapcore/snapd/gadget/install"
 	"github.com/snapcore/snapd/gadget/quantity"
+	"github.com/snapcore/snapd/kernel"
 	"github.com/snapcore/snapd/logger"
+	"github.com/snapcore/snapd/osutil"
+	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/systemd"
 	"github.com/snapcore/snapd/testutil"
 )
 
@@ -45,8 +49,11 @@ type contentTestSuite struct {
 
 	gadgetRoot string
 
-	mockMountPoint   string
-	mockMountCalls   []struct{ source, target, fstype string }
+	mockMountPoint string
+	mockMountCalls []struct {
+		source, target, fstype string
+		flags                  uintptr
+	}
 	mockUnmountCalls []string
 
 	mockMountErr error
@@ -72,7 +79,10 @@ func (s *contentTestSuite) SetUpTest(c *C) {
 	s.mockMountPoint = c.MkDir()
 
 	restore := install.MockSysMount(func(source, target, fstype string, flags uintptr, data string) error {
-		s.mockMountCalls = append(s.mockMountCalls, struct{ source, target, fstype string }{source, target, fstype})
+		s.mockMountCalls = append(s.mockMountCalls, struct {
+			source, target, fstype string
+			flags                  uintptr
+		}{source, target, fstype, flags})
 		return s.mockMountErr
 	})
 	s.AddCleanup(restore)
@@ -88,6 +98,7 @@ func mockOnDiskStructureSystemSeed(gadgetRoot string) *gadget.LaidOutStructure {
 	return &gadget.LaidOutStructure{
 		VolumeStructure: &gadget.VolumeStructure{
 			Filesystem: "vfat",
+			Role:       gadget.SystemSeed,
 			Content: []gadget.VolumeContent{
 				{
 					UnresolvedSource: "grubx64.efi",
@@ -104,6 +115,16 @@ func mockOnDiskStructureSystemSeed(gadgetRoot string) *gadget.LaidOutStructure {
 				},
 				ResolvedSource: filepath.Join(gadgetRoot, "grubx64.efi"),
 			},
+		},
+	}
+}
+
+func mockOnDiskStructureSystemData() *gadget.LaidOutStructure {
+	return &gadget.LaidOutStructure{
+		VolumeStructure: &gadget.VolumeStructure{
+			Filesystem: "ext4",
+			Role:       gadget.SystemData,
+			YamlIndex:  1000, // to demonstrate we do not use the laid out index
 		},
 	}
 }
@@ -211,7 +232,7 @@ func (s *contentTestSuite) TestWriteFilesystemContent(c *C) {
 			observeErr:   tc.observeErr,
 			expectedRole: m.Role(),
 		}
-		err := install.WriteFilesystemContent(m, "/dev/node2", obs)
+		err := install.WriteFilesystemContent(m, nil, "/dev/node2", obs)
 		if tc.err == "" {
 			c.Assert(err, IsNil)
 		} else {
@@ -220,7 +241,7 @@ func (s *contentTestSuite) TestWriteFilesystemContent(c *C) {
 
 		if err == nil {
 			// the target file system is mounted on a directory named after the structure index
-			content, err := ioutil.ReadFile(filepath.Join(dirs.SnapRunDir, "gadget-install/dev-node2", "EFI/boot/grubx64.efi"))
+			content, err := os.ReadFile(filepath.Join(dirs.SnapRunDir, "gadget-install/dev-node2", "EFI/boot/grubx64.efi"))
 			c.Assert(err, IsNil)
 			c.Check(string(content), Equals, "grubx64.efi content")
 			c.Assert(obs.content, DeepEquals, map[string][]*mockContentChange{
@@ -233,6 +254,196 @@ func (s *contentTestSuite) TestWriteFilesystemContent(c *C) {
 			})
 		}
 	}
+}
+
+func (s *contentTestSuite) testWriteFilesystemContentDriversTree(c *C, kMntPoint string, modulesComps []install.KernelModulesComponentInfo, isCore bool) {
+	defer dirs.SetRootDir(dirs.GlobalRootDir)
+	dirs.SetRootDir(c.MkDir())
+	restore := osutil.MockMountInfo(``)
+	defer restore()
+
+	kMntPoint = filepath.Join(dirs.GlobalRootDir, kMntPoint)
+
+	dataMntPoint := filepath.Join(dirs.SnapRunDir, "gadget-install/dev-node2")
+	restore = install.MockSysMount(func(source, target, fstype string, flags uintptr, data string) error {
+		c.Check(source, Equals, "/dev/node2")
+		c.Check(fstype, Equals, "ext4")
+		c.Check(target, Equals, filepath.Join(dirs.SnapRunDir, "gadget-install/dev-node2"))
+		return nil
+	})
+	defer restore()
+
+	restore = install.MockSysUnmount(func(target string, flags int) error {
+		return nil
+	})
+	defer restore()
+
+	// copy existing mock
+	m := mockOnDiskStructureSystemData()
+	obs := &mockWriteObserver{
+		c:            c,
+		observeErr:   nil,
+		expectedRole: m.Role(),
+	}
+	// mock drivers tree
+	treesDir := dirs.SnapKernelDriversTreesDirUnder(dirs.GlobalRootDir)
+	modsSubDir := "pc-kernel/111/lib/modules/6.8.0-31-generic"
+	modsDir := filepath.Join(treesDir, modsSubDir)
+	c.Assert(os.MkdirAll(modsDir, 0755), IsNil)
+	someFile := filepath.Join(modsDir, "modules.alias")
+	c.Assert(os.WriteFile(someFile, []byte("blah"), 0644), IsNil)
+
+	kInfo := &install.KernelSnapInfo{
+		Name:             "pc-kernel",
+		Revision:         snap.R(111),
+		MountPoint:       kMntPoint,
+		NeedsDriversTree: true,
+		IsCore:           isCore,
+		ModulesComps:     modulesComps,
+	}
+
+	dataDir := ""
+	if isCore {
+		dataDir = "system-data/_writable_defaults"
+	}
+	restore = install.MockKernelEnsureKernelDriversTree(func(kMntPts kernel.MountPoints, compsMntPts []kernel.ModulesCompMountPoints, destDir string, opts *kernel.KernelDriversTreeOptions) (err error) {
+		c.Check(kMntPts, Equals,
+			kernel.MountPoints{
+				Current: kMntPoint,
+				Target:  filepath.Join(dirs.SnapMountDir, "/pc-kernel/111")})
+		c.Check(destDir, Equals, filepath.Join(dataMntPoint, dataDir,
+			"var/lib/snapd/kernel/pc-kernel/111"))
+		c.Check(len(compsMntPts), Equals, len(modulesComps))
+		if len(modulesComps) > 0 {
+			c.Check(compsMntPts, DeepEquals, []kernel.ModulesCompMountPoints{
+				{
+					LinkName: "kmod1",
+					MountPoints: kernel.MountPoints{
+						Current: modulesComps[0].MountPoint,
+						Target: filepath.Join(dirs.SnapMountDir,
+							"/pc-kernel/components/mnt/kmod1/3"),
+					},
+				},
+				{
+					LinkName: "kmod2",
+					MountPoints: kernel.MountPoints{
+						Current: modulesComps[1].MountPoint,
+						Target: filepath.Join(dirs.SnapMountDir,
+							"/pc-kernel/components/mnt/kmod2/7"),
+					},
+				},
+			})
+		}
+		return nil
+	})
+	defer restore()
+
+	err := install.WriteFilesystemContent(m, kInfo, "/dev/node2", obs)
+	c.Assert(err, IsNil)
+
+	// Check content of kernel mount unit / links
+	cpi := snap.MinimalSnapContainerPlaceInfo("pc-kernel", snap.R(111))
+	checkInstallMountUnit(c, filepath.Join(dataMntPoint, dataDir), cpi)
+
+	// now for kernel-modules components
+	for _, comp := range modulesComps {
+		cpi := snap.MinimalComponentContainerPlaceInfo(comp.Name,
+			comp.Revision, "pc-kernel")
+		checkInstallMountUnit(c, filepath.Join(dataMntPoint, dataDir), cpi)
+	}
+}
+
+func checkInstallMountUnit(c *C, dataDir string, cpi snap.ContainerPlaceInfo) {
+	whereDir := dirs.StripRootDir(cpi.MountDir())
+	unitFileName := systemd.EscapeUnitNamePath(whereDir) + ".mount"
+	c.Check(filepath.Join(dataDir, "etc/systemd/system", unitFileName),
+		testutil.FileEquals, fmt.Sprintf(
+			`[Unit]
+Description=%s
+After=snapd.mounts-pre.target
+Before=snapd.mounts.target
+Before=systemd-udevd.service systemd-modules-load.service
+Before=usr-lib-modules.mount usr-lib-firmware.mount
+
+[Mount]
+What=%s
+Where=%s
+Type=squashfs
+Options=nodev,ro,x-gdu.hide,x-gvfs-hide
+LazyUnmount=yes
+
+[Install]
+WantedBy=snapd.mounts.target
+WantedBy=multi-user.target
+`, cpi.MountDescription(), dirs.StripRootDir(cpi.MountFile()), whereDir))
+
+	for _, target := range []string{"multi-user.target.wants", "snapd.mounts.target.wants"} {
+		path, err := os.Readlink(filepath.Join(dataDir,
+			"etc/systemd/system", target, unitFileName))
+		c.Check(err, IsNil)
+		c.Check(path, Equals, filepath.Join(dirs.SnapServicesDir, unitFileName))
+	}
+}
+
+func (s *contentTestSuite) TestWriteFilesystemContentDriversTreeCore(c *C) {
+	isCore := true
+	s.testWriteFilesystemContentDriversTree(c,
+		filepath.Join(dirs.SnapMountDir, "pc-kernel/111"), nil, isCore)
+}
+
+func (s *contentTestSuite) TestWriteFilesystemContentDriversTreeCoreWithKMods(c *C) {
+	isCore := true
+	kMods := []install.KernelModulesComponentInfo{{
+		Name:       "kmod1",
+		Revision:   snap.R(3),
+		MountPoint: filepath.Join(dirs.SnapMountDir, "pc-kernel/components/mnt/kmod1/3"),
+	}, {
+		Name:       "kmod2",
+		Revision:   snap.R(7),
+		MountPoint: filepath.Join(dirs.SnapMountDir, "pc-kernel/components/mnt/kmod2/7"),
+	}}
+	s.testWriteFilesystemContentDriversTree(c,
+		filepath.Join(dirs.SnapMountDir, "pc-kernel/111"), kMods, isCore)
+}
+
+func (s *contentTestSuite) TestWriteFilesystemContentDriversTreeCoreUnusualMntPt(c *C) {
+	isCore := true
+	s.testWriteFilesystemContentDriversTree(c, "/somewhere/pc-kernel/111", nil, isCore)
+}
+
+func (s *contentTestSuite) TestWriteFilesystemContentDriversTreeCoreUnusualMntPtWithKMods(c *C) {
+	isCore := true
+	kMods := []install.KernelModulesComponentInfo{{
+		Name:       "kmod1",
+		Revision:   snap.R(3),
+		MountPoint: "/components/pc-kernel/mnt/kmod1/3",
+	}, {
+		Name:       "kmod2",
+		Revision:   snap.R(7),
+		MountPoint: "/components/pc-kernel/mnt/kmod2/7",
+	}}
+	s.testWriteFilesystemContentDriversTree(c, "/somewhere/pc-kernel/111", kMods, isCore)
+}
+
+func (s *contentTestSuite) TestWriteFilesystemContentDriversTreeHybrid(c *C) {
+	isCore := false
+	s.testWriteFilesystemContentDriversTree(c,
+		filepath.Join(dirs.SnapMountDir, "pc-kernel/111"), nil, isCore)
+}
+
+func (s *contentTestSuite) TestWriteFilesystemContentDriversTreeHybridWithKmods(c *C) {
+	isCore := false
+	kMods := []install.KernelModulesComponentInfo{{
+		Name:       "kmod1",
+		Revision:   snap.R(3),
+		MountPoint: filepath.Join(dirs.SnapMountDir, "pc-kernel/components/mnt/kmod1/3"),
+	}, {
+		Name:       "kmod2",
+		Revision:   snap.R(7),
+		MountPoint: filepath.Join(dirs.SnapMountDir, "pc-kernel/components/mnt/kmod2/7"),
+	}}
+	s.testWriteFilesystemContentDriversTree(c,
+		filepath.Join(dirs.SnapMountDir, "pc-kernel/111"), kMods, isCore)
 }
 
 func (s *contentTestSuite) TestWriteFilesystemContentUnmountErrHandling(c *C) {
@@ -295,7 +506,7 @@ func (s *contentTestSuite) TestWriteFilesystemContentUnmountErrHandling(c *C) {
 		})
 		defer restore()
 
-		err := install.WriteFilesystemContent(m, "/dev/node2", obs)
+		err := install.WriteFilesystemContent(m, nil, "/dev/node2", obs)
 		if tc.expectedErr == "" {
 			c.Assert(err, IsNil)
 		} else {
@@ -372,17 +583,52 @@ func (s *contentTestSuite) TestMountFilesystem(c *C) {
 	defer dirs.SetRootDir("")
 
 	// mount a filesystem...
-	err := install.MountFilesystem("/dev/node2", "vfat", filepath.Join(boot.InitramfsRunMntDir, "ubuntu-seed"))
+	err := install.MountFilesystem("/dev/node2", "vfat", filepath.Join(boot.InitramfsRunMntDir, "ubuntu-seed"), install.MntfsParams{})
 	c.Assert(err, IsNil)
 
 	// ...and check if it was mounted at the right mount point
 	c.Check(s.mockMountCalls, HasLen, 1)
-	c.Check(s.mockMountCalls, DeepEquals, []struct{ source, target, fstype string }{
-		{"/dev/node2", boot.InitramfsUbuntuSeedDir, "vfat"},
+	c.Check(s.mockMountCalls, DeepEquals, []struct {
+		source, target, fstype string
+		flags                  uintptr
+	}{
+		{"/dev/node2", boot.InitramfsUbuntuSeedDir, "vfat", 0},
 	})
 
 	// try again with mocked error
 	s.mockMountErr = fmt.Errorf("mock mount error")
-	err = install.MountFilesystem("/dev/node2", "vfat", filepath.Join(boot.InitramfsRunMntDir, "ubuntu-seed"))
+	err = install.MountFilesystem("/dev/node2", "vfat", filepath.Join(boot.InitramfsRunMntDir, "ubuntu-seed"), install.MntfsParams{})
 	c.Assert(err, ErrorMatches, `cannot mount filesystem "/dev/node2" at ".*/run/mnt/ubuntu-seed": mock mount error`)
+}
+
+func (s *contentTestSuite) TestMountFilesystemOptions(c *C) {
+	dirs.SetRootDir(c.MkDir())
+	defer dirs.SetRootDir("")
+
+	tests := []struct {
+		params        install.MntfsParams
+		expectedFlags uintptr
+	}{
+		{install.MntfsParams{}, 0},
+		{install.MntfsParams{NoExec: true}, syscall.MS_NOEXEC},
+		{install.MntfsParams{NoDev: true}, syscall.MS_NODEV},
+		{install.MntfsParams{NoSuid: true}, syscall.MS_NOSUID},
+	}
+
+	for _, t := range tests {
+		// reset calls
+		s.mockMountCalls = nil
+
+		err := install.MountFilesystem("/dev/node2", "vfat", filepath.Join(boot.InitramfsRunMntDir, "ubuntu-seed"), t.params)
+		c.Assert(err, IsNil)
+
+		// .. verify flags
+		c.Check(s.mockMountCalls, HasLen, 1)
+		c.Check(s.mockMountCalls, DeepEquals, []struct {
+			source, target, fstype string
+			flags                  uintptr
+		}{
+			{"/dev/node2", boot.InitramfsUbuntuSeedDir, "vfat", t.expectedFlags},
+		})
+	}
 }

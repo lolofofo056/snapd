@@ -22,7 +22,6 @@ package wrappers
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -33,6 +32,7 @@ import (
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/release"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/strutil"
 	"github.com/snapcore/snapd/systemd"
 )
 
@@ -42,6 +42,23 @@ var execStartRe = regexp.MustCompile(`(?m)^ExecStart=(/usr/bin/snap\s+.*|/usr/li
 // snapdToolingMountUnit is the name of the mount unit that provides the snapd tooling
 const SnapdToolingMountUnit = "usr-lib-snapd.mount"
 
+func skipStartDueToQuirks(unit string, targetVersion string) bool {
+	switch unit {
+	case "snapd.apparmor.service":
+		// versions earlier than 2.62 did not have the do-not-start tag in
+		// snapd.apparmor.service, which was introduced in
+		// https://github.com/canonical/snapd/commit/d1cf336e7c584078dff3883c93f0581ae455811e
+		// due to which snapd may attempt to restart snapd.apparmor.service and
+		// in specific cases use apparmor_parser from the base
+		compare, err := strutil.VersionCompare(targetVersion, "2.62")
+
+		// we're downgrading to version earlier than 2.62
+		return err == nil && compare < 0
+	default:
+		return false
+	}
+}
+
 func snapdSkipStart(content []byte) bool {
 	return bytes.Contains(content, []byte("X-Snapd-Snap: do-not-start"))
 }
@@ -49,7 +66,7 @@ func snapdSkipStart(content []byte) bool {
 // snapdUnitSkipStart returns true for units that should not be started
 // automatically
 func snapdUnitSkipStart(unitPath string) (skip bool, err error) {
-	content, err := ioutil.ReadFile(unitPath)
+	content, err := os.ReadFile(unitPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			// no point in starting units that do not exist
@@ -70,6 +87,7 @@ func writeSnapdToolingMountUnit(sysd systemd.Systemd, prefix string, opts *AddSn
 	content := []byte(fmt.Sprintf(`[Unit]
 Description=Make the snapd snap tooling available for the system
 Before=snapd.service
+Before=systemd-udevd.service
 
 [Mount]
 What=%s/usr/lib/snapd
@@ -141,16 +159,60 @@ type AddSnapdSnapServicesOptions struct {
 	Preseeding bool
 }
 
+// SnapdRestart keeps state of services that need a restart after
+// current symlink of snapd snap (/snap/snapd/current) has been
+// updated. Call Restart method then.
+// Currently, the list of services is static and the absence of a
+// SnapdRestart object (nil), means no service requires a restart.
+type SnapdRestart interface {
+	Restart() error
+}
+
+type snapdRestartImpl struct {
+	Sysd systemd.Systemd
+}
+
+// Restart restarts systemd service units. Call this method after
+// symlink /snap/snapd/current has been updated.
+func (r *snapdRestartImpl) Restart() error {
+	if err := r.Sysd.StartNoBlock([]string{"snapd.apparmor.service"}); err != nil {
+		return err
+	}
+
+	// and finally start snapd.service (it will stop by itself and gets
+	// started by systemd then)
+	// Because of the file lock held on the snapstate by the Overlord, the new
+	// snapd will block there until we release it. For this reason, we cannot
+	// start the unit in blocking mode.
+	// TODO: move/share this responsibility with daemon so that we can make the
+	// start blocking again
+	if err := r.Sysd.StartNoBlock([]string{"snapd.service"}); err != nil {
+		return err
+	}
+	if err := r.Sysd.StartNoBlock([]string{"snapd.seeded.service"}); err != nil {
+		return err
+	}
+	// we cannot start snapd.autoimport in blocking mode because
+	// it has a "After=snapd.seeded.service" which means that on
+	// seeding a "systemctl start" that blocks would hang forever
+	// and we deadlock.
+	if err := r.Sysd.StartNoBlock([]string{"snapd.autoimport.service"}); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // AddSnapdSnapServices sets up the services based on a given snapd snap in the
 // system.
-func AddSnapdSnapServices(s *snap.Info, opts *AddSnapdSnapServicesOptions, inter Interacter) error {
+func AddSnapdSnapServices(s *snap.Info, opts *AddSnapdSnapServicesOptions, inter Interacter) (SnapdRestart, error) {
 	if snapType := s.Type(); snapType != snap.TypeSnapd {
-		return fmt.Errorf("internal error: adding explicit snapd services for snap %q type %q is unexpected", s.InstanceName(), snapType)
+		return nil, fmt.Errorf("internal error: adding explicit snapd services for snap %q type %q is unexpected", s.InstanceName(), snapType)
 	}
 
 	// we never write snapd services on classic
 	if release.OnClassic {
-		return nil
+		return nil, nil
 	}
 
 	if opts == nil {
@@ -165,24 +227,24 @@ func AddSnapdSnapServices(s *snap.Info, opts *AddSnapdSnapServicesOptions, inter
 	}
 
 	if err := writeSnapdToolingMountUnit(sysd, s.MountDir(), opts); err != nil {
-		return err
+		return nil, err
 	}
 
 	serviceUnits, err := filepath.Glob(filepath.Join(s.MountDir(), "lib/systemd/system/*.service"))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	socketUnits, err := filepath.Glob(filepath.Join(s.MountDir(), "lib/systemd/system/*.socket"))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	timerUnits, err := filepath.Glob(filepath.Join(s.MountDir(), "lib/systemd/system/*.timer"))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	targetUnits, err := filepath.Glob(filepath.Join(s.MountDir(), "lib/systemd/system/*.target"))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	units := append(socketUnits, serviceUnits...)
 	units = append(units, timerUnits...)
@@ -192,11 +254,11 @@ func AddSnapdSnapServices(s *snap.Info, opts *AddSnapdSnapServicesOptions, inter
 	for _, unit := range units {
 		st, err := os.Stat(unit)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		content, err := ioutil.ReadFile(unit)
+		content, err := os.ReadFile(unit)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if execStartRe.Match(content) {
 			content = execStartRe.ReplaceAll(content, []byte(fmt.Sprintf("ExecStart=%s$1", s.MountDir())))
@@ -215,13 +277,15 @@ func AddSnapdSnapServices(s *snap.Info, opts *AddSnapdSnapServicesOptions, inter
 	changed, removed, err := osutil.EnsureDirStateGlobs(dirs.SnapServicesDir, globs, snapdUnits)
 	if err != nil {
 		// TODO: uhhhh, what do we do in this case?
-		return err
+		return nil, err
 	}
 	if (len(changed) + len(removed)) == 0 {
 		// nothing to do
-		return nil
+		return nil, nil
 	}
 
+	logger.Debugf("removed units: %v", removed)
+	logger.Debugf("changed units: %v", changed)
 	// stop all removed units first
 	for _, unit := range removed {
 		serviceUnits := []string{unit}
@@ -236,7 +300,7 @@ func AddSnapdSnapServices(s *snap.Info, opts *AddSnapdSnapServicesOptions, inter
 	// daemon-reload so that we get the new services
 	if len(changed) > 0 {
 		if err := sysd.DaemonReload(); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
@@ -254,14 +318,14 @@ func AddSnapdSnapServices(s *snap.Info, opts *AddSnapdSnapServicesOptions, inter
 		if !opts.Preseeding {
 			enabled, err := sysd.IsEnabled(unit)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			if enabled {
 				continue
 			}
 		}
 		if err := sysd.EnableNoReload([]string{unit}); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
@@ -271,8 +335,16 @@ func AddSnapdSnapServices(s *snap.Info, opts *AddSnapdSnapServicesOptions, inter
 			// be started. Others like "snapd.seeded.service" are started
 			// as dependencies of snapd.service.
 			if snapdSkipStart(snapdUnits[unit].(*osutil.MemoryFileState).Content) {
+				logger.Debugf("skipping unit %v, has do-not-start tag", unit)
 				continue
 			}
+			// check for any version specific quirks
+			if skipStartDueToQuirks(unit, s.Version) {
+				logger.Debugf("skipping unit %v, due to version specific quirks for %v", unit, s.Version)
+				continue
+			}
+
+			logger.Debugf("(re)starting snapd unit %v", unit)
 			// Ensure to only restart if the unit was previously
 			// active. This ensures we DTRT on firstboot and do
 			// not stop e.g. snapd.socket because doing that
@@ -282,7 +354,7 @@ func AddSnapdSnapServices(s *snap.Info, opts *AddSnapdSnapServicesOptions, inter
 			// exists before we are fully seeded).
 			isActive, err := sysd.IsActive(unit)
 			if err != nil {
-				return err
+				return nil, err
 			}
 
 			serviceUnits := []string{unit}
@@ -291,57 +363,36 @@ func AddSnapdSnapServices(s *snap.Info, opts *AddSnapdSnapServicesOptions, inter
 				// this will also bring down snapd itself
 				if unit != "snapd.socket" {
 					if err := sysd.Restart(serviceUnits); err != nil {
-						return err
+						return nil, err
 					}
 				}
 			} else {
 				if err := sysd.Start(serviceUnits); err != nil {
-					return err
+					return nil, err
 				}
 			}
 		}
 	}
 
-	// and finally start snapd.service (it will stop by itself and gets
-	// started by systemd then)
-	// Because of the file lock held on the snapstate by the Overlord, the new
-	// snapd will block there until we release it. For this reason, we cannot
-	// start the unit in blocking mode.
-	// TODO: move/share this responsibility with daemon so that we can make the
-	// start blocking again
-	if err := sysd.StartNoBlock([]string{"snapd.service"}); err != nil {
-		return err
-	}
-	if err := sysd.StartNoBlock([]string{"snapd.seeded.service"}); err != nil {
-		return err
-	}
-	// we cannot start snapd.autoimport in blocking mode because
-	// it has a "After=snapd.seeded.service" which means that on
-	// seeding a "systemctl start" that blocks would hang forever
-	// and we deadlock.
-	if err := sysd.StartNoBlock([]string{"snapd.autoimport.service"}); err != nil {
-		return err
-	}
-
 	// Handle the user services
 	if err := writeSnapdUserServicesOnCore(s, opts, inter); err != nil {
-		return err
+		return nil, err
 	}
 
 	// Handle D-Bus configuration
 	if err := writeSnapdDbusConfigOnCore(s); err != nil {
-		return err
+		return nil, err
 	}
 
 	if err := writeSnapdDbusActivationOnCore(s); err != nil {
-		return err
+		return nil, err
 	}
 
 	if err := writeSnapdDesktopFilesOnCore(s); err != nil {
-		return err
+		return nil, err
 	}
 
-	return nil
+	return &snapdRestartImpl{Sysd: sysd}, nil
 }
 
 // undoSnapdUserServicesOnCore attempts to remove services that were deployed in
@@ -460,7 +511,7 @@ func writeSnapdUserServicesOnCore(s *snap.Info, opts *AddSnapdSnapServicesOption
 		if err != nil {
 			return err
 		}
-		content, err := ioutil.ReadFile(unit)
+		content, err := os.ReadFile(unit)
 		if err != nil {
 			return err
 		}
@@ -676,6 +727,15 @@ func undoSnapdDbusActivationOnCore() error {
 var snapdDesktopFileNames = []string{
 	"io.snapcraft.SessionAgent.desktop",
 	"snap-handle-link.desktop",
+}
+
+func isSnapdDesktopFile(desktopFile string) bool {
+	for _, df := range snapdDesktopFileNames {
+		if desktopFile == df {
+			return true
+		}
+	}
+	return false
 }
 
 func writeSnapdDesktopFilesOnCore(s *snap.Info) error {

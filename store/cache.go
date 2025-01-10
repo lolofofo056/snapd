@@ -22,7 +22,6 @@ package store
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sort"
@@ -148,7 +147,7 @@ func (cm *CacheManager) Put(cacheKey, sourcePath string) error {
 func (cm *CacheManager) count() int {
 	// TODO: Use something more effective than a list of all entries
 	//       here. This will waste a lot of memory on large dirs.
-	if l, err := ioutil.ReadDir(cm.cacheDir); err == nil {
+	if l, err := os.ReadDir(cm.cacheDir); err == nil {
 		return len(l)
 	}
 	return 0
@@ -161,47 +160,51 @@ func (cm *CacheManager) path(cacheKey string) string {
 
 // cleanup ensures that only maxItems are stored in the cache
 func (cm *CacheManager) cleanup() error {
-	fil, err := ioutil.ReadDir(cm.cacheDir)
+	entries, err := os.ReadDir(cm.cacheDir)
 	if err != nil {
 		return err
 	}
-	if len(fil) <= cm.maxItems {
+
+	if len(entries) <= cm.maxItems {
 		return nil
 	}
 
-	numOwned := 0
-	for _, fi := range fil {
+	// most of the entries will have more than one hardlink, but a minority may
+	// be referenced only the cache and thus be a candidate for pruning
+	pruneCandidates := make([]os.FileInfo, 0, len(entries)/5)
+
+	for _, entry := range entries {
+		fi, err := entry.Info()
+		if err != nil {
+			return err
+		}
+
 		n, err := hardLinkCount(fi)
 		if err != nil {
 			logger.Noticef("cannot inspect cache: %s", err)
 		}
-		// Only count the file if it is not referenced elsewhere in the filesystem
+		// If the file is referenced in the filesystem somewhere else our copy
+		// is "free" so skip it.
 		if n <= 1 {
-			numOwned++
+			pruneCandidates = append(pruneCandidates, fi)
 		}
 	}
 
-	if numOwned <= cm.maxItems {
+	if len(pruneCandidates) <= cm.maxItems {
+		// nothing to prune
 		return nil
 	}
 
 	var lastErr error
-	sort.Sort(changesByMtime(fil))
+	sort.Sort(changesByMtime(pruneCandidates))
+	numOwned := len(pruneCandidates)
 	deleted := 0
-	for _, fi := range fil {
+	for _, fi := range pruneCandidates {
 		path := cm.path(fi.Name())
-		n, err := hardLinkCount(fi)
-		if err != nil {
-			logger.Noticef("cannot inspect cache: %s", err)
-		}
-		// If the file is referenced in the filesystem somewhere
-		// else our copy is "free" so skip it. If there is any
-		// error we cleanup the file (it is just a cache afterall).
-		if n > 1 {
-			continue
-		}
 		if err := osRemove(path); err != nil {
 			if !os.IsNotExist(err) {
+				// If there is any error we cleanup the file (it is just a cache
+				// afterall).
 				logger.Noticef("cannot cleanup cache: %s", err)
 				lastErr = err
 			}

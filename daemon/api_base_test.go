@@ -23,10 +23,8 @@ import (
 	"context"
 	"crypto"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"os"
-	"os/user"
 	"path/filepath"
 	"time"
 
@@ -40,7 +38,9 @@ import (
 	"github.com/snapcore/snapd/asserts/sysdb"
 	"github.com/snapcore/snapd/daemon"
 	"github.com/snapcore/snapd/dirs"
+	"github.com/snapcore/snapd/interfaces/ifacetest"
 	"github.com/snapcore/snapd/osutil"
+	"github.com/snapcore/snapd/osutil/user"
 	"github.com/snapcore/snapd/overlord"
 	"github.com/snapcore/snapd/overlord/assertstate"
 	"github.com/snapcore/snapd/overlord/assertstate/assertstatetest"
@@ -257,6 +257,54 @@ func (s *apiBaseSuite) SetUpTest(c *check.C) {
 			HomeDir:  "",
 		}, nil
 	}))
+
+	s.AddCleanup(daemon.MockSnapstateStoreInstallGoal(newStoreInstallGoalRecorder))
+	s.AddCleanup(daemon.MockSnapstatePathUpdateGoal(newPathUpdateGoalRecorder))
+	s.AddCleanup(daemon.MockSnapstateStoreUpdateGoal(newStoreUpdateGoalRecorder))
+}
+
+type storeInstallGoalRecorder struct {
+	snapstate.InstallGoal
+	snaps []snapstate.StoreSnap
+}
+
+func newStoreInstallGoalRecorder(snaps ...snapstate.StoreSnap) snapstate.InstallGoal {
+	return &storeInstallGoalRecorder{
+		snaps:       snaps,
+		InstallGoal: snapstate.StoreInstallGoal(snaps...),
+	}
+}
+
+type pathUpdateGoalRecorder struct {
+	snapstate.UpdateGoal
+	snaps []snapstate.PathSnap
+}
+
+func newPathUpdateGoalRecorder(snaps ...snapstate.PathSnap) snapstate.UpdateGoal {
+	return &pathUpdateGoalRecorder{
+		snaps:      snaps,
+		UpdateGoal: snapstate.PathUpdateGoal(snaps...),
+	}
+}
+
+type storeUpdateGoalRecorder struct {
+	snapstate.UpdateGoal
+	snaps []snapstate.StoreUpdate
+}
+
+func (s *storeUpdateGoalRecorder) names() []string {
+	names := make([]string, 0, len(s.snaps))
+	for _, snap := range s.snaps {
+		names = append(names, snap.InstanceName)
+	}
+	return names
+}
+
+func newStoreUpdateGoalRecorder(snaps ...snapstate.StoreUpdate) snapstate.UpdateGoal {
+	return &storeUpdateGoalRecorder{
+		snaps:      snaps,
+		UpdateGoal: snapstate.StoreUpdateGoal(snaps...),
+	}
 }
 
 func (s *apiBaseSuite) mockModel(st *state.State, model *asserts.Model) {
@@ -388,6 +436,9 @@ func newFakeSnapManager(st *state.State, runner *state.TaskRunner) *fakeSnapMana
 	runner.AddHandler("fake-install-snap-error", func(t *state.Task, _ *tomb.Tomb) error {
 		return fmt.Errorf("fake-install-snap-error errored")
 	}, nil)
+	runner.AddHandler("fake-refresh-snap", func(t *state.Task, _ *tomb.Tomb) error {
+		return nil
+	}, nil)
 
 	return &fakeSnapManager{}
 }
@@ -429,7 +480,8 @@ func (s *apiBaseSuite) mockSnap(c *check.C, yamlText string) *snap.Info {
 		panic("call s.daemon(c) etc in your test first")
 	}
 
-	snapInfo := snaptest.MockSnap(c, yamlText, &snap.SideInfo{Revision: snap.R(1)})
+	appSet := ifacetest.MockSnapAndAppSet(c, yamlText, nil, &snap.SideInfo{Revision: snap.R(1)})
+	snapInfo := appSet.Info()
 
 	st := s.d.Overlord().State()
 
@@ -452,7 +504,7 @@ func (s *apiBaseSuite) mockSnap(c *check.C, yamlText string) *snap.Info {
 
 	// Put the snap into the interface repository
 	repo := s.d.Overlord().InterfaceManager().Repository()
-	err := repo.AddSnap(snapInfo)
+	err := repo.AddAppSet(appSet)
 	c.Assert(err, check.IsNil)
 	return snapInfo
 }
@@ -537,7 +589,7 @@ version: %s
 	}, nil, "")
 	c.Assert(err, check.IsNil)
 
-	content, err := ioutil.ReadFile(snapInfo.MountFile())
+	content, err := os.ReadFile(snapInfo.MountFile())
 	c.Assert(err, check.IsNil)
 	h := sha3.Sum384(content)
 	dgst, err := asserts.EncodeDigest(crypto.SHA3_384, h[:])

@@ -4,14 +4,15 @@ export LANG=C.UTF-8
 export LANGUAGE=en
 
 if command -v goctest >/dev/null; then
-    goctest="goctest"
+    goctest="goctest ./..."
 else
-    goctest="go test"
+    goctest="go test ./..."
 fi
 COVERMODE=${COVERMODE:-atomic}
 COVERAGE_SUFFIX=${GO_BUILD_TAGS:-notags}
 COVERAGE_OUT=${COVERAGE_OUT:-.coverage/coverage-$COVERAGE_SUFFIX.cov}
 CHANGED_FILES=${CHANGED_FILES:-""}
+TIMEOUT=${TIMEOUT:-15}
 
 if [ -z "${GITHUB_WORKFLOW:-}" ]; then
     # when *not* running inside github, ensure we use go-1.18 by default
@@ -115,7 +116,7 @@ missing_interface_spread_test() {
     for iface in $(go run ./tests/lib/list-interfaces.go) ; do
         search="plugs: \\[ $iface \\]"
         case "$iface" in
-            bool-file|gpio|pwm|dsp|netlink-driver|hidraw|i2c|iio|serial-port|spi)
+            bool-file|gpio|pwm|dsp|netlink-driver|hidraw|i2c|iio|serial-port|spi|confdb)
                 # skip gadget provided interfaces for now
                 continue
                 ;;
@@ -126,6 +127,21 @@ missing_interface_spread_test() {
                 search='plugs: \[ autopilot-introspection \]'
                 ;;
         esac
+
+        # check if a standalone test already exists and that it at least
+        # connects and disconnects the interface
+        dedicated_test=$(find tests/main/ -maxdepth 1 -name "interfaces-$iface")
+        if [ -n "$dedicated_test" ]; then
+            if grep -q "$search" "$snap_yaml" ; then
+                echo "Dedicated test '$dedicated_test' found for '$iface'."
+                echo "Please remove '$iface' from '$snap_yaml'."
+                exit 1
+            fi
+            # dedicated test already exists, skip high-level test check below
+            continue
+        fi
+
+        # check if high-level minimal test exists for interface
         if ! grep -q "$search" "$snap_yaml" ; then
             echo "Missing high-level test for interface '$iface'. Please add to:"
             echo "* $snap_yaml"
@@ -146,9 +162,11 @@ if [ "$STATIC" = 1 ]; then
 
     # XXX: remove once we can use an action, see workflows/test.yaml for
     #      details why we still use this script
-    if [ -n "${GITHUB_PULL_REQUEST:-}" ] && [ "${GITHUB_PULL_REQUEST:-}" != "false" ]; then
+    if [ -n "${GITHUB_PULL_REQUEST_TITLE:-}" ]; then
         echo Checking pull request summary
-        ./check-pr-title.py "$GITHUB_PULL_REQUEST"
+        ./check-pr-title.py "${GITHUB_PULL_REQUEST_TITLE}"
+    else
+	echo Skipping pull request summary check: not a pull request
     fi
 
     # check commit author/committer name for unicode
@@ -207,6 +225,22 @@ if [ "$STATIC" = 1 ]; then
         exit 1
     fi
 
+    echo "Checking for usages of deprecated io/ioutil"
+    got=""
+    for dir in $(go list -f '{{.Dir}}' ./... | grep -v '/vendor/' ); do
+        # shellcheck disable=SC2063
+        s="$(grep -nP io/ioutil "$dir"/*.go || true)"
+        if [ -n "$s" ]; then
+            got="$s\\n$got"
+        fi
+    done
+
+    if [ -n "$got" ]; then
+        echo 'Found usages of deprecated io/ioutil, please use "io" or "os" equivalents'
+        echo "$got"
+        exit 1
+    fi
+
     if command -v shellcheck >/dev/null; then
         exclude_tools_path=tests/lib/external/snapd-testing-tools
         echo "Checking shell scripts..."
@@ -261,7 +295,7 @@ if [ "$STATIC" = 1 ]; then
         ./tests/lib/external/snapd-testing-tools/utils/spread-shellcheck $FILTERED_FILES --exclude "$exclude_tools_path" --exclude "tests/nested/manual/core20-preseed"
     fi
 
-    if [ -z "${SKIP_MISSPELL-}" ]; then
+    if [ -z "${SKIP_MISSPELL:-}" ]; then
         echo "Checking spelling errors"
         if ! command -v misspell >/dev/null; then
             goinstall github.com/client9/misspell/cmd/misspell
@@ -271,11 +305,11 @@ if [ "$STATIC" = 1 ]; then
         # exportfs is used in the nfs-support test
         # becuase because of misspell in upstream steam rules (PR#12657)
         MISSPELL_IGNORE="auther,PROCES,PROCESSS,proces,processs,exportfs,becuase"
-        git ls-files -z -- . ':!:./po' ':!:./vendor' ':!:./c-vendor' ':!:./cmd/libsnap-confine-private/bpf/vendor' |
+        git ls-files -z -- . ':!:./po' ':!:./vendor' ':!:./c-vendor' ':!:./cmd/libsnap-confine-private/bpf/vendor' ':!:./build-aux/snap/local/apparmor'|
             xargs -0 misspell -error -i "$MISSPELL_IGNORE"
     fi
 
-    if [ -z "${SKIP_INEFFASSIGN-}" ]; then
+    if [ -z "${SKIP_INEFFASSIGN:-}" ]; then
         if dpkg --compare-versions "$(go version | awk '$3 ~ /^go[0-9]/ {print substr($3, 3)}')" ge 1.12; then
             echo "Checking for ineffective assignments"
             if ! command -v ineffassign >/dev/null; then
@@ -300,7 +334,7 @@ if [ "$STATIC" = 1 ]; then
         fi
     fi
 
-    echo "Checking all interfaces have minimal spread test"
+    echo "Checking all interfaces have a spread test"
     missing_interface_spread_test
 
     echo "Checking for incorrect multiline strings in spread tests"
@@ -323,7 +357,7 @@ if [ "$STATIC" = 1 ]; then
 
     # FIXME: re-add staticcheck with a matching version for the used go-version
 
-    if [ -z "${SKIP_TESTS_FORMAT_CHECK-}" ] || [ "$SKIP_TESTS_FORMAT_CHECK" = 0 ]; then
+    if [ -z "${SKIP_TESTS_FORMAT_CHECK:-}" ] || [ "$SKIP_TESTS_FORMAT_CHECK" = 0 ]; then
         CHANGED_TESTS=""
         FILTERED_TESTS=""
         EXCLUDE_PATH=tests/lib/external/snapd-testing-tools
@@ -359,6 +393,37 @@ if [ "$STATIC" = 1 ]; then
       echo "$got"
       exit 1
     fi
+
+    if [ -z "${SKIP_GOLANGCI_LINT:-}" ]; then
+
+        echo "Checking installation of golangci-lint"
+        gcil="$(command -v golangci-lint || true)"
+        if [ -z "$gcil" ]; then 
+            echo "ERROR: Cannot find golangci-lint. You need to first install the golangci-lint"
+            exit 1
+        fi
+
+        if echo "$gcil" | grep -q '/snap/bin/' ; then
+            # golangci-lint was installed from the snap
+            if snap refresh --list | grep -q golangci-lint; then
+                echo "WARNING: your golangci-lint snap is out of date. The CI will install a fresh version, which may differ from yours."
+            fi
+            if ! snap list golangci-lint | grep -q latest; then
+                echo "WARNING: your golangci-lint snap is not installed from the latest/* channel."
+            fi
+        fi
+
+        # Check whether golangci-lint was built with go version >= the installed go version
+        gcil_go_ver=$(golangci-lint --version | grep -o 'go[0-9]*\.[0-9]*\.[0-9]*' | cut -c 3-)
+        go_ver=$(go version | grep -o 'go[0-9]*\.[0-9]*\.[0-9]*' | cut -c 3-)
+        if [ "$(printf '%s\n' "$go_ver" "$gcil_go_ver" | sort -V | head -n1)" != "$go_ver" ]; then
+           echo "WARNING: Your go version ($go_ver) is greater than the version of go that golangci-lint was built with ($gcil_go_ver)."
+        fi
+
+        # don't run with --new-from-rev as the diff might not be enough to tell
+        # the change introduces problems (e.g., removing the last call to a function)
+        golangci-lint --path-prefix= run
+    fi
 fi
 
 if [ "$UNIT" = 1 ]; then
@@ -369,33 +434,41 @@ if [ "$UNIT" = 1 ]; then
     go version
 
     tags=
-    if [ -n "${GO_BUILD_TAGS-}" ]; then
+    race=
+    timeout="${TIMEOUT}m"
+    if [ -n "${GO_BUILD_TAGS:-}" ]; then
         echo "Using build tags: $GO_BUILD_TAGS"
         tags="-tags $GO_BUILD_TAGS"
+    fi
+    if [ -n "${GO_TEST_RACE:-}" ]; then
+        echo "Using go test -race"
+        race="-race"
+        timeout="$((TIMEOUT*2))m"
     fi
 
     echo Building
     # shellcheck disable=SC2086
-    go build -v $tags github.com/snapcore/snapd/...
+    go build -v $tags $race github.com/snapcore/snapd/...
 
     # tests
     echo Running tests from "$PWD"
     if [ "$short" = 1 ]; then
+            echo "Running without test coverage"
             # shellcheck disable=SC2046,SC2086
-            GOTRACEBACK=1 $goctest $tags -short -timeout 5m $(go list ./... | grep -v '/vendor/' )
+            GOTRACEBACK=1 $goctest $tags $race -short -timeout $timeout
     else
         coverage=""
-        if [ -z "${SKIP_COVERAGE-}" ]; then
+        if [ -z "${SKIP_COVERAGE:-}" ]; then
             coverage="-coverprofile=$COVERAGE_OUT -covermode=$COVERMODE"
             # Prepare the coverage output profile.
             mkdir -p "$(dirname "$COVERAGE_OUT")"
-            echo "mode: $COVERMODE" > "$COVERAGE_OUT"
+            echo "Using coverage params: $coverage"
         else
             echo "Skipping test coverage"
         fi
 
         # shellcheck disable=SC2046,SC2086
-        GOTRACEBACK=1 $goctest $tags -timeout 5m $coverage $(go list ./... | grep -v '/vendor/' )
+        GOTRACEBACK=1 $goctest $tags $race -timeout $timeout $coverage
     fi
 
     # python unit test for mountinfo.query and version-compare
@@ -418,7 +491,7 @@ EOF
     exit 1
 fi
 
-if [ -n "${SKIP_DIRTY_CHECK-}" ]; then
+if [ -n "${SKIP_DIRTY_CHECK:-}" ]; then
     exit 0
 fi
 
