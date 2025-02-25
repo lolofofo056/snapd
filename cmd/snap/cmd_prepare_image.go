@@ -55,9 +55,11 @@ type cmdPrepareImage struct {
 
 	// TODO: introduce SnapWithChannel?
 	Snaps              []string `long:"snap" value-name:"<snap>[=<channel>]"`
+	Components         []string `long:"comp" value-name:"<snap>+<comp>"`
 	ExtraSnaps         []string `long:"extra-snaps" hidden:"yes"` // DEPRECATED
 	RevisionsFile      string   `long:"revisions"`
 	WriteRevisionsFile string   `long:"write-revisions" optional:"true" optional-value:"./seed.manifest"`
+	Validation         string   `long:"validation" choice:"ignore" choice:"enforce"`
 }
 
 func init() {
@@ -88,6 +90,8 @@ For preparing classic images it supports a --classic mode`),
 			// TRANSLATORS: This should not start with a lowercase letter.
 			"snap": i18n.G("Include the given snap from the store or a local file and/or specify the channel to track for the given snap"),
 			// TRANSLATORS: This should not start with a lowercase letter.
+			"comp": i18n.G("Include the given component from the store or a local file"),
+			// TRANSLATORS: This should not start with a lowercase letter.
 			"extra-snaps": i18n.G("Extra snaps to be installed (DEPRECATED)"),
 			// TRANSLATORS: This should not start with a lowercase letter.
 			"revisions": i18n.G("Specify a seeds.manifest file referencing the exact revisions of the provided snaps which should be installed"),
@@ -97,6 +101,8 @@ For preparing classic images it supports a --classic mode`),
 			"channel": i18n.G("The channel to use"),
 			// TRANSLATORS: This should not start with a lowercase letter.
 			"customize": i18n.G("Image customizations specified as JSON file."),
+			// TRANSLATORS: This should not start with a lowercase letter.
+			"validation": i18n.G("Control whether validations should be ignored or enforced. (default: ignore)"),
 		}, []argDesc{
 			{
 				// TRANSLATORS: This needs to begin with < and end with >
@@ -123,6 +129,7 @@ func (x *cmdPrepareImage) Execute(args []string) error {
 
 	opts := &image.Options{
 		Snaps:            x.ExtraSnaps,
+		Components:       x.Components,
 		ModelFile:        x.Positional.ModelAssertionFn,
 		Channel:          x.Channel,
 		Architecture:     x.Architecture,
@@ -143,6 +150,11 @@ func (x *cmdPrepareImage) Execute(args []string) error {
 			return err
 		}
 		opts.Customizations = *custo
+	}
+
+	if x.Validation != "" {
+		// validation passed in the command line overrides customizations
+		opts.Customizations.Validation = x.Validation
 	}
 
 	snaps := make([]string, 0, len(x.Snaps)+len(x.ExtraSnaps))

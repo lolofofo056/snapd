@@ -209,6 +209,8 @@ The CI tooling will check and enforce the order and required sections when a spr
 
 * Large mechanical refactoring and changes should be done as separate PRs. Try to separate behaviour changes and refactoring into different PRs and not mix the two.
 
+* Refactoring should not touch preexisting tests. If changing a test is unavoidable, changes must be minimal. To ensure a refactor can be anchored, it's a good idea to check the coverage before starting, both in terms of lines of codes and in the features and behaviors that may be affected. Checking the coverage afterwards can also reveal whether there is old code that now can be dropped.
+
 * Large moving of code around and changes to code placement might also be better done separately.
 
 * PR summaries and the first line of commit messages are expected to be of this form:
@@ -221,6 +223,15 @@ The CI tooling will check and enforce the order and required sections when a spr
       * `many: correct struct fields and output key`
   * When no golang code is involved, the context prefix before the colon can refer to directories or top-level files instead.
     * `build-aux,.github/workflows: limit make processes with nproc`
+
+* Merging
+  * Only use `Squash and Merge` or `Rebase and Merge`, never `Create a merge commit`
+  * `Squash and Merge`: Preferred method because it simplifies cherry-picking of PR content
+    * Also for single commits
+    * This merge will use the title as commit message so double check that it is accurate and concise
+  * `Rebase and Merge`: Required when it is important to be able to distinguish different parts of a solution in the future
+    * Keep commits to a minimum
+    * Squash uninteresting commits such as review improvements after review approval
 
 ## Further readings
 

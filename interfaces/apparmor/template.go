@@ -85,6 +85,7 @@ var templateCommon = `
   #include <abstractions/base>
   #include <abstractions/consoles>
   #include <abstractions/openssl>
+  ###KERNEL_MODULES_AND_FIRMWARE###
 
   # While in later versions of the base abstraction, include this explicitly
   # for series 16 and cross-distro
@@ -196,6 +197,9 @@ var templateCommon = `
   /etc/os-release rk,
   /usr/lib/os-release k,
 
+  # Debian version of the host OS which might be required in AppArmor-secured Debian
+  /etc/debian_version r,
+
   # systemd native journal API (see sd_journal_print(4)). This should be in
   # AppArmor's base abstraction, but until it is, include here. We include
   # the base journal path as well as the journal namespace pattern path. Each
@@ -203,6 +207,7 @@ var templateCommon = `
   /run/systemd/journal{,.snap-*}/socket w,
   /run/systemd/journal{,.snap-*}/stdout rw, # 'r' shouldn't be needed, but journald
                                             # doesn't leak anything so allow
+  /run/systemd/journal{,.snap-*}/dev-log w,
 
   # snapctl and its requirements
   /usr/bin/snapctl ixr,
@@ -261,8 +266,10 @@ var templateCommon = `
   owner @{PROC}/@{pid}/cgroup rk,
   @{PROC}/@{pid}/cpuset r,
   @{PROC}/@{pid}/io r,
+  owner @{PROC}/@{pid}/fdinfo/* r,
   owner @{PROC}/@{pid}/limits r,
   owner @{PROC}/@{pid}/loginuid r,
+  owner @{PROC}/@{pid}/sessionid r,
   @{PROC}/@{pid}/smaps r,
   @{PROC}/@{pid}/stat r,
   @{PROC}/@{pid}/statm r,
@@ -297,6 +304,7 @@ var templateCommon = `
   /sys/fs/cgroup/memory/{,user.slice/}memory.limit_in_bytes r,
   /sys/fs/cgroup/memory/{,**/}snap.@{SNAP_INSTANCE_NAME}{,.*}/memory.limit_in_bytes r,
   /sys/fs/cgroup/memory/{,**/}snap.@{SNAP_INSTANCE_NAME}{,.*}/memory.stat r,
+  /sys/fs/cgroup/system.slice/snap.@{SNAP_INSTANCE_NAME}{,.*}/memory.max r,
   /sys/fs/cgroup/cpu,cpuacct/{,user.slice/}cpu.cfs_{period,quota}_us r,
   /sys/fs/cgroup/cpu,cpuacct/{,**/}snap.@{SNAP_INSTANCE_NAME}{,.*}/cpu.cfs_{period,quota}_us r,
   /sys/fs/cgroup/cpu,cpuacct/{,user.slice/}cpu.shares r,
@@ -373,7 +381,7 @@ var templateCommon = `
   /var/snap/{@{SNAP_NAME},@{SNAP_INSTANCE_NAME}}/@{SNAP_REVISION}/** wl,
   /var/snap/{@{SNAP_NAME},@{SNAP_INSTANCE_NAME}}/common/** wl,
 
-  # The ubuntu-core-launcher creates an app-specific private restricted /tmp
+  # The snap-confine program creates an app-specific private restricted /tmp
   # and will fail to launch the app if something goes wrong. As such, we can
   # simply allow full access to /tmp.
   /tmp/   r,
@@ -606,6 +614,7 @@ var defaultCoreRuntimeTemplateRules = `
   /{,usr/}bin/run-parts ixr,
   /{,usr/}bin/sed ixr,
   /{,usr/}bin/seq ixr,
+  /{,usr/}bin/setpriv ixr,
   /{,usr/}bin/sha{1,224,256,384,512}sum ixr,
   /{,usr/}bin/shuf ixr,
   /{,usr/}bin/sleep ixr,
@@ -634,6 +643,7 @@ var defaultCoreRuntimeTemplateRules = `
   /{,usr/}bin/unzip ixr,
   /{,usr/}bin/uptime ixr,
   /{,usr/}bin/vdir ixr,
+  /{,usr/}bin/vim.tiny ixr,
   /{,usr/}bin/wc ixr,
   /{,usr/}bin/which{,.debianutils} ixr,
   /{,usr/}bin/xargs ixr,
@@ -681,6 +691,7 @@ var defaultOtherBaseTemplateRules = `
   # - /lib/modules
   #
   # Everything but /lib/firmware and /lib/modules
+  # TODO: use GenerateAAREExclusionPatterns for this
   /{,usr/}lib/ r,
   /{,usr/}lib/[^fm]** mrklix,
   /{,usr/}lib/{f[^i],m[^o]}** mrklix,
@@ -709,6 +720,7 @@ var defaultOtherBaseTemplateRules = `
   #
   # Everything but /usr/lib and /usr/src, which are handled elsewhere.
   /usr/ r,
+  # TODO: use GenerateAAREExclusionPatterns for this
   /usr/[^ls]** mrklix,
   /usr/{l[^i],s[^r]}** mrklix,
   /usr/{li[^b],sr[^c]}** mrklix,
@@ -884,6 +896,9 @@ var classicJailmodeSnippet = `
 
   # For snappy reexec on 4.8+ kernels
   @{INSTALL_DIR}/core/*/usr/lib/snapd/snap-exec m,
+  # Same as above but accounting for the case when the
+  # snapd snap is installed and executes the snap application.
+  @{INSTALL_DIR}/snapd/*/usr/lib/snapd/snap-exec rm,
 `
 
 var ptraceTraceDenySnippet = `
@@ -1001,6 +1016,12 @@ profile snap-update-ns.###SNAP_INSTANCE_NAME### (attach_disconnected) {
   /run/snapd/lock/###SNAP_INSTANCE_NAME###.lock rwk,
   /run/snapd/lock/.lock rwk,
 
+  # While the base abstraction has rules for encryptfs encrypted home and
+  # private directories, it is missing rules for directory read on the toplevel
+  # directory of the mount (LP: #1848919)
+  owner @{HOME}/.Private/ r,
+  owner @{HOMEDIRS}/.ecryptfs/*/.Private/ r,
+
   # Allow reading stored mount namespaces,
   /run/snapd/ns/ r,
   /run/snapd/ns/###SNAP_INSTANCE_NAME###.mnt r,
@@ -1059,6 +1080,8 @@ profile snap-update-ns.###SNAP_INSTANCE_NAME### (attach_disconnected) {
   /tmp/ r,
   /usr/ r,
   /var/ r,
+  /var/lib/ r,
+  /var/lib/snapd/ r,
   /var/snap/ r,
 
   # Allow reading timezone data.

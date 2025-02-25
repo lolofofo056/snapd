@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2018 Canonical Ltd
+ * Copyright (C) 2018-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -25,6 +25,9 @@ import (
 
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/osutil"
+	"github.com/snapcore/snapd/release"
+	"github.com/snapcore/snapd/sandbox/apparmor"
+	"github.com/snapcore/snapd/systemd"
 )
 
 // SnapdFeature is a named feature that may be on or off.
@@ -37,16 +40,12 @@ const (
 	ParallelInstances
 	// Hotplug controls availability of dynamically creating slots based on system hardware.
 	Hotplug
-	// SnapdSnap controls possibility of installing the snapd snap.
-	SnapdSnap
 	// PerUserMountNamespace controls the persistence of per-user mount namespaces.
 	PerUserMountNamespace
 	// RefreshAppAwareness controls refresh being aware of running applications.
 	RefreshAppAwareness
 	// ClassicPreservesXdgRuntimeDir controls $XDG_RUNTIME_DIR in snaps with classic confinement.
 	ClassicPreservesXdgRuntimeDir
-	// RobustMountNamespaceUpdates controls how snap-update-ns updates existing mount namespaces.
-	RobustMountNamespaceUpdates
 	// UserDaemons controls availability of user mode service support.
 	UserDaemons
 	// DbusActivation controls whether snaps daemons can be activated via D-Bus
@@ -70,20 +69,30 @@ const (
 	QuotaGroups
 	// RefreshAppAwarenessUX enables experimental UX improvements for refresh-app-awareness.
 	RefreshAppAwarenessUX
-	// AspectsConfiguration enables experimental aspect-based configuration.
-	AspectsConfiguration
+	// Confdbs enables experimental configuration based on confdbs and views.
+	Confdbs
+	// ConfdbControl enables experimental remote management of confdbs
+	ConfdbControl
+	// AppArmorPrompting enables AppArmor to prompt the user for permission when apps perform certain operations.
+	AppArmorPrompting
+	// GPIOChardevInterface enables experimental gpio-chardev interface.
+	GPIOChardevInterface
 
 	// lastFeature is the final known feature, it is only used for testing.
 	lastFeature
 )
 
-// KnownFeatures returns the list of all known features.
-func KnownFeatures() []SnapdFeature {
+var knownFeaturesImpl = func() []SnapdFeature {
 	features := make([]SnapdFeature, int(lastFeature))
 	for i := range features {
 		features[i] = SnapdFeature(i)
 	}
 	return features
+}
+
+// KnownFeatures returns the list of all known features.
+func KnownFeatures() []SnapdFeature {
+	return knownFeaturesImpl()
 }
 
 // featureNames maps feature constant to stable string representation.
@@ -92,12 +101,10 @@ var featureNames = map[SnapdFeature]string{
 	Layouts:               "layouts",
 	ParallelInstances:     "parallel-instances",
 	Hotplug:               "hotplug",
-	SnapdSnap:             "snapd-snap",
 	PerUserMountNamespace: "per-user-mount-namespace",
 	RefreshAppAwareness:   "refresh-app-awareness",
 
 	ClassicPreservesXdgRuntimeDir: "classic-preserves-xdg-runtime-dir",
-	RobustMountNamespaceUpdates:   "robust-mount-namespace-updates",
 
 	UserDaemons:    "user-daemons",
 	DbusActivation: "dbus-activation",
@@ -114,14 +121,19 @@ var featureNames = map[SnapdFeature]string{
 	QuotaGroups: "quota-groups",
 
 	RefreshAppAwarenessUX: "refresh-app-awareness-ux",
-	AspectsConfiguration:  "aspects-configuration",
+
+	Confdbs:       "confdbs",
+	ConfdbControl: "confdb-control",
+
+	AppArmorPrompting: "apparmor-prompting",
+
+	GPIOChardevInterface: "gpio-chardev-interface",
 }
 
 // featuresEnabledWhenUnset contains a set of features that are enabled when not explicitly configured.
 var featuresEnabledWhenUnset = map[SnapdFeature]bool{
 	Layouts:                       true,
 	RefreshAppAwareness:           true,
-	RobustMountNamespaceUpdates:   true,
 	ClassicPreservesXdgRuntimeDir: true,
 	DbusActivation:                true,
 }
@@ -133,12 +145,40 @@ var featuresExported = map[SnapdFeature]bool{
 	ParallelInstances:     true,
 
 	ClassicPreservesXdgRuntimeDir: true,
-	RobustMountNamespaceUpdates:   true,
 	HiddenSnapDataHomeDir:         true,
 	MoveSnapHomeDir:               true,
 
 	RefreshAppAwarenessUX: true,
-	AspectsConfiguration:  true,
+	Confdbs:               true,
+	AppArmorPrompting:     true,
+	GPIOChardevInterface:  true,
+}
+
+var (
+	releaseSystemctlSupportsUserUnits = release.SystemctlSupportsUserUnits
+)
+
+// featuresSupportedCallbacks maps features to a callback function which may be
+// run to determine if the feature is supported and, if not, return false along
+// with a reason why the feature is unsupported. If a function has no callback
+// defined, it should be assumed to be supported.
+var featuresSupportedCallbacks = map[SnapdFeature]func() (bool, string){
+	// QuotaGroups requires systemd version 230 or higher
+	QuotaGroups: func() (bool, string) {
+		if err := systemd.EnsureAtLeast(230); err != nil {
+			return false, err.Error()
+		}
+		return true, ""
+	},
+	// UserDaemons requires user units
+	UserDaemons: func() (bool, string) {
+		if !releaseSystemctlSupportsUserUnits() {
+			return false, "user session daemons are not supported on this system's distribution version"
+		}
+		return true, ""
+	},
+	// AppArmorPrompting requires that AppArmor supports prompting.
+	AppArmorPrompting: apparmor.PromptingSupported,
 }
 
 // String returns the name of a snapd feature.
@@ -186,6 +226,19 @@ func (f SnapdFeature) ConfigOption() (snapName, confName string) {
 	return "core", "experimental." + f.String()
 }
 
+// IsSupported returns true if the feature's supported callback returns true, or
+// if it has no supportedCallback. If the feature is unsupported, the returned
+// string details as to why.
+func (f SnapdFeature) IsSupported() (supported bool, whyNot string) {
+	if callback, exists := featuresSupportedCallbacks[f]; exists {
+		supported, whyNot = callback()
+		if !supported {
+			return false, whyNot
+		}
+	}
+	return true, ""
+}
+
 // IsEnabled checks if a given exported snapd feature is enabled.
 //
 // The function panics for features that are not exported.
@@ -219,4 +272,50 @@ func Flag(tr confGetter, feature SnapdFeature) (bool, error) {
 		return feature.IsEnabledWhenUnset(), nil
 	}
 	return false, fmt.Errorf("%s can only be set to 'true' or 'false', got %q", feature, isEnabled)
+}
+
+// FeatureInfo records whether a particular feature is supported and/or enabled.
+//
+// If the feature is not supported, it should also contain a reason describing
+// why the feature is not supported. A feature is enabled if its feature flag is
+// set to true, regardless of whether or not it is supported.
+type FeatureInfo struct {
+	Supported         bool   `json:"supported"`
+	UnsupportedReason string `json:"unsupported-reason,omitempty"`
+	Enabled           bool   `json:"enabled"`
+}
+
+// All returns a map from feature flags to information about that feature.
+//
+// In particular, the information contains whether the feature is supported
+// and/or enabled. If the feature is not supported, it should also contain a
+// reason describing why the feature is not supported. If a feature's value is
+// not set to true or false, it is excluded from the list, since it is not in
+// this case considered to be a feature flag.
+func All(tr confGetter) map[string]FeatureInfo {
+	knownFeatures := KnownFeatures()
+	allFeaturesInfo := make(map[string]FeatureInfo, len(knownFeatures))
+	for _, feature := range knownFeatures {
+		enabled, err := Flag(tr, feature)
+		if err != nil {
+			// Skip features with values other than true or false
+			continue
+		}
+		// Features implicitly supported if no callback exists
+		supported := true
+		var unsupportedReason string
+		if callback, exists := featuresSupportedCallbacks[feature]; exists {
+			supported, unsupportedReason = callback()
+		}
+		name := feature.String()
+		info := FeatureInfo{
+			Supported: supported,
+			Enabled:   enabled,
+		}
+		if !supported {
+			info.UnsupportedReason = unsupportedReason
+		}
+		allFeaturesInfo[name] = info
+	}
+	return allFeaturesInfo
 }

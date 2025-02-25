@@ -79,7 +79,9 @@ func (s *rosOptDataInterfaceSuite) TestAppArmorSpec(c *C) {
 	restore := release.MockOnClassic(false)
 	defer restore()
 
-	spec := apparmor.NewSpecification(interfaces.NewSnapAppSet(s.plug.Snap()))
+	appSet, err := interfaces.NewSnapAppSet(s.plug.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec := apparmor.NewSpecification(appSet)
 	c.Assert(spec.AddConnectedPlug(s.iface, s.plug, s.slot), IsNil)
 	c.Assert(spec.SecurityTags(), DeepEquals, []string{"snap.consumer.app"})
 	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, `capability dac_read_search,`)
@@ -90,7 +92,7 @@ func (s *rosOptDataInterfaceSuite) TestStaticInfo(c *C) {
 	si := interfaces.StaticInfoOf(s.iface)
 	c.Assert(si.ImplicitOnCore, Equals, false)
 	c.Assert(si.ImplicitOnClassic, Equals, true)
-	c.Assert(si.Summary, testutil.Contains, `Allows read-only access`)
+	c.Assert(si.Summary, testutil.Contains, `allows read-only access`)
 	c.Assert(si.BaseDeclarationSlots, testutil.Contains, "ros-opt-data")
 }
 

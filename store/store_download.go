@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"github.com/juju/ratelimit"
+	"golang.org/x/sys/unix"
 	"gopkg.in/retry.v1"
 
 	"github.com/snapcore/snapd/dirs"
@@ -214,10 +215,17 @@ func (s *Store) Download(ctx context.Context, name string, targetPath string, do
 		if len(downloadInfo.Deltas) == 1 {
 			err := s.downloadAndApplyDelta(name, targetPath, downloadInfo, pbar, user, dlOpts)
 			if err == nil {
-				return nil
+				// try to place the file in the cacher
+				if err = s.cacher.Put(downloadInfo.Sha3_384, targetPath); err == nil {
+					// file is in the cache now
+					return nil
+				} else {
+					logger.Noticef("Cannot place rebuilt blob for %s in cache: %v", name, err)
+				}
+			} else {
+				// We revert to normal downloads if there is any error.
+				logger.Noticef("Cannot download or apply deltas for %s: %v", name, err)
 			}
-			// We revert to normal downloads if there is any error.
-			logger.Noticef("Cannot download or apply deltas for %s: %v", name, err)
 		}
 	}
 
@@ -299,6 +307,75 @@ func (s *Store) Download(ctx context.Context, name string, targetPath string, do
 	}
 
 	return s.cacher.Put(downloadInfo.Sha3_384, targetPath)
+}
+
+var errIconUnchanged = errors.New("existing icon unchanged")
+
+const (
+	// Etags should all be smaller than 256B.
+	maxEtagSize   = 256
+	etagXattrName = "user.snap_store_etag"
+)
+
+// DownloadIcon downloads the icon for the snap from the given download URL to
+// the given target path. Snap icons are small (<256kB) files served from an
+// ordinary unauthenticated file server, so this does not require store
+// authentication or user state, nor a progress bar. They are also not revision-
+// specific, and do not use a download cache.
+func (s *Store) DownloadIcon(ctx context.Context, name string, targetPath string, downloadURL string) error {
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+		return err
+	}
+
+	// Read etag of existing file at targetPath, if it exists
+	var etag string
+	etagBuf := make([]byte, maxEtagSize)
+	if size, err := unix.Getxattr(targetPath, etagXattrName, etagBuf); err == nil {
+		// if an error occurs, ignore it, and don't include an etag in the request
+		etag = string(etagBuf[:size])
+	}
+
+	// Download icon to a temporary file location, since there may be an active
+	// snap icon hard-linked to targetPath. If download fails, don't want to
+	// corrupt the existing icon file contents. Instead, commit the new file
+	// once the download succeeds, thus leaving any previous icon linked to the
+	// original unchanged icon contents, until a future task re-links to the
+	// new contents.
+	aw, err := osutil.NewAtomicFile(targetPath, 0o644, 0, osutil.NoChown, osutil.NoChown)
+	if err != nil {
+		return fmt.Errorf("cannot create file for snap icon for snap %s: %v", name, err)
+	}
+	// on success, Cancel becomes a no-op
+	defer aw.Cancel()
+
+	logger.Debugf("Starting download of %q to %q.", downloadURL, targetPath)
+
+	etag, err = downloadIcon(ctx, name, etag, downloadURL, aw)
+	if err != nil {
+		if errors.Is(err, errIconUnchanged) {
+			logger.Debugf("download of snap icon skipped for snap %s: icon unchanged", name)
+			return nil
+		}
+		return err
+	}
+
+	if err = aw.Commit(); err != nil {
+		return fmt.Errorf("cannot commit snap icon file for snap %s: %v", name, err)
+	}
+
+	// Success, now try to store the etag
+	if etag != "" {
+		if len(etag) >= maxEtagSize { // len doesn't include trailing '\0'
+			logger.Debugf("snap icon etag exceeds maximum etag length (%d): %d", maxEtagSize, len(etag))
+		} else {
+			// If the filesystem does not support xattrs, we'll just redownload
+			// the whole icon next time, so log but do not return any error.
+			if err := unix.Setxattr(targetPath, etagXattrName, []byte(etag), 0); err != nil {
+				logger.Debugf("cannot save etag in icon file xattrs: %v", err)
+			}
+		}
+	}
+	return nil
 }
 
 func downloadReqOpts(storeURL *url.URL, cdnHeader string, opts *DownloadOptions) *requestOptions {
@@ -478,7 +555,7 @@ func downloadImpl(ctx context.Context, name, sha3_384, downloadURL string, user 
 			return fmt.Errorf("the download has been cancelled: %s", downloadCtx.Err())
 		}
 		var resp *http.Response
-		cli := s.newHTTPClient(nil)
+		cli := s.newHTTPClient(nil) // XXX: there's no timeout defined for this client, and the context is context.TODO(), so it won't be cancelled
 		oldCheckRedirect := cli.CheckRedirect
 		if oldCheckRedirect == nil {
 			panic("internal error: the httputil.NewHTTPClient-produced http.Client must have CheckRedirect defined")
@@ -591,6 +668,105 @@ func downloadImpl(ctx context.Context, name, sha3_384, downloadURL string, user 
 		logger.Debugf("Download succeeded in %.03fs (%.0f%cB/s).", dt.Seconds(), r, p)
 	}
 	return finalErr
+}
+
+type ReadWriteSeekTruncater interface {
+	io.Reader
+	io.Writer
+	io.Seeker
+
+	Truncate(size int64) error
+}
+
+var (
+	maxIconFilesize int64 = 300000
+	downloadIcon          = downloadIconImpl
+)
+
+// downloadIconImpl writes an http.Request which does not require authentication
+// or a progress.Meter. Returns the etag of the downloaded icon, if it exists.
+// If the icon file on disk is unchanged on the server, returns errIconUnchanged.
+func downloadIconImpl(ctx context.Context, name, etag, downloadURL string, w ReadWriteSeekTruncater) (newEtag string, err error) {
+	iconURL, err := url.Parse(downloadURL)
+	if err != nil {
+		return "", err
+	}
+
+	startTime := time.Now()
+	errRetry := errors.New("retry")
+	for attempt := retry.Start(downloadRetryStrategy, nil); attempt.Next(); {
+		httputil.MaybeLogRetryAttempt(iconURL.String(), attempt, startTime)
+
+		err = func() error {
+			clientOpts := &httputil.ClientOptions{} // XXX: should this have a timeout?
+			cli := httputil.NewHTTPClient(clientOpts)
+			reqOptions := iconRequestOptions{
+				url:  iconURL,
+				etag: etag,
+			}
+			var resp *http.Response
+			resp, err = doIconRequest(ctx, cli, reqOptions)
+			if err != nil {
+				if httputil.ShouldRetryAttempt(attempt, err) {
+					return errRetry
+				}
+				return err
+			}
+
+			defer resp.Body.Close()
+
+			if httputil.ShouldRetryHttpResponse(attempt, resp) {
+				return errRetry
+			}
+
+			switch resp.StatusCode {
+			case 200: // all good
+			case 304:
+				// etag matched, icon is unchanged, so abort
+				return errIconUnchanged
+			default:
+				return &DownloadError{Code: resp.StatusCode, URL: resp.Request.URL}
+			}
+
+			if resp.ContentLength == 0 || resp.ContentLength > maxIconFilesize {
+				return fmt.Errorf("unsupported Content-Length for %s (must be nonzero and <%dB): %d", downloadURL, maxIconFilesize, resp.ContentLength)
+			}
+			logger.Debugf("download size for %s: %d", downloadURL, resp.ContentLength)
+
+			_, err = io.CopyN(w, resp.Body, resp.ContentLength)
+
+			if err != nil {
+				if httputil.ShouldRetryAttempt(attempt, err) {
+					if _, err := w.Seek(0, io.SeekStart); err != nil {
+						return err
+					}
+					if err := w.Truncate(0); err != nil {
+						return err
+					}
+					return errRetry
+				}
+				return err
+			}
+
+			// Save etag, if it exists.
+			newEtag = resp.Header.Get("etag")
+
+			return nil
+		}()
+
+		if err == errRetry {
+			continue
+		}
+
+		if err == nil {
+			logger.Debugf("icon download succeeded for %s", name)
+		}
+
+		return newEtag, err
+	}
+	// The loop will return an error directly if retries are exhausted and an
+	// error occurs, so we never actually break out of the loop and get here.
+	return "", errors.New("icon download retries exhausted")
 }
 
 // DownloadStream will copy the snap from the request to the io.Reader

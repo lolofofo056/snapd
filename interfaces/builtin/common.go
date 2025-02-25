@@ -20,7 +20,7 @@
 package builtin
 
 import (
-	"io/ioutil"
+	"os"
 	"path/filepath"
 
 	"github.com/snapcore/snapd/interfaces"
@@ -37,9 +37,9 @@ import (
 // applicable for testing.
 var evalSymlinks = filepath.EvalSymlinks
 
-// readDir is either ioutil.ReadDir or a mocked function applicable for
+// readDir is either os.ReadDir or a mocked function applicable for
 // testing.
-var readDir = ioutil.ReadDir
+var readDir = os.ReadDir
 
 type commonInterface struct {
 	name    string
@@ -48,6 +48,9 @@ type commonInterface struct {
 
 	implicitOnCore    bool
 	implicitOnClassic bool
+
+	implicitPlugOnCore    bool
+	implicitPlugOnClassic bool
 
 	affectsPlugOnRefresh bool
 
@@ -98,12 +101,14 @@ func (iface *commonInterface) Name() string {
 // StaticInfo returns various meta-data about this interface.
 func (iface *commonInterface) StaticInfo() interfaces.StaticInfo {
 	return interfaces.StaticInfo{
-		Summary:              iface.summary,
-		DocURL:               iface.docURL,
-		ImplicitOnCore:       iface.implicitOnCore,
-		ImplicitOnClassic:    iface.implicitOnClassic,
-		BaseDeclarationPlugs: iface.baseDeclarationPlugs,
-		BaseDeclarationSlots: iface.baseDeclarationSlots,
+		Summary:               iface.summary,
+		DocURL:                iface.docURL,
+		ImplicitOnCore:        iface.implicitOnCore,
+		ImplicitOnClassic:     iface.implicitOnClassic,
+		ImplicitPlugOnCore:    iface.implicitPlugOnCore,
+		ImplicitPlugOnClassic: iface.implicitPlugOnClassic,
+		BaseDeclarationPlugs:  iface.baseDeclarationPlugs,
+		BaseDeclarationSlots:  iface.baseDeclarationSlots,
 		// affects the plug snap because of mount backend
 		AffectsPlugOnRefresh:    iface.affectsPlugOnRefresh,
 		AppArmorUnconfinedPlugs: iface.appArmorUnconfinedPlugs,

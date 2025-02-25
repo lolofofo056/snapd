@@ -69,23 +69,25 @@ type CreateOptions struct {
 // CreateMissingPartitions calls createMissingPartitions but returns only
 // OnDiskStructure, as it is meant to be used externally (i.e. by
 // muinstaller).
-func CreateMissingPartitions(dl *gadget.OnDiskVolume, pv *gadget.Volume, opts *CreateOptions) ([]*gadget.OnDiskAndGadgetStructurePair, error) {
-	dgpairs, err := createMissingPartitions(dl, pv, opts)
+func CreateMissingPartitions(dv *gadget.OnDiskVolume, gv *gadget.Volume, opts *CreateOptions) ([]*gadget.OnDiskAndGadgetStructurePair, error) {
+	dgpairs, err := createMissingPartitions(dv, gv, opts, nil)
 	if err != nil {
 		return nil, err
 	}
 	return dgpairs, nil
 }
 
-// createMissingPartitions creates the partitions listed in the laid out volume
-// pv that are missing from the existing device layout, returning a list of
+// createMissingPartitions creates the partitions listed in the gadget volume
+// gv that are missing from the disk dv taking into account options opts. The
+// map of gadget indexes to deleted partitions is needed because if they were
+// removed, when creating we need to use the same size. This returns a list of
 // structures that have been created.
-func createMissingPartitions(dl *gadget.OnDiskVolume, gv *gadget.Volume, opts *CreateOptions) ([]*gadget.OnDiskAndGadgetStructurePair, error) {
+func createMissingPartitions(dv *gadget.OnDiskVolume, gv *gadget.Volume, opts *CreateOptions, deletedOffsetSize map[int]StructOffsetSize) ([]*gadget.OnDiskAndGadgetStructurePair, error) {
 	if opts == nil {
 		opts = &CreateOptions{}
 	}
 
-	buf, created, err := buildPartitionList(dl, gv, opts)
+	buf, created, err := buildPartitionList(dv, gv, opts, deletedOffsetSize)
 	if err != nil {
 		return nil, err
 	}
@@ -93,20 +95,25 @@ func createMissingPartitions(dl *gadget.OnDiskVolume, gv *gadget.Volume, opts *C
 		return created, nil
 	}
 
-	logger.Debugf("create partitions on %s: %s", dl.Device, buf.String())
+	logger.Debugf("create partitions on %s: %s", dv.Device, buf.String())
 
 	// Write the partition table. By default sfdisk will try to re-read the
 	// partition table with the BLKRRPART ioctl but will fail because the
 	// kernel side rescan removes and adds partitions and we have partitions
 	// mounted (so it fails on removal). Use --no-reread to skip this attempt.
-	cmd := exec.Command("sfdisk", "--append", "--no-reread", dl.Device)
+	cmd := exec.Command("sfdisk", "--append", "--no-reread", dv.Device)
 	cmd.Stdin = buf
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return created, osutil.OutputErr(output, err)
 	}
 
 	// Re-read the partition table
-	if err := reloadPartitionTable(opts.GadgetRootDir, dl.Device); err != nil {
+	// TODO this is not really working if, in a reinstall, we deleted
+	// partitions of a different size of the ones we are creating (see
+	// comment on why we are not doing this in buildPartitionList). In any
+	// case, it seems that we have had problems in the past with partx and
+	// maybe we should try something else (partprobe?).
+	if err := reloadPartitionTable(opts.GadgetRootDir, dv.Device); err != nil {
 		return nil, err
 	}
 
@@ -131,11 +138,12 @@ func createMissingPartitions(dl *gadget.OnDiskVolume, gv *gadget.Volume, opts *C
 	return created, nil
 }
 
-// buildPartitionList builds a list of partitions based on the current
-// device contents and gadget structure list, in sfdisk dump format, and
-// returns a partitioning description suitable for sfdisk input and a
-// list of the partitions to be created.
-func buildPartitionList(dl *gadget.OnDiskVolume, vol *gadget.Volume, opts *CreateOptions) (sfdiskInput *bytes.Buffer, toBeCreated []*gadget.OnDiskAndGadgetStructurePair, err error) {
+// buildPartitionList builds a list of partitions based on the current device
+// contents and gadget structure list, in sfdisk dump format, and returns a
+// partitioning description suitable for sfdisk input and a list of the
+// partitions to be created. To determine the size we need the gadget, volume
+// and map of gadget indexes to just deleted partitions.
+func buildPartitionList(dl *gadget.OnDiskVolume, vol *gadget.Volume, opts *CreateOptions, deletedOffsetSize map[int]StructOffsetSize) (sfdiskInput *bytes.Buffer, toBeCreated []*gadget.OnDiskAndGadgetStructurePair, err error) {
 	if opts == nil {
 		opts = &CreateOptions{}
 	}
@@ -149,17 +157,26 @@ func buildPartitionList(dl *gadget.OnDiskVolume, vol *gadget.Volume, opts *Creat
 	// called before this function. muinstaller also checks for
 	// PartialStructure before this is run.
 	pIndex := 0
-
-	// Keep track what partitions we already have on disk - the keys to this map
-	// is the starting sector of the structure we have seen.
-	// TODO: use quantity.SectorOffset or similar when that is available
-
-	seen := map[uint64]bool{}
 	for _, s := range dl.Structure {
-		start := uint64(s.StartOffset) / sectorSize
-		seen[start] = true
 		if s.DiskIndex > pIndex {
 			pIndex = s.DiskIndex
+		}
+	}
+
+	// Find out partitions already on the disk, if we don't want to create
+	// all. If CreateAllMissingPartitions is set we are being called from
+	// muinstaller and no partitions are expected on the disk.
+	// TODO we should avoid using createMissingPartitions as ancillary
+	// method from muinstaller to avoid this sort of situation, maybe by copying
+	// the code around.
+	matchedStructs := map[int]*gadget.OnDiskStructure{}
+	if !opts.CreateAllMissingPartitions {
+		// EnsureVolumeCompatibility will ignore missing partitions as
+		// the AssumeCreatablePartitionsCreated option is false by default.
+		if matchedStructs, err = gadget.EnsureVolumeCompatibility(vol, dl, nil); err != nil {
+			return nil, nil, fmt.Errorf(
+				"gadget and boot device %v partition table not compatible: %v",
+				dl.Device, err)
 		}
 	}
 
@@ -180,23 +197,44 @@ func buildPartitionList(dl *gadget.OnDiskVolume, vol *gadget.Volume, opts *Creat
 		if !vs.IsPartition() {
 			continue
 		}
-
-		// Work out offset, might have not been set if min-size is used
-		// (but note that as we are creating we use the size value)
-		offset := quantity.Offset(0)
-		if vs.Offset != nil {
-			offset = *vs.Offset
-		} else {
-			offset = lastEnd
-		}
-
-		lastEnd = offset + quantity.Offset(vs.Size)
-
 		// Skip partitions defined in the gadget that are already in the volume
-		startInSectors := uint64(offset) / sectorSize
-		if seen[startInSectors] {
+		if ds, ok := matchedStructs[vs.YamlIndex]; ok {
+			lastEnd = ds.StartOffset + quantity.Offset(ds.Size)
 			continue
 		}
+
+		// We use the offset/size of removed partitions in reinstalls
+		// instead of using "size" from the gadget. These data can be
+		// different from the gadget size field when it is possible to
+		// specify sizes in the [min-size, size] interval. With this
+		// approach we make sure that:
+		//
+		// - There are no overlaps with non-deleted partitions after
+		//   the deleted ones
+		// - We do not end up with smaller than before data partition
+		// - If using an installer, it might have decided on partition
+		//   sizes and we would be overriding that decision
+		//
+		// If we decide a different approach in the future these points
+		// will need to be considered.
+		var offset quantity.Offset
+		var size quantity.Size
+		if prevOffsetSize, ok := deletedOffsetSize[vs.YamlIndex]; ok {
+			offset = prevOffsetSize.StartOffset
+			size = prevOffsetSize.Size
+		} else {
+			// Work out offset, might have not been set if min-size
+			// is used (but note that we use the size value as we
+			// are creating for the first time)
+			if vs.Offset != nil {
+				offset = *vs.Offset
+			} else {
+				offset = lastEnd
+			}
+			size = vs.Size
+		}
+
+		lastEnd = offset + quantity.Offset(size)
 
 		pIndex++
 
@@ -206,7 +244,8 @@ func buildPartitionList(dl *gadget.OnDiskVolume, vol *gadget.Volume, opts *Creat
 		}
 
 		// Check if the data partition should be expanded
-		newSizeInSectors := uint64(vs.Size) / sectorSize
+		startInSectors := uint64(offset) / sectorSize
+		newSizeInSectors := uint64(size) / sectorSize
 		if vs.Role == gadget.SystemData && canExpandData && startInSectors+newSizeInSectors < dl.UsableSectorsEnd {
 			// note that if startInSectors + newSizeInSectors == dl.UsableSectorEnd
 			// then we won't hit this branch, but it would be redundant anyways
@@ -266,34 +305,51 @@ func deviceName(name string, index int) string {
 	return fmt.Sprintf("%s%d", name, index)
 }
 
+// StructOffsetSize contains current offset and size of a partition that we are
+// about to delete.
+type StructOffsetSize struct {
+	StartOffset quantity.Offset
+	Size        quantity.Size
+}
+
 // removeCreatedPartitions removes partitions added during a previous install.
-func removeCreatedPartitions(gadgetRoot string, gv *gadget.Volume, dl *gadget.OnDiskVolume) error {
+// For this it matches partitions from the gadget to the partitions currently
+// existing in the volume. It needs gadgetRoot to find some configuration
+// options. It returns a map of gadget.yaml indexes to information about the
+// removed partitions.
+func removeCreatedPartitions(gadgetRoot string, gv *gadget.Volume, dl *gadget.OnDiskVolume) (map[int]StructOffsetSize, error) {
 	sfdiskIndexes := make([]string, 0, len(dl.Structure))
 	// up to 3 possible partitions are creatable and thus removable:
 	// ubuntu-data, ubuntu-boot, and ubuntu-save
 	deletedIndexes := make(map[int]bool, 3)
+	deletedOffsetSize := make(map[int]StructOffsetSize, 3)
 	for i, s := range dl.Structure {
-		if wasCreatedDuringInstall(gv, s) {
+		yamlIdx := indexIfCreatedDuringInstall(gv, s)
+		if yamlIdx >= 0 {
 			logger.Noticef("partition %s was created during previous install", s.Node)
 			sfdiskIndexes = append(sfdiskIndexes, strconv.Itoa(i+1))
+			deletedOffsetSize[yamlIdx] = StructOffsetSize{
+				StartOffset: s.StartOffset,
+				Size:        s.Size,
+			}
 			deletedIndexes[i] = true
 		}
 	}
 	if len(sfdiskIndexes) == 0 {
-		return nil
+		return deletedOffsetSize, nil
 	}
 
 	// Delete disk partitions
 	logger.Debugf("delete disk partitions %v", sfdiskIndexes)
 	cmd := exec.Command("sfdisk", append([]string{"--no-reread", "--delete", dl.Device}, sfdiskIndexes...)...)
 	if output, err := cmd.CombinedOutput(); err != nil {
-		return osutil.OutputErr(output, err)
+		return nil, osutil.OutputErr(output, err)
 	}
 
 	// Reload the partition table - note that this specifically does not trigger
 	// udev events to remove the deleted devices, see the doc-comment below
 	if err := reloadPartitionTable(gadgetRoot, dl.Device); err != nil {
-		return err
+		return nil, err
 	}
 
 	// Remove the partitions we deleted from the OnDiskVolume - note that we
@@ -319,12 +375,7 @@ func removeCreatedPartitions(gadgetRoot string, gv *gadget.Volume, dl *gadget.On
 
 	dl.Structure = newStructure
 
-	// Ensure all created partitions were removed
-	if remaining := createdDuringInstall(gv, dl); len(remaining) > 0 {
-		return fmt.Errorf("cannot remove partitions: %s", strings.Join(remaining, ", "))
-	}
-
-	return nil
+	return deletedOffsetSize, nil
 }
 
 // ensureNodesExistImpl makes sure that the specified device nodes are available
@@ -402,14 +453,15 @@ func udevTrigger(device string) error {
 	return nil
 }
 
-// wasCreatedDuringInstall returns if the OnDiskStructure was created during
-// install by referencing the gadget volume. A structure is only considered to
-// be created during install if it is a role that is created during install and
-// the start offsets match. We specifically don't look at anything on the
-// structure such as filesystem information since this may be incomplete due to
-// a failed installation, or due to the partial layout that is created by some
-// ARM tools (i.e. ptool and fastboot) when flashing images to internal MMC.
-func wasCreatedDuringInstall(gv *gadget.Volume, s gadget.OnDiskStructure) bool {
+// indexIfCreatedDuringInstall returns the gadget index if the OnDiskStructure
+// was created during install by referencing the gadget volume, -1 otherwise. A
+// structure is only considered to be created during install if it is a role
+// that is created during install and the start offsets match. We specifically
+// don't look at anything on the structure such as filesystem information since
+// this may be incomplete due to a failed installation, or due to the partial
+// layout that is created by some ARM tools (i.e. ptool and fastboot) when
+// flashing images to internal MMC.
+func indexIfCreatedDuringInstall(gv *gadget.Volume, s gadget.OnDiskStructure) int {
 	// for a structure to have been created during install, it must be one of
 	// the system-boot, system-data, or system-save roles from the gadget, and
 	// as such the on disk structure must exist in the exact same location as
@@ -424,22 +476,10 @@ func wasCreatedDuringInstall(gv *gadget.Volume, s gadget.OnDiskStructure) bool {
 			// install, see if the offset matches the provided on disk structure
 			// has
 			if gadget.CheckValidStartOffset(s.StartOffset, gv.Structure, i) == nil {
-				return true
+				return gs.YamlIndex
 			}
 		}
 	}
 
-	return false
-}
-
-// createdDuringInstall returns a list of partitions created during the
-// install process.
-func createdDuringInstall(gv *gadget.Volume, layout *gadget.OnDiskVolume) (created []string) {
-	created = make([]string, 0, len(layout.Structure))
-	for _, s := range layout.Structure {
-		if wasCreatedDuringInstall(gv, s) {
-			created = append(created, s.Node)
-		}
-	}
-	return created
+	return -1
 }

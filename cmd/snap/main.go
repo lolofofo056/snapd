@@ -20,6 +20,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -75,8 +76,8 @@ type argDesc struct {
 
 var optionsData options
 
-// ErrExtraArgs is returned  if extra arguments to a command are found
-var ErrExtraArgs = fmt.Errorf(i18n.G("too many arguments for command"))
+// ErrExtraArgs is returned if extra arguments to a command are found
+var ErrExtraArgs = errors.New(i18n.G("too many arguments for command"))
 
 // cmdInfo holds information needed to call parser.AddCommand(...).
 type cmdInfo struct {
@@ -365,6 +366,7 @@ func Parser(cli *client.Client) *flags.Parser {
 }
 
 var isStdinTTY = terminal.IsTerminal(0)
+var isStdoutTTY = terminal.IsTerminal(1)
 
 // ClientConfig is the configuration of the Client used by all commands.
 var ClientConfig = client.Config{
@@ -400,7 +402,7 @@ This command has been left available for documentation purposes only.
 }
 
 func init() {
-	err := logger.SimpleSetup()
+	err := logger.SimpleSetup(nil)
 	if err != nil {
 		fmt.Fprintf(Stderr, i18n.G("WARNING: failed to activate logging: %v\n"), err)
 	}
@@ -441,6 +443,11 @@ func exitCodeFromError(err error) int {
 
 func main() {
 	snapdtool.ExecInSnapdOrCoreSnap()
+
+	if err := snapdtool.MaybeSetupFIPS(); err != nil {
+		fmt.Fprintf(os.Stderr, "cannot check or enable FIPS mode: %v\n", err)
+		os.Exit(1)
+	}
 
 	// check for magic symlink to /usr/bin/snap:
 	// 1. symlink from command-not-found to /usr/bin/snap: run c-n-f

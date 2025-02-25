@@ -126,9 +126,15 @@ const fwupdPermanentSlotAppArmor = `
   /boot/efi/{,**/} r,
   # allow access to fwupd* and fw/ under boot/ for core systems
   /boot/efi/EFI/*/fwupd*.efi* rw,
+  # allow access to the shim and fallback shim
+  /boot/efi/EFI/*/shim*.efi* r,
+  /boot/efi/EFI/BOOT/BOOT*.EFI r,
+  /boot/efi/EFI/*/grub*.efi* r,
   /boot/efi/EFI/*/ rw,
   /boot/efi/EFI/*/fw/ rw,
   /boot/efi/EFI/*/fw/** rw,
+  /boot/efi/EFI/dell/bios/recovery/ rw,
+  /boot/efi/EFI/dell/bios/recovery/** rw,
   /boot/efi/EFI/fwupd/ rw,
   /boot/efi/EFI/fwupd/** rw,
   /boot/efi/EFI/UpdateCapsule/ rw,
@@ -153,6 +159,10 @@ const fwupdPermanentSlotAppArmor = `
   # Required by plugin amdgpu
   /sys/devices/**/psp_vbflash rw,
   /sys/devices/**/psp_vbflash_status r,
+
+  # Required by plugin thunderbolt
+  /sys/devices/**/nvm_non_active*/nvmem a,
+  /sys/devices/**/nvm_active*/nvmem r,
 
   # DBus accesses
   #include <abstractions/dbus-strict>
@@ -416,7 +426,7 @@ func (iface *fwupdInterface) AppArmorConnectedPlug(spec *apparmor.Specification,
 	if implicitSystemConnectedSlot(slot) {
 		new = "unconfined"
 	} else {
-		new = spec.SnapAppSet().SlotLabelExpression(slot)
+		new = slot.LabelExpression()
 	}
 	snippet := strings.Replace(fwupdConnectedPlugAppArmor, old, new, -1)
 	spec.AddSnippet(snippet)
@@ -460,7 +470,7 @@ func (iface *fwupdInterface) MountPermanentSlot(spec *mount.Specification, slot 
 func (iface *fwupdInterface) AppArmorConnectedSlot(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
 	if !implicitSystemConnectedSlot(slot) {
 		old := "###PLUG_SECURITY_TAGS###"
-		new := spec.SnapAppSet().PlugLabelExpression(plug)
+		new := plug.LabelExpression()
 		snippet := strings.Replace(fwupdConnectedSlotAppArmor, old, new, -1)
 		spec.AddSnippet(snippet)
 	}

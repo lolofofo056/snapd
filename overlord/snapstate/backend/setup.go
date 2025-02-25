@@ -20,6 +20,7 @@
 package backend
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -28,11 +29,14 @@ import (
 	"github.com/snapcore/snapd/cmd/snaplock/runinhibit"
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/kernel"
+	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/progress"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/systemd"
 )
+
+var kernelEnsureKernelDriversTree = kernel.EnsureKernelDriversTree
 
 // InstallRecord keeps a record of what installation effectively did as hints
 // about what needs to be undone in case of failure.
@@ -79,11 +83,12 @@ func (b Backend) SetupSnap(snapFilePath, instanceName string, sideInfo *snap.Sid
 		return snapType, nil, err
 	}
 
-	if s.InstanceKey != "" {
-		err := os.MkdirAll(snap.BaseDir(s.SnapName()), 0755)
-		if err != nil && !os.IsExist(err) {
-			return snapType, nil, err
-		}
+	// for consistency, since we created an instance directory, let's create
+	// the shared snap prefix directory as well; even if the directory is
+	// removed during removal of snap sharing the same name, linking the
+	// current instance will ensure it exists
+	if err := createSharedSnapDirForParallelInstance(s); err != nil {
+		return snapType, nil, err
 	}
 
 	// in uc20+ and classic with modes run mode, all snaps must be on the
@@ -99,11 +104,17 @@ func (b Backend) SetupSnap(snapFilePath, instanceName string, sideInfo *snap.Sid
 	}
 
 	// generate the mount unit for the squashfs
-	if err := addMountUnit(s, b.preseed, meter); err != nil {
+	t := s.Type()
+	mountFlags := systemd.EnsureMountUnitFlags{
+		PreventRestartIfModified: false,
+		// We need early mounts only for UC20+/hybrid, also 16.04
+		// systemd seems to be buggy if we enable this.
+		StartBeforeDriversLoad: t == snap.TypeKernel && dev.HasModeenv(),
+	}
+	if err := addMountUnit(s, mountFlags, newSystemd(b.preseed, meter)); err != nil {
 		return snapType, nil, err
 	}
 
-	t := s.Type()
 	if !setupOpts.SkipKernelExtraction {
 		if err := boot.Kernel(s, t, dev).ExtractKernelAssets(snapf); err != nil {
 			return snapType, nil, fmt.Errorf("cannot install kernel: %s", err)
@@ -116,67 +127,29 @@ func (b Backend) SetupSnap(snapFilePath, instanceName string, sideInfo *snap.Sid
 
 // SetupKernelSnap does extra configuration for kernel snaps.
 func (b Backend) SetupKernelSnap(instanceName string, rev snap.Revision, meter progress.Meter) (err error) {
-	var sysd systemd.Systemd
-	if b.preseed {
-		sysd = systemd.NewEmulationMode(dirs.GlobalRootDir)
-	} else {
-		sysd = systemd.New(systemd.SystemMode, meter)
-	}
-
-	// Create early mount for the snap
-	cpi := snap.MinimalSnapContainerPlaceInfo(instanceName, rev)
-
-	earlyMountDir := kernel.EarlyKernelMountDir(instanceName, rev)
-	addMountUnitOptions := &systemd.MountUnitOptions{
-		MountUnitType: systemd.BeforeDriversLoadMountUnit,
-		Lifetime:      systemd.Persistent,
-		Description:   "Early mount unit for kernel snap",
-		What:          cpi.MountFile(),
-		Where:         dirs.StripRootDir(earlyMountDir),
-		Fstype:        "squashfs",
-		Options:       []string{"nodev,ro,x-gdu.hide,x-gvfs-hide"},
-	}
-	_, err = sysd.EnsureMountUnitFileWithOptions(addMountUnitOptions)
-	if err != nil {
-		return fmt.Errorf("cannot create mount in %q: %w", earlyMountDir, err)
-	}
-
-	// Clean-up mount if the kernel tree cannot be built
-	defer func() {
-		if err == nil {
-			return
-		}
-		if e := sysd.RemoveMountUnitFile(earlyMountDir); e != nil {
-			meter.Notify(fmt.Sprintf("while trying to clean up due to previous failure: %v", e))
-		}
-	}()
-
 	// Build kernel tree that will be mounted from initramfs
-	return kernel.EnsureKernelDriversTree(instanceName, rev,
-		earlyMountDir, nil, &kernel.KernelDriversTreeOptions{KernelInstall: true})
+	cpi := snap.MinimalSnapContainerPlaceInfo(instanceName, rev)
+	destDir := kernel.DriversTreeDir(dirs.GlobalRootDir, instanceName, rev)
+
+	// TODO:COMPS: consider components when installed jointly
+	return kernelEnsureKernelDriversTree(
+		kernel.MountPoints{
+			Current: cpi.MountDir(),
+			Target:  cpi.MountDir()},
+		nil, destDir,
+		&kernel.KernelDriversTreeOptions{KernelInstall: true})
 }
 
 func (b Backend) RemoveKernelSnapSetup(instanceName string, rev snap.Revision, meter progress.Meter) error {
-	if err := kernel.RemoveKernelDriversTree(instanceName, rev); err != nil {
-		return err
-	}
-
-	var sysd systemd.Systemd
-	if b.preseed {
-		sysd = systemd.NewEmulationMode(dirs.GlobalRootDir)
-	} else {
-		sysd = systemd.New(systemd.SystemMode, meter)
-	}
-
-	earlyMountDir := kernel.EarlyKernelMountDir(instanceName, rev)
-	return sysd.RemoveMountUnitFile(earlyMountDir)
+	kernelTree := kernel.DriversTreeDir(dirs.GlobalRootDir, instanceName, rev)
+	return kernel.RemoveKernelDriversTree(kernelTree)
 }
 
 // SetupComponent prepares and mounts a component for further processing.
 func (b Backend) SetupComponent(compFilePath string, compPi snap.ContainerPlaceInfo, dev snap.Device, meter progress.Meter) (installRecord *InstallRecord, err error) {
 	// This assumes that the component was already verified or --dangerous was used.
 
-	_, snapf, oErr := OpenComponentFile(compFilePath)
+	compInfo, snapf, oErr := OpenComponentFile(compFilePath, nil, nil)
 	if oErr != nil {
 		return nil, oErr
 	}
@@ -214,7 +187,13 @@ func (b Backend) SetupComponent(compFilePath string, compPi snap.ContainerPlaceI
 	}
 
 	// generate the mount unit for the squashfs
-	if err := addMountUnit(compPi, b.preseed, meter); err != nil {
+	mountFlags := systemd.EnsureMountUnitFlags{
+		PreventRestartIfModified: false,
+		// We need early mounts only for UC20+/hybrid, also 16.04
+		// systemd seems to be buggy if we enable this.
+		StartBeforeDriversLoad: compInfo.Type == snap.KernelModulesComponent && dev.HasModeenv(),
+	}
+	if err := addMountUnit(compPi, mountFlags, newSystemd(b.preseed, meter)); err != nil {
 		return nil, err
 	}
 
@@ -264,7 +243,7 @@ func (b Backend) RemoveComponentFiles(cpi snap.ContainerPlaceInfo, installRecord
 		return err
 	}
 
-	// Remove /snap/<snap_instance>/components/<snap_rev>/<comp_name>
+	// Remove /snap/<snap_instance>/components/mnt/<comp_name>/<comp_rev>
 	if err := os.RemoveAll(cpi.MountDir()); err != nil {
 		return err
 	}
@@ -277,17 +256,13 @@ func (b Backend) RemoveComponentFiles(cpi snap.ContainerPlaceInfo, installRecord
 		}
 	}
 
-	// TODO should we check here if there are other components installed
-	// for this snap revision or for other revisions and if not delete
-	// <snap_rev>/ and maybe also components/<snap_rev>/?
-
 	return nil
 }
 
 func (b Backend) RemoveSnapDir(s snap.PlaceInfo, hasOtherInstances bool) error {
 	mountDir := s.MountDir()
 
-	snapName, instanceKey := snap.SplitInstanceName(s.InstanceName())
+	_, instanceKey := snap.SplitInstanceName(s.InstanceName())
 	if instanceKey != "" {
 		// always ok to remove instance specific one, failure to remove
 		// is ok, there may be other revisions
@@ -296,18 +271,24 @@ func (b Backend) RemoveSnapDir(s snap.PlaceInfo, hasOtherInstances bool) error {
 	if !hasOtherInstances {
 		// remove only if not used by other instances of the same snap,
 		// failure to remove is ok, there may be other revisions
-		os.Remove(snap.BaseDir(snapName))
+		os.Remove(snap.BaseDir(s.SnapName()))
 	}
 	return nil
 }
 
 func (b Backend) RemoveComponentDir(cpi snap.ContainerPlaceInfo) error {
 	compMountDir := cpi.MountDir()
-	// Remove /snap/<snap_instance>/components/<snap_rev>/<comp_name>
-	os.Remove(compMountDir)
-	// and /snap/<snap_instance>/components/<snap_rev> (might fail
-	// if there are other components installed for this revision)
-	os.Remove(filepath.Dir(compMountDir))
+	// Remove last 3 directories of
+	// /snap/<snap_instance>/components/mnt/<comp_name>/ if they
+	// are empty (last one should be). Note that subdirectories with snap
+	// revisions are handled by UnlinkComponent.
+	for i := 0; i < 3; i++ {
+		compMountDir = filepath.Dir(compMountDir)
+		if err := os.Remove(compMountDir); err != nil {
+			break
+		}
+	}
+
 	return nil
 }
 
@@ -322,6 +303,93 @@ func (b Backend) UndoSetupComponent(cpi snap.ContainerPlaceInfo, installRecord *
 }
 
 // RemoveSnapInhibitLock removes the file controlling inhibition of "snap run".
-func (b Backend) RemoveSnapInhibitLock(instanceName string) error {
-	return runinhibit.RemoveLockFile(instanceName)
+func (b Backend) RemoveSnapInhibitLock(instanceName string, stateUnlocker runinhibit.Unlocker) error {
+	if stateUnlocker == nil {
+		return errors.New("internal error: stateUnlocker cannot be nil")
+	}
+	return runinhibit.RemoveLockFile(instanceName, stateUnlocker)
+}
+
+// SetupKernelModulesComponents changes kernel-modules configuration by
+// installing currentComps. The components currently active are currentComps,
+// while ksnapName and ksnapRev identify the currently active kernel.
+func (b Backend) SetupKernelModulesComponents(currentComps, finalComps []*snap.ComponentSideInfo, ksnapName string, ksnapRev snap.Revision, meter progress.Meter) (err error) {
+	return moveKModsComponentsState(
+		currentComps, finalComps, ksnapName, ksnapRev,
+		"after failure to set-up kernel modules components")
+}
+
+// moveKModsComponentsState changes kernel-modules set-up from currentComps to
+// finalComps, for the kernel/revision specified by ksnapName/ksnapRev.
+func moveKModsComponentsState(currentComps, finalComps []*snap.ComponentSideInfo, ksnapName string, ksnapRev snap.Revision, cleanErrMsg string) (err error) {
+	cpi := snap.MinimalSnapContainerPlaceInfo(ksnapName, ksnapRev)
+	kMntPts := kernel.MountPoints{
+		Current: cpi.MountDir(),
+		Target:  cpi.MountDir(),
+	}
+	destDir := kernel.DriversTreeDir(dirs.GlobalRootDir, ksnapName, ksnapRev)
+	kinfo, err := kernel.ReadInfo(kMntPts.Current)
+	if err != nil {
+		return err
+	}
+	finalCompsMntPts := compsMountPoints(finalComps, ksnapName, ksnapRev, kinfo)
+
+	if err := kernelEnsureKernelDriversTree(kMntPts, finalCompsMntPts, destDir,
+		&kernel.KernelDriversTreeOptions{KernelInstall: false}); err != nil {
+
+		// Revert change on error
+		currentCompsMntPts := compsMountPoints(currentComps, ksnapName, ksnapRev, kinfo)
+		if e := kernelEnsureKernelDriversTree(kMntPts, currentCompsMntPts, destDir,
+			&kernel.KernelDriversTreeOptions{KernelInstall: false}); e != nil {
+			logger.Noticef("while restoring kernel tree %s: %v", cleanErrMsg, e)
+		}
+
+		return err
+	}
+
+	return nil
+}
+
+func compsMountPoints(comps []*snap.ComponentSideInfo, kSnapName string, ksnapRev snap.Revision, ki *kernel.Info) []kernel.ModulesCompMountPoints {
+	compsMntPts := make([]kernel.ModulesCompMountPoints, 0, len(comps)+1)
+	for _, csi := range comps {
+		compPlaceInfo := snap.MinimalComponentContainerPlaceInfo(csi.Component.ComponentName,
+			csi.Revision, kSnapName)
+		if dirHasDrivers(compPlaceInfo.MountDir()) {
+			compsMntPts = append(compsMntPts, kernel.ModulesCompMountPoints{
+				LinkName: csi.Component.ComponentName,
+				MountPoints: kernel.MountPoints{
+					Current: compPlaceInfo.MountDir(),
+					Target:  compPlaceInfo.MountDir(),
+				}})
+		}
+	}
+
+	// The kernel might generate dynamically modules, check
+	if dynDir := ki.DynamicModulesDir(kSnapName, ksnapRev); dynDir != "" {
+		if dirHasDrivers(dynDir) {
+			logger.Noticef("setup: modules for %s", dynDir)
+			compsMntPts = append(compsMntPts, kernel.ModulesCompMountPoints{
+				LinkName: kSnapName + "_dyn",
+				MountPoints: kernel.MountPoints{
+					Current: dynDir,
+					Target:  dynDir,
+				}})
+		}
+	}
+
+	return compsMntPts
+}
+
+func dirHasDrivers(dir string) bool {
+	modExists, modIsDir, _ := osutil.DirExists(filepath.Join(dir, "modules"))
+	fwExists, fwIsDir, _ := osutil.DirExists(filepath.Join(dir, "firmware"))
+	return (modExists && modIsDir) || (fwExists && fwIsDir)
+}
+
+func newSystemd(preseed bool, meter progress.Meter) systemd.Systemd {
+	if preseed {
+		return systemd.NewEmulationMode(dirs.GlobalRootDir)
+	}
+	return systemd.New(systemd.SystemMode, meter)
 }

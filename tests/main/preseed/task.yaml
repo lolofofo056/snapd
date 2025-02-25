@@ -5,7 +5,10 @@ details: |
   command works, up to the point where the image is ready to be booted.
   The test assumes cloud image with a core and lxd snaps in its seeds/.
 
-systems: [ubuntu-2*]
+# Ubuntu 24.04: there is no longer any seeded snaps in base or minimal cloud images
+# https://bugs.launchpad.net/ubuntu/+source/ubuntu-meta/+bug/2051346
+# https://bugs.launchpad.net/ubuntu/+source/ubuntu-meta/+bug/2051572
+systems: [ubuntu-20*, ubuntu-22*, ubuntu-23*]
 
 environment:
   IMAGE_MOUNTPOINT: /mnt/cloudimg
@@ -24,13 +27,19 @@ prepare: |
   mount_ubuntu_image "$(pwd)/cloudimg.img" "$IMAGE_MOUNTPOINT"
 
   # add snapd from this branch into the seed
-  "$TESTSTOOLS"/snaps-state repack_snapd_deb_into_snap snapd
-  mv snapd-from-deb.snap snapd.snap
+  # shellcheck source=tests/lib/prepare.sh
+  . "$TESTSLIB"/prepare.sh
+  build_snapd_snap_with_run_mode_firstboot_tweaks "$PWD"
+  mv snapd_*.snap snapd.snap
   inject_snap_into_seed "$IMAGE_MOUNTPOINT" snapd
 
   # for images that are already preseeded, we need to undo the preseeding there
   echo "Running preseed --reset for already preseeded cloud images"
-  SNAPD_DEBUG=1 /usr/lib/snapd/snap-preseed --reset "$IMAGE_MOUNTPOINT"
+  SNAP_PRESEED=/usr/lib/snapd/snap-preseed
+  if tests.info is-snapd-from-archive; then
+      SNAP_PRESEED="/snap/snapd/current$SNAP_PRESEED"
+  fi
+  SNAPD_DEBUG=1 "$SNAP_PRESEED" --reset "$IMAGE_MOUNTPOINT"
 
 restore: |
   #shellcheck source=tests/lib/preseed.sh
@@ -43,11 +52,16 @@ execute: |
       LXD_BASE_SNAP=core22
   fi
 
+  SNAP_PRESEED=/usr/lib/snapd/snap-preseed
+  if tests.info is-snapd-from-archive; then
+      SNAP_PRESEED="/snap/snapd/current$SNAP_PRESEED"
+  fi
+
   echo "Checking missing chroot path arg error"
-  /usr/lib/snapd/snap-preseed 2>&1 | MATCH "error: need chroot path as argument"
+  "$SNAP_PRESEED" 2>&1 | MATCH "error: need chroot path as argument"
 
   echo "Running pre-seeding"
-  SNAPD_DEBUG=1 /usr/lib/snapd/snap-preseed "$IMAGE_MOUNTPOINT"
+  SNAPD_DEBUG=1 "$SNAP_PRESEED" "$IMAGE_MOUNTPOINT"
 
   # precondition, core snap mounted by snap-preseed got unmounted
   mount | NOMATCH "snap-preseed"
@@ -120,7 +134,7 @@ execute: |
   # the list of expected profiles isn't exhaustive, we're just checking some critical ones
   for prof in snap.lxd.lxd snap.lxd.hook.install snap.lxd.hook.configure snap.lxd.daemon; do
     test -f "$AA_PROFILES/$prof"
-    test -f "$SECCOMP_PROFILES/$prof.bin"
+    test -f "$SECCOMP_PROFILES/$prof.bin2"
   done
 
   echo "Checking that mount units have been created and enabled on the target image"

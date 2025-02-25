@@ -23,8 +23,10 @@ import (
 	"bufio"
 	"bytes"
 	"crypto"
+	"encoding/json"
 	"fmt"
 	"io"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -39,6 +41,7 @@ type typeFlags int
 const (
 	noAuthority typeFlags = 1 << iota
 	sequenceForming
+	jsonBody
 )
 
 // MetaHeaders is a list of headers in assertions which are about the assertion
@@ -100,7 +103,7 @@ func (at *AssertionType) MaxSupportedFormat() int {
 	return maxSupportedFormat[at.Name]
 }
 
-// SequencingForming returns true if the assertion type has a positive
+// SequenceForming returns true if the assertion type has a positive
 // integer >= 1 as the last component (preferably called "sequence")
 // of its primary key over which the assertions of the type form
 // sequences, usually without gaps, one sequence per sequence key (the
@@ -140,7 +143,7 @@ var (
 	PreseedType              = &AssertionType{"preseed", []string{"series", "brand-id", "model", "system-label"}, nil, assemblePreseed, 0}
 	SnapResourceRevisionType = &AssertionType{"snap-resource-revision", []string{"snap-id", "resource-name", "resource-sha3-384", "provenance"}, map[string]string{"provenance": naming.DefaultProvenance}, assembleSnapResourceRevision, 0}
 	SnapResourcePairType     = &AssertionType{"snap-resource-pair", []string{"snap-id", "resource-name", "resource-revision", "snap-revision", "provenance"}, map[string]string{"provenance": naming.DefaultProvenance}, assembleSnapResourcePair, 0}
-	AspectBundleType         = &AssertionType{"aspect-bundle", []string{"account-id", "name"}, nil, assembleAspectBundle, 0}
+	ConfdbType               = &AssertionType{"confdb", []string{"account-id", "name"}, nil, assembleConfdb, jsonBody}
 
 	// ...
 )
@@ -150,6 +153,7 @@ var (
 	DeviceSessionRequestType = &AssertionType{"device-session-request", []string{"brand-id", "model", "serial"}, nil, assembleDeviceSessionRequest, noAuthority}
 	SerialRequestType        = &AssertionType{"serial-request", nil, nil, assembleSerialRequest, noAuthority}
 	AccountKeyRequestType    = &AssertionType{"account-key-request", []string{"public-key-sha3-384"}, nil, assembleAccountKeyRequest, noAuthority}
+	ConfdbControlType        = &AssertionType{"confdb-control", []string{"brand-id", "model", "serial"}, nil, assembleConfdbControl, noAuthority}
 )
 
 var typeRegistry = map[string]*AssertionType{
@@ -170,11 +174,12 @@ var typeRegistry = map[string]*AssertionType{
 	PreseedType.Name:              PreseedType,
 	SnapResourceRevisionType.Name: SnapResourceRevisionType,
 	SnapResourcePairType.Name:     SnapResourcePairType,
-	AspectBundleType.Name:         AspectBundleType,
+	ConfdbType.Name:               ConfdbType,
 	// no authority
 	DeviceSessionRequestType.Name: DeviceSessionRequestType,
 	SerialRequestType.Name:        SerialRequestType,
 	AccountKeyRequestType.Name:    AccountKeyRequestType,
+	ConfdbControlType.Name:        ConfdbControlType,
 }
 
 // Type returns the AssertionType with name or nil
@@ -204,7 +209,8 @@ func init() {
 	// 3: support for on-store/on-brand/on-model device scope constraints
 	// 4: support for plug-names/slot-names constraints
 	// 5: alt attr matcher usage (was unused before, has new behavior now)
-	maxSupportedFormat[SnapDeclarationType.Name] = 5
+	// 6: support for $PLUG_PUBLISHER_ID/$SLOT_PUBLISHER_ID in attr constraints
+	maxSupportedFormat[SnapDeclarationType.Name] = 6
 
 	// 1: support to limit to device serials
 	// 2: support for user-presence constraint
@@ -563,7 +569,7 @@ type SequenceMember interface {
 // customSigner represents an assertion with special arrangements for its signing key (e.g. self-signed), rather than the usual case where an assertion is signed by its authority.
 type customSigner interface {
 	// signKey returns the public key material for the key that signed this assertion.  See also SignKeyID.
-	signKey() PublicKey
+	signKey(db RODatabase) (PublicKey, error)
 }
 
 // MediaType is the media type for encoded assertions on the wire.
@@ -994,6 +1000,34 @@ func checkNoAuthority(assertType *AssertionType, headers map[string]interface{})
 	return nil
 }
 
+func checkJSON(assertType *AssertionType, body []byte) (err error) {
+	defer func() {
+		if err != nil {
+			err = fmt.Errorf("assertion %s: %v", assertType.Name, err)
+		}
+	}()
+
+	if body == nil {
+		return fmt.Errorf(`body must contain JSON`)
+	}
+
+	var val interface{}
+	if err := json.Unmarshal(body, &val); err != nil {
+		return fmt.Errorf("invalid JSON in body: %v", err)
+	}
+
+	formatted, err := json.MarshalIndent(val, "", "  ")
+	if err != nil {
+		return fmt.Errorf("invalid JSON in body: %v", err)
+	}
+
+	if !reflect.DeepEqual(body, formatted) {
+		return fmt.Errorf(`JSON in body must be indented with 2 spaces and sort object entries by key`)
+	}
+
+	return nil
+}
+
 // assemble is the internal variant of Assemble, assumes headers are already checked for supported types
 func assemble(headers map[string]interface{}, body, content, signature []byte) (Assertion, error) {
 	length, err := checkIntWithDefault(headers, "body-length", 0)
@@ -1019,6 +1053,12 @@ func assemble(headers map[string]interface{}, body, content, signature []byte) (
 	assertType := Type(typ)
 	if assertType == nil {
 		return nil, fmt.Errorf("unknown assertion type: %q", typ)
+	}
+
+	if assertType.flags&jsonBody != 0 {
+		if err := checkJSON(assertType, body); err != nil {
+			return nil, err
+		}
 	}
 
 	if assertType.flags&noAuthority == 0 {
@@ -1081,6 +1121,7 @@ func assembleAndSign(assertType *AssertionType, headers map[string]interface{}, 
 	}
 
 	withAuthority := assertType.flags&noAuthority == 0
+	withJSONBody := assertType.flags&jsonBody != 0
 
 	err = checkHeaders(headers)
 	if err != nil {
@@ -1091,6 +1132,12 @@ func assembleAndSign(assertType *AssertionType, headers map[string]interface{}, 
 	// make sure we actually enforce that
 	if !utf8.Valid(body) {
 		return nil, fmt.Errorf("assertion body is not utf8")
+	}
+
+	if withJSONBody {
+		if err := checkJSON(assertType, body); err != nil {
+			return nil, err
+		}
 	}
 
 	finalHeaders := copyHeaders(headers)

@@ -210,7 +210,7 @@ func (s *partitionTestSuite) TestBuildPartitionList(c *C) {
 
 	// the expected expanded writable partition size is:
 	// start offset = (2M + 1200M), expanded size in sectors = (8388575*512 - start offset)/512
-	sfdiskInput, create, err := install.BuildPartitionList(dl, pv.Volume, nil)
+	sfdiskInput, create, err := install.BuildPartitionList(dl, pv.Volume, nil, nil)
 	c.Assert(err, IsNil)
 	c.Assert(sfdiskInput.String(), Equals,
 		`/dev/node3 : start=     2461696, size=      262144, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4, name="Save"
@@ -250,7 +250,7 @@ func (s *partitionTestSuite) TestBuildPartitionListPartsNotInGadget(c *C) {
 	// offset = (2M + 1200M), expanded size in sectors =
 	// (8388575*512 - start offset)/512
 	sfdiskInput, create, err := install.BuildPartitionList(dl, pv.Volume,
-		&install.CreateOptions{})
+		&install.CreateOptions{}, nil)
 	c.Assert(err, IsNil)
 	c.Assert(sfdiskInput.String(), Equals,
 		`/dev/node3 : start=     2461696, size=      262144, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4, name="Save"
@@ -291,8 +291,49 @@ func (s *partitionTestSuite) TestBuildPartitionListOnlyCreatablePartitions(c *C)
 	dl, err := gadget.OnDiskVolumeFromDevice("/dev/node")
 	c.Assert(err, IsNil)
 
-	_, _, err = install.BuildPartitionList(dl, pv.Volume, nil)
-	c.Assert(err, ErrorMatches, `cannot create partition #1 \(\"BIOS Boot\"\)`)
+	_, _, err = install.BuildPartitionList(dl, pv.Volume, nil, nil)
+	c.Assert(err, ErrorMatches, `gadget and boot device /dev/node partition table not compatible: cannot find gadget structure "BIOS Boot" on disk`)
+}
+
+func (s *partitionTestSuite) TestBuildPartitionListExistingPartsInSizeRange(c *C) {
+	m := map[string]*disks.MockDiskMapping{
+		"/dev/node": makeMockDiskMappingIncludingPartitions(scriptPartitionsBiosSeed),
+	}
+
+	restore := disks.MockDeviceNameToDiskMapping(m)
+	defer restore()
+
+	// The gadget has size rage of [1000, 1400]MiB for the seed partition,
+	// and the actual size on disk is 1200MiB. The partition on disk should
+	// match the one in the gadget and we will created save and data
+	// partitions right after it.
+	err := gadgettest.MakeMockGadget(s.gadgetRoot, gptGadgetContentWithRangeForSeed)
+	c.Assert(err, IsNil)
+	pv, err := gadgettest.MustLayOutSingleVolumeFromGadget(s.gadgetRoot, "", uc20Mod)
+	c.Assert(err, IsNil)
+
+	dl, err := gadget.OnDiskVolumeFromDevice("/dev/node")
+	c.Assert(err, IsNil)
+
+	// the expected expanded writable partition size is:
+	// start offset = (2M + 1200M), expanded size in sectors = (8388575*512 - start offset)/512
+	sfdiskInput, create, err := install.BuildPartitionList(dl, pv.Volume, nil, nil)
+	c.Assert(err, IsNil)
+	c.Assert(sfdiskInput.String(), Equals,
+		`/dev/node3 : start=     2461696, size=      262144, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4, name="Save"
+/dev/node4 : start=     2723840, size=     5664735, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4, name="Writable"
+`)
+	c.Check(create, NotNil)
+	c.Assert(create, DeepEquals, []*gadget.OnDiskAndGadgetStructurePair{
+		{
+			DiskStructure:   createOnDiskStructureSave(pv.Volume),
+			GadgetStructure: &pv.Volume.Structure[3],
+		},
+		{
+			DiskStructure:   createOnDiskStructureWritableAfterSave(pv.Volume),
+			GadgetStructure: &pv.Volume.Structure[4],
+		},
+	})
 }
 
 func (s *partitionTestSuite) TestCreatePartitions(c *C) {
@@ -328,7 +369,7 @@ func (s *partitionTestSuite) TestCreatePartitions(c *C) {
 	opts := &install.CreateOptions{
 		GadgetRootDir: s.gadgetRoot,
 	}
-	created, err := install.TestCreateMissingPartitions(dl, pv.Volume, opts)
+	created, err := install.TestCreateMissingPartitions(dl, pv.Volume, opts, nil)
 	c.Assert(err, IsNil)
 	c.Assert(created, DeepEquals, []*gadget.OnDiskAndGadgetStructurePair{
 		{
@@ -389,7 +430,7 @@ func (s *partitionTestSuite) TestCreatePartitionsNonRolePartitions(c *C) {
 		GadgetRootDir:              s.gadgetRoot,
 		CreateAllMissingPartitions: true,
 	}
-	created, err := install.TestCreateMissingPartitions(dl, pv.Volume, opts)
+	created, err := install.TestCreateMissingPartitions(dl, pv.Volume, opts, nil)
 	c.Assert(err, IsNil)
 	c.Assert(created, HasLen, 3)
 	c.Assert(calls, Equals, 1)
@@ -412,8 +453,9 @@ func (s *partitionTestSuite) TestRemovePartitionsTrivial(c *C) {
 	dl, err := gadget.OnDiskVolumeFromDevice("/dev/node")
 	c.Assert(err, IsNil)
 
-	err = install.RemoveCreatedPartitions(s.gadgetRoot, gInfo.Volumes["pc"], dl)
+	deletedOffsetSize, err := install.RemoveCreatedPartitions(s.gadgetRoot, gInfo.Volumes["pc"], dl)
 	c.Assert(err, IsNil)
+	c.Assert(deletedOffsetSize, DeepEquals, map[int]install.StructOffsetSize{})
 }
 
 func (s *partitionTestSuite) TestRemovePartitions(c *C) {
@@ -489,8 +531,10 @@ func (s *partitionTestSuite) TestRemovePartitions(c *C) {
 	gInfo, err := gadget.ReadInfoAndValidate(s.gadgetRoot, uc20Mod, nil)
 	c.Assert(err, IsNil)
 
-	err = install.RemoveCreatedPartitions(s.gadgetRoot, gInfo.Volumes["pc"], dl)
+	deletedOffsetSize, err := install.RemoveCreatedPartitions(s.gadgetRoot, gInfo.Volumes["pc"], dl)
 	c.Assert(err, IsNil)
+	c.Assert(deletedOffsetSize, DeepEquals, map[int]install.StructOffsetSize{
+		3: {StartOffset: 1260388352, Size: 2457600 * 512}})
 
 	c.Assert(cmdSfdisk.Calls(), DeepEquals, [][]string{
 		{"sfdisk", "--no-reread", "--delete", "/dev/node", "3"},
@@ -589,8 +633,6 @@ func (s *partitionTestSuite) TestRemovePartitionsWithDeviceRescan(c *C) {
 	err = os.WriteFile(filepath.Join(devPath, "device", "rescan"), nil, 0755)
 	c.Assert(err, IsNil)
 
-	fmt.Println("wrote", devPath)
-
 	restore := disks.MockDeviceNameToDiskMapping(m)
 	defer restore()
 
@@ -613,8 +655,10 @@ func (s *partitionTestSuite) TestRemovePartitionsWithDeviceRescan(c *C) {
 	gInfo, err := gadget.ReadInfoAndValidate(s.gadgetRoot, uc20Mod, nil)
 	c.Assert(err, IsNil)
 
-	err = install.RemoveCreatedPartitions(s.gadgetRoot, gInfo.Volumes["pc"], dl)
+	deletedOffsetSize, err := install.RemoveCreatedPartitions(s.gadgetRoot, gInfo.Volumes["pc"], dl)
 	c.Assert(err, IsNil)
+	c.Assert(deletedOffsetSize, DeepEquals, map[int]install.StructOffsetSize{
+		3: {StartOffset: 1260388352, Size: 2457600 * 512}})
 
 	c.Assert(cmdSfdisk.Calls(), DeepEquals, [][]string{
 		{"sfdisk", "--no-reread", "--delete", "/dev/node", "3"},
@@ -754,8 +798,10 @@ func (s *partitionTestSuite) TestRemovePartitionsNonAdjacent(c *C) {
 	gInfo, err := gadget.ReadInfoAndValidate(s.gadgetRoot, uc20Mod, nil)
 	c.Assert(err, IsNil)
 
-	err = install.RemoveCreatedPartitions(s.gadgetRoot, gInfo.Volumes["pc"], dl)
+	deletedOffsetSize, err := install.RemoveCreatedPartitions(s.gadgetRoot, gInfo.Volumes["pc"], dl)
 	c.Assert(err, IsNil)
+	c.Assert(deletedOffsetSize, DeepEquals, map[int]install.StructOffsetSize{
+		2: {StartOffset: 1024*1024 + 1024*1024, Size: 2457600 * 512}})
 
 	c.Assert(cmdSfdisk.Calls(), DeepEquals, [][]string{
 		{"sfdisk", "--no-reread", "--delete", "/dev/node", "2"},
@@ -870,7 +916,7 @@ const gptGadgetContentWithSave = `volumes:
 const gptGadgetContentWithGap = `volumes:
   pc:
     bootloader: grub
-    partial: [ filesystem ]
+    partial: [ structure ]
     structure:
       - name: Recovery
         offset: 2M
@@ -931,6 +977,52 @@ const gptGadgetContentWithMinSize = `volumes:
         type: 83,0FC63DAF-8483-4772-8E79-3D69D8477DE4
         size: 1200M
 `
+
+const gptGadgetContentWithRangeForSeed = `volumes:
+  pc:
+    bootloader: grub
+    structure:
+      - name: mbr
+        type: mbr
+        size: 440
+        content:
+          - image: pc-boot.img
+      - name: BIOS Boot
+        type: DA,21686148-6449-6E6F-744E-656564454649
+        size: 1M
+        offset: 1M
+      - name: Recovery
+        role: system-seed
+        filesystem: vfat
+        type: EF,C12A7328-F81F-11D2-BA4B-00A0C93EC93B
+        min-size: 1000M
+        size: 1400M
+        content:
+          - source: grubx64.efi
+            target: EFI/boot/grubx64.efi
+      - name: Save
+        role: system-save
+        filesystem: ext4
+        type: 83,0FC63DAF-8483-4772-8E79-3D69D8477DE4
+        size: 128M
+      - name: Writable
+        role: system-data
+        filesystem: ext4
+        type: 83,0FC63DAF-8483-4772-8E79-3D69D8477DE4
+        size: 1200M
+`
+
+// createdDuringInstall returns a list of partitions created during the
+// install process.
+func createdDuringInstall(gv *gadget.Volume, layout *gadget.OnDiskVolume) (created []string) {
+	created = make([]string, 0, len(layout.Structure))
+	for _, s := range layout.Structure {
+		if install.IndexIfCreatedDuringInstall(gv, s) >= 0 {
+			created = append(created, s.Node)
+		}
+	}
+	return created
+}
 
 func (s *partitionTestSuite) TestCreatedDuringInstallGPT(c *C) {
 	m := map[string]*disks.MockDiskMapping{
@@ -1011,7 +1103,7 @@ func (s *partitionTestSuite) TestCreatedDuringInstallGPT(c *C) {
 	dl, err := gadget.OnDiskVolumeFromDevice("node")
 	c.Assert(err, IsNil)
 
-	list := install.CreatedDuringInstall(pv.Volume, dl)
+	list := createdDuringInstall(pv.Volume, dl)
 	// only save and writable should show up
 	c.Check(list, DeepEquals, []string{"/dev/node3", "/dev/node4"})
 
@@ -1025,7 +1117,7 @@ func (s *partitionTestSuite) TestCreatedDuringInstallGPT(c *C) {
 	dl, err = gadget.OnDiskVolumeFromDevice("node")
 	c.Assert(err, IsNil)
 
-	list = install.CreatedDuringInstall(pv.Volume, dl)
+	list = createdDuringInstall(pv.Volume, dl)
 	// only save and writable should show up
 	c.Check(list, DeepEquals, []string{"/dev/node3", "/dev/node4"})
 }
@@ -1147,6 +1239,6 @@ func (s *partitionTestSuite) TestCreatedDuringInstallMBR(c *C) {
 	pv, err := gadgettest.MustLayOutSingleVolumeFromGadget(s.gadgetRoot, "", uc20Mod)
 	c.Assert(err, IsNil)
 
-	list := install.CreatedDuringInstall(pv.Volume, dl)
+	list := createdDuringInstall(pv.Volume, dl)
 	c.Assert(list, DeepEquals, []string{"/dev/node2", "/dev/node3", "/dev/node4"})
 }

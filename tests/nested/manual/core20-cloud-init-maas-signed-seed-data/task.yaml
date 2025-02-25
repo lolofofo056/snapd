@@ -1,6 +1,11 @@
 summary: Test that UC2* can use cloud-init config on ubuntu-seed with grade signed.
 
-systems: [ubuntu-20.04-64, ubuntu-22.04-64]
+details: |
+  Verify that on Ubuntu Core 20+ it is possible to configure cloud-init on
+  ubuntu-seed with grade signed. Check files have been copied depending on the variant
+  and cloud-init is disabled after it is executed.
+
+systems: [ubuntu-2*]
 
 environment:
   # three variants
@@ -47,10 +52,6 @@ prepare: |
       echo "This test needs test keys to be trusted"
       exit
   fi
-
-  snap install remarshal jq
-  tests.cleanup defer snap remove remarshal
-  tests.cleanup defer snap remove jq
 
   #shellcheck source=tests/lib/nested.sh
   . "$TESTSLIB/nested.sh"
@@ -275,9 +276,9 @@ execute: |
     remote.exec "cat /etc/cloud/cloud.cfg.d/99_snapd_datasource.cfg" > datasource_restrict.cfg
     # check that it has only MAAS
     #shellcheck disable=SC2002
-    cat datasource_restrict.cfg | yaml2json | jq -r '."datasource_list" | .[]' | MATCH MAAS
+    cat datasource_restrict.cfg | gojq --yaml-input -r '."datasource_list" | .[]' | MATCH MAAS
     #shellcheck disable=SC2002
-    test "$(cat datasource_restrict.cfg | yaml2json | jq -r '."datasource_list" | .[]' | wc -l)" = 1
+    test "$(cat datasource_restrict.cfg | gojq --yaml-input -r '."datasource_list" | .[]' | wc -l)" = 1
   fi
 
   # note that zzzz_snapd.cfg is not installed because cloud-init is in error and

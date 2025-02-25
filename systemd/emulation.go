@@ -124,7 +124,7 @@ func (s *emulation) LogReader(services []string, n int, follow, namespaces bool)
 	return nil, fmt.Errorf("LogReader")
 }
 
-func (s *emulation) EnsureMountUnitFile(description, what, where, fstype string) (string, error) {
+func (s *emulation) EnsureMountUnitFile(description, what, where, fstype string, flags EnsureMountUnitFlags) (string, error) {
 	// We don't build the options in exactly the same way as in the systemd
 	// type because these options will be written in a unit that is used in
 	// a host different to where this is running (the one used while
@@ -132,12 +132,13 @@ func (s *emulation) EnsureMountUnitFile(description, what, where, fstype string)
 	// target is not a container.
 	mountUnitOptions := append(fsMountOptions(fstype), squashfs.StandardOptions()...)
 	return s.EnsureMountUnitFileWithOptions(&MountUnitOptions{
-		Lifetime:    Persistent,
-		Description: description,
-		What:        what,
-		Where:       where,
-		Fstype:      fstype,
-		Options:     mountUnitOptions,
+		Lifetime:                 Persistent,
+		Description:              description,
+		What:                     what,
+		Where:                    where,
+		Fstype:                   fstype,
+		Options:                  mountUnitOptions,
+		PreventRestartIfModified: flags.PreventRestartIfModified,
 	})
 }
 
@@ -149,12 +150,12 @@ func (s *emulation) EnsureMountUnitFileWithOptions(unitOptions *MountUnitOptions
 	// Pass directly options, note that passed options need to be correct
 	// for the final target that will use the preseeding tarball. See also
 	// comment in EnsureMountUnitFile.
-	mountUnitName, modified, err := ensureMountUnitFile(unitOptions)
+	mountUnitName, modified, err := EnsureMountUnitFileContent(unitOptions)
 	if err != nil {
 		return "", err
 	}
 
-	if modified == mountUnchanged {
+	if modified == MountUnchanged {
 		return mountUnitName, nil
 	}
 
@@ -168,8 +169,8 @@ func (s *emulation) EnsureMountUnitFileWithOptions(unitOptions *MountUnitOptions
 	// systemd.EnsureMountUnitFile. For instance, when preseeding in a lxd
 	// container, the snap will be mounted with fuse, but mount unit will
 	// use squashfs.
-	hostFsType, actualOptions := hostFsTypeAndMountOptions(unitOptions.Fstype)
-	if modified == mountUpdated {
+	hostFsType, actualOptions := HostFsTypeAndMountOptions(unitOptions.Fstype)
+	if modified == MountUpdated {
 		actualOptions = append(actualOptions, "remount")
 	}
 	cmd := exec.Command("mount", "-t", hostFsType, unitOptions.What, unitOptions.Where, "-o", strings.Join(actualOptions, ","))
@@ -236,4 +237,8 @@ func (s *emulation) Umount(whatOrWhere string) error {
 
 func (s *emulation) Run(command []string, opts *RunOptions) ([]byte, error) {
 	return nil, &notImplementedError{"Run"}
+}
+
+func (s *emulation) SetLogLevel(logLevel string) error {
+	return &notImplementedError{"SetLogLevel"}
 }

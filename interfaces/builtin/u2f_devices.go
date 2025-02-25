@@ -75,7 +75,7 @@ var u2fDevices = []u2fDevice{
 	{
 		Name:             "JaCarta U2F",
 		VendorIDPattern:  "24dc",
-		ProductIDPattern: "0101",
+		ProductIDPattern: "0101|0501",
 	},
 	{
 		Name:             "U2F Zero",
@@ -111,6 +111,11 @@ var u2fDevices = []u2fDevice{
 		Name:             "Nitrokey 3",
 		VendorIDPattern:  "20a0",
 		ProductIDPattern: "42b2",
+	},
+	{
+		Name:             "Nitrokey Passkey",
+		VendorIDPattern:  "20a0",
+		ProductIDPattern: "42f3",
 	},
 	{
 		Name:             "Google Titan U2F",
@@ -168,9 +173,9 @@ var u2fDevices = []u2fDevice{
 		ProductIDPattern: "0e90",
 	},
 	{
-		Name:             "Token2 FIDO2 key",
+		Name:             "Token2 FIDO2 Security Keys",
 		VendorIDPattern:  "349e",
-		ProductIDPattern: "0010|0011|0012|0020|0021|0022|0200|0201|0202",
+		ProductIDPattern: "0010|0011|0012|0013|0014|0015|0016|0020|0021|0022|0023|0024|0025|0026|0200|0201|0202|0203|0204|0205|0206",
 	},
 	{
 		Name:             "Swissbit iShield Key",
@@ -186,6 +191,21 @@ var u2fDevices = []u2fDevice{
 		Name:             "Kensington VeriMark Guard Fingerprint Key",
 		VendorIDPattern:  "047d",
 		ProductIDPattern: "8055",
+	},
+	{
+		Name:             "TrustKeys FIDO2 U2F",
+		VendorIDPattern:  "311f",
+		ProductIDPattern: "4a2a|a6e9",
+	},
+	{
+		Name:             "OneSpan DIGIPASS FX Series",
+		VendorIDPattern:  "1a44",
+		ProductIDPattern: "1501|1502|1503|1506|1507|1508|1509|150A",
+	},
+	{
+		Name:             "Arculus AuthentiKey",
+		VendorIDPattern:  "3752",
+		ProductIDPattern: "0001",
 	},
 }
 

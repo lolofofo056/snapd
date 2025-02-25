@@ -287,6 +287,10 @@ func initialConnectAttributes(st *state.State, plugSnapInfo *snap.Info, plugSnap
 		return nil, nil, err
 	}
 
+	if err := addImplicitInterfaces(st, plugSnapInfo); err != nil {
+		return nil, nil, err
+	}
+
 	plug, ok := plugSnapInfo.Plugs[plugName]
 	if !ok {
 		return nil, nil, fmt.Errorf("snap %q has no plug named %q", plugSnap, plugName)
@@ -298,7 +302,7 @@ func initialConnectAttributes(st *state.State, plugSnapInfo *snap.Info, plugSnap
 		return nil, nil, err
 	}
 
-	if err := addImplicitSlots(st, slotSnapInfo); err != nil {
+	if err := addImplicitInterfaces(st, slotSnapInfo); err != nil {
 		return nil, nil, err
 	}
 
@@ -475,7 +479,7 @@ func disconnectTasks(st *state.State, conn *interfaces.Connection, flags disconn
 // CheckInterfaces checks whether plugs and slots of snap are allowed for installation.
 func CheckInterfaces(st *state.State, snapInfo *snap.Info, deviceCtx snapstate.DeviceContext) error {
 	// XXX: addImplicitSlots is really a brittle interface
-	if err := addImplicitSlots(st, snapInfo); err != nil {
+	if err := addImplicitInterfaces(st, snapInfo); err != nil {
 		return err
 	}
 
@@ -570,9 +574,57 @@ func OnSnapLinkageChanged(st *state.State, snapsup *snapstate.SnapSetup) error {
 		// track the revision that was just unlinked that has
 		// still profiles
 		snapst.PendingSecurity = &snapstate.PendingSecurityState{
-			SideInfo: snapst.CurrentSideInfo(),
+			SideInfo:   snapst.CurrentSideInfo(),
+			Components: snapst.CurrentComponentSideInfos(),
 		}
 	}
 	snapstate.Set(st, instanceName, &snapst)
 	return nil
+}
+
+// InterfacesRequestsControlHandlerServices returns the list of all apps which
+// are defined as "handler-service" for a snap which has a connected plug for
+// the "snap-interfaces-requests-control" interface.
+//
+// The caller must ensure that the given state is locked.
+func InterfacesRequestsControlHandlerServices(st *state.State) ([]*snap.AppInfo, error) {
+	conns, err := ConnectionStates(st)
+	if err != nil {
+		return nil, fmt.Errorf("internal error: cannot get connections: %w", err)
+	}
+
+	var handlers []*snap.AppInfo
+
+	for connId, connState := range conns {
+		if connState.Interface != "snap-interfaces-requests-control" || !connState.Active() {
+			continue
+		}
+
+		connRef, err := interfaces.ParseConnRef(connId)
+		if err != nil {
+			return nil, err
+		}
+
+		handler, ok := connState.StaticPlugAttrs["handler-service"].(string)
+		if !ok {
+			// does not have a handler service
+			continue
+		}
+
+		sn := connRef.PlugRef.Snap
+		si, err := snapstate.CurrentInfo(st, sn)
+		if err != nil {
+			return nil, err
+		}
+
+		// this should not fail as the plug's BeforePrepare should have validated that such an app exists
+		app := si.Apps[handler]
+		if app == nil {
+			return nil, fmt.Errorf("internal error: cannot find app %q in snap %q", app, sn)
+		}
+
+		handlers = append(handlers, app)
+	}
+
+	return handlers, nil
 }

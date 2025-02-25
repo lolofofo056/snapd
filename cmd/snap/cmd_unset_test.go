@@ -49,21 +49,21 @@ func (s *snapSetSuite) TestSnapUnset(c *check.C) {
 	c.Check(s.setConfApiCalls, check.Equals, 1)
 }
 
-func (s *aspectsSuite) TestAspectUnset(c *check.C) {
-	restore := s.mockAspectsFlag(c)
+func (s *confdbSuite) TestConfdbUnset(c *check.C) {
+	restore := s.mockConfdbFlag(c)
 	defer restore()
 
-	s.mockAspectServer(c, `{"abc":null}`, false)
+	s.mockConfdbServer(c, `{"abc":null}`, false)
 
 	_, err := snapunset.Parser(snapunset.Client()).ParseArgs([]string{"unset", "foo/bar/baz", "abc"})
 	c.Assert(err, check.IsNil)
 }
 
-func (s *aspectsSuite) TestAspectUnsetNoWait(c *check.C) {
-	restore := s.mockAspectsFlag(c)
+func (s *confdbSuite) TestConfdbUnsetNoWait(c *check.C) {
+	restore := s.mockConfdbFlag(c)
 	defer restore()
 
-	s.mockAspectServer(c, `{"abc":null}`, true)
+	s.mockConfdbServer(c, `{"abc":null}`, true)
 
 	rest, err := snapunset.Parser(snapunset.Client()).ParseArgs([]string{"unset", "--no-wait", "foo/bar/baz", "abc"})
 	c.Assert(err, check.IsNil)
@@ -73,7 +73,7 @@ func (s *aspectsSuite) TestAspectUnsetNoWait(c *check.C) {
 	c.Check(s.Stderr(), check.Equals, "")
 }
 
-func (s *aspectsSuite) TestAspectUnsetDisabledFlag(c *check.C) {
+func (s *confdbSuite) TestConfdbUnsetDisabledFlag(c *check.C) {
 	var reqs int
 	s.RedirectClientToTestServer(func(w http.ResponseWriter, r *http.Request) {
 		switch reqs {
@@ -88,14 +88,20 @@ func (s *aspectsSuite) TestAspectUnsetDisabledFlag(c *check.C) {
 	})
 
 	_, err := snapunset.Parser(snapunset.Client()).ParseArgs([]string{"unset", "foo/bar/baz", "abc"})
-	c.Assert(err, check.ErrorMatches, "aspect-based configuration is disabled: you must set 'experimental.aspects-configuration' to true")
+	c.Assert(err, check.ErrorMatches, `the "confdbs" feature is disabled: set 'experimental.confdbs' to true`)
 }
 
-func (s *aspectsSuite) TestAspectUnsetInvalidAspectID(c *check.C) {
-	restore := s.mockAspectsFlag(c)
+func (s *confdbSuite) TestConfdbUnsetInvalidConfdbID(c *check.C) {
+	restore := s.mockConfdbFlag(c)
 	defer restore()
 
 	_, err := snapunset.Parser(snapunset.Client()).ParseArgs([]string{"unset", "foo//bar", "abc"})
 	c.Assert(err, check.NotNil)
-	c.Check(err.Error(), check.Equals, "aspect identifier must conform to format: <account-id>/<bundle>/<aspect>")
+	c.Check(err.Error(), check.Equals, "confdb identifier must conform to format: <account-id>/<confdb>/<view>")
+}
+
+func (s *confdbSuite) TestUnsetEmptyKey(c *check.C) {
+	_, err := snapunset.Parser(snapunset.Client()).ParseArgs([]string{"unset", "some-snap", ""})
+	c.Assert(err, check.NotNil)
+	c.Check(err, check.ErrorMatches, "configuration keys cannot be empty")
 }

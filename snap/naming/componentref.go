@@ -21,6 +21,7 @@ package naming
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -33,6 +34,16 @@ type ComponentRef struct {
 // NewComponentRef returns a reference to a snap component.
 func NewComponentRef(snapName, componentName string) ComponentRef {
 	return ComponentRef{SnapName: snapName, ComponentName: componentName}
+}
+
+// SplitFullComponentName splits <snap>+<comp> in <snap> and <comp> strings.
+func SplitFullComponentName(fullComp string) (string, string, error) {
+	names := strings.Split(fullComp, "+")
+	if len(names) != 2 {
+		return "", "", fmt.Errorf("incorrect component name %q", fullComp)
+	}
+
+	return names[0], names[1], nil
 }
 
 func (cr ComponentRef) String() string {
@@ -56,12 +67,29 @@ func (cid *ComponentRef) UnmarshalYAML(unmarshall func(interface{}) error) error
 		return err
 	}
 
-	names := strings.Split(idStr, "+")
-	if len(names) != 2 {
-		return fmt.Errorf("incorrect component name %q", idStr)
+	snap, comp, err := SplitFullComponentName(idStr)
+	if err != nil {
+		return err
 	}
 
-	*cid = ComponentRef{SnapName: names[0], ComponentName: names[1]}
+	*cid = ComponentRef{SnapName: snap, ComponentName: comp}
 
 	return nil
+}
+
+// snapPackComponentFilename is a regular expression that matches what snap pack
+// creates when building a component. For example, "foo+bar_1.0.0.comp" matches
+// this expression.
+var snapPackComponentFilename = regexp.MustCompile(fmt.Sprintf(`^(%[1]s)\+(%[1]s)(?:_.*)?\.comp$`, almostValidNameRegexString))
+
+// ComponentRefFromSnapPackFilename parses a filename created when creating a
+// component with "snap pack". These are generally in one of two forms:
+//   - <snap>+<comp>.comp
+//   - <snap>+<comp>_<version>.comp
+func ComponentRefFromSnapPackFilename(filename string) (ComponentRef, error) {
+	matches := snapPackComponentFilename.FindStringSubmatch(filename)
+	if len(matches) != 3 {
+		return ComponentRef{}, fmt.Errorf("cannot parse snap pack component filename: %q", filename)
+	}
+	return NewComponentRef(matches[1], matches[2]), nil
 }

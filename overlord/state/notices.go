@@ -26,6 +26,8 @@ import (
 const (
 	// defaultNoticeExpireAfter is the default expiry time for notices.
 	defaultNoticeExpireAfter = 7 * 24 * time.Hour
+	// maxNoticeKeyLength is the max size in bytes for a notice key.
+	maxNoticeKeyLength = 256
 )
 
 // Notice represents an aggregated notice. The combination of type and key is unique.
@@ -199,11 +201,24 @@ const (
 
 	// Recorded whenever an auto-refresh is inhibited for one or more snaps.
 	RefreshInhibitNotice NoticeType = "refresh-inhibit"
+
+	// Recorded by "snap run" command when it is inhibited from running a
+	// a snap due an ongoing refresh.
+	SnapRunInhibitNotice NoticeType = "snap-run-inhibit"
+
+	// Recorded whenever a request prompt is created or resolved. The key for
+	// interfaces-requests-prompt notices is the request prompt ID.
+	InterfacesRequestsPromptNotice NoticeType = "interfaces-requests-prompt"
+
+	// Recorded whenever a request rule is created, modified, deleted, or
+	// expired. The key for interfaces-requests-rule-update notices is the
+	// rule ID.
+	InterfacesRequestsRuleUpdateNotice NoticeType = "interfaces-requests-rule-update"
 )
 
 func (t NoticeType) Valid() bool {
 	switch t {
-	case ChangeUpdateNotice, WarningNotice, RefreshInhibitNotice:
+	case ChangeUpdateNotice, WarningNotice, RefreshInhibitNotice, SnapRunInhibitNotice, InterfacesRequestsPromptNotice, InterfacesRequestsRuleUpdateNotice:
 		return true
 	}
 	return false
@@ -228,16 +243,33 @@ func (s *State) AddNotice(userID *uint32, noticeType NoticeType, key string, opt
 	if options == nil {
 		options = &AddNoticeOptions{}
 	}
-	err := validateNotice(noticeType, key, options)
+	err := ValidateNotice(noticeType, key, options)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("internal error: %w", err)
 	}
 
 	s.writing()
 
 	now := options.Time
 	if now.IsZero() {
-		now = time.Now()
+		now = timeNow()
+		/**
+		 * Ensure that two notices never have the same sent time.
+		 *
+		 * Since the Notices API receives an "after:" parameter with the
+		 * date and time of the last received notice to filter all the
+		 * previous notices and avoid duplicates, if two or more notices
+		 * have the same date and time, only the first will be emitted,
+		 * and the others will be silently discarded. This can happen in
+		 * systems that don't guarantee a granularity of one nanosecond
+		 * in their timers, which can happen in some not-so-old devices,
+		 * where the HPET is used instead of internal high resolution
+		 * timers, or in other architectures different from the X86_64.
+		 */
+		if !now.After(s.lastNoticeTimestamp) {
+			now = s.lastNoticeTimestamp.Add(time.Nanosecond)
+		}
+		s.lastNoticeTimestamp = now
 	}
 	now = now.UTC()
 	newOrRepeated := false
@@ -279,15 +311,19 @@ func (s *State) AddNotice(userID *uint32, noticeType NoticeType, key string, opt
 	return notice.id, nil
 }
 
-func validateNotice(noticeType NoticeType, key string, options *AddNoticeOptions) error {
+// ValidateNotice validates notice type and key before adding.
+func ValidateNotice(noticeType NoticeType, key string, options *AddNoticeOptions) error {
 	if !noticeType.Valid() {
-		return fmt.Errorf("internal error: attempted to add notice with invalid type %q", noticeType)
+		return fmt.Errorf("cannot add notice with invalid type %q", noticeType)
 	}
 	if key == "" {
-		return fmt.Errorf("internal error: attempted to add %s notice with invalid key %q", noticeType, key)
+		return fmt.Errorf("cannot add %s notice with invalid key %q", noticeType, key)
+	}
+	if len(key) > maxNoticeKeyLength {
+		return fmt.Errorf("cannot add %s notice with invalid key: key must be %d bytes or less", noticeType, maxNoticeKeyLength)
 	}
 	if noticeType == RefreshInhibitNotice && key != "-" {
-		return fmt.Errorf(`internal error: attempted to add %s notice with invalid key %q, only "-" key is supported`, noticeType, key)
+		return fmt.Errorf(`cannot add %s notice with invalid key %q: only "-" key is supported`, noticeType, key)
 	}
 	return nil
 }

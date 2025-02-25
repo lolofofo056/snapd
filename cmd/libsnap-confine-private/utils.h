@@ -17,15 +17,23 @@
 #ifndef CORE_LAUNCHER_UTILS_H
 #define CORE_LAUNCHER_UTILS_H
 
-#include <stdlib.h>
 #include <stdbool.h>
+#include <stdlib.h>
 
-__attribute__((noreturn))
-    __attribute__((format(printf, 1, 2)))
-void die(const char *fmt, ...);
+/**
+ * Macro which calculates array size.
+ *
+ * Based on ARRAY_SIZE from the Linux kernel, see
+ * https://elixir.bootlin.com/linux/v6.13.3/source/include/linux/array_size.h#L11
+ */
+#define SC_ARRAY_SIZE(arr)                                                                                  \
+    (sizeof(arr) / sizeof((arr)[0]) + ((int)sizeof(struct {                                                 \
+         _Static_assert(!__builtin_types_compatible_p(typeof(arr), typeof(&(arr)[0])), "must be an array"); \
+     })))
 
-__attribute__((format(printf, 1, 2)))
-void debug(const char *fmt, ...);
+__attribute__((noreturn)) __attribute__((format(printf, 1, 2))) void die(const char *fmt, ...);
+
+__attribute__((format(printf, 1, 2))) void debug(const char *fmt, ...);
 
 /**
  * Get an environment variable and convert it to a boolean.
@@ -50,16 +58,21 @@ bool sc_is_debug_enabled(void);
 bool sc_is_reexec_enabled(void);
 
 /**
+ * Return true if executing inside a container.
+ **/
+bool sc_is_in_container(void);
+
+/**
  * sc_identity describes the user performing certain operation.
  *
  * UID and GID represent user and group accounts numbers and are controlled by
  * change_uid and change_gid flags.
-**/
+ **/
 typedef struct sc_identity {
-	uid_t uid;
-	gid_t gid;
-	unsigned change_uid:1;
-	unsigned change_gid:1;
+    uid_t uid;
+    gid_t gid;
+    bool change_uid : 1;
+    bool change_gid : 1;
 } sc_identity;
 
 /**
@@ -69,16 +82,30 @@ typedef struct sc_identity {
  * causes the effective group to change to the root group. No change is made to
  * effective user identity.
  **/
-static inline sc_identity sc_root_group_identity(void)
-{
-	sc_identity id = {
-		/* Explicitly set our intent of changing just the GID.
-		 * Refactoring of this code must retain this property. */
-		.change_uid = 0,
-		.change_gid = 1,
-		.gid = 0,
-	};
-	return id;
+static inline sc_identity sc_root_group_identity(void) {
+    sc_identity id = {
+        /* Explicitly set our intent of changing just the GID.
+         * Refactoring of this code must retain this property. */
+        .change_uid = false,
+        .change_gid = true,
+        .gid = 0,
+    };
+    return id;
+}
+
+/**
+ * Produce value indicating no change in current identity.
+ *
+ * Produce a value of sc_identity which indicates no change in the identity of
+ * the current process.
+ **/
+static inline sc_identity sc_no_change_identity(void) {
+    sc_identity id = {
+        /* Explicit no change in either uid or gid. */
+        .change_uid = false,
+        .change_gid = false,
+    };
+    return id;
 }
 
 /**
@@ -90,7 +117,7 @@ static inline sc_identity sc_root_group_identity(void)
  *
  * The fields change_uid and change_gid control if user and group ID is changed.
  * The returned old identity has identical values of both use flags.
-**/
+ **/
 sc_identity sc_set_effective_identity(sc_identity identity);
 
 void write_string_to_file(const char *filepath, const char *buf);
@@ -109,14 +136,12 @@ void write_string_to_file(const char *filepath, const char *buf);
  *
  * The function returns -1 in case of any error.
  **/
-__attribute__((warn_unused_result))
-int sc_nonfatal_mkpath(const char *const path, mode_t mode);
+__attribute__((warn_unused_result)) int sc_nonfatal_mkpath(const char *const path, mode_t mode);
 
 /**
  * Return true if path is a valid path for the snap-confine binary
  **/
-__attribute__((warn_unused_result))
-bool sc_is_expected_path(const char *path);
+__attribute__((warn_unused_result)) bool sc_is_expected_path(const char *path);
 
 /**
  * Wait for file to appear for timeout_sec seconds. Returns true once the file

@@ -27,6 +27,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/snapcore/snapd/asserts"
@@ -37,6 +38,8 @@ import (
 	"github.com/snapcore/snapd/snap"
 )
 
+// TODO: rename this type to something more general, since it is used for more
+// than just refreshes
 type RefreshOptions struct {
 	// RefreshManaged indicates to the store that the refresh is
 	// managed via snapd-control.
@@ -44,6 +47,10 @@ type RefreshOptions struct {
 	Scheduled      bool
 
 	PrivacyKey string
+
+	// IncludeResources indicates to the store that resources should be included
+	// in the response.
+	IncludeResources bool
 }
 
 // snap action: install/refresh
@@ -63,6 +70,9 @@ type CurrentSnap struct {
 	// HeldBy is an optional array of snaps with holds on the current snap's
 	// refreshes. The "system" snap represents a hold placed by the user.
 	HeldBy []string
+	// Resources is a map of resource names to the resource revision that is
+	// currently installed for the snap.
+	Resources map[string]snap.Revision
 }
 
 type AssertionQuery interface {
@@ -105,6 +115,11 @@ type SnapAction struct {
 	CohortKey    string
 	Flags        SnapActionFlags
 	Epoch        snap.Epoch
+	// ResourceInstall is a flag that indicates that this action is being used
+	// to fetch the list of resources that are available for a snap. This flag
+	// impacts how we decide to report an error if the snap has no updates
+	// available.
+	ResourceInstall bool
 	// ValidationSets is an optional array of validation set primary keys
 	// (relevant for install and refresh actions).
 	ValidationSets []snapasserts.ValidationSetKey
@@ -208,12 +223,12 @@ type snapActionResultList struct {
 	ErrorList []errorListEntry    `json:"error-list"`
 }
 
-var snapActionFields = jsonutil.StructFields((*storeSnap)(nil))
+var snapActionFields = jsonutil.StructFields((*storeSnap)(nil), "resources")
 
 // SnapAction queries the store for snap information for the given
 // install/refresh actions, given the context information about
 // current installed snaps in currentSnaps. If the request was overall
-// successul (200) but there were reported errors it will return both
+// successful (200) but there were reported errors it will return both
 // the snap infos and an SnapActionError.
 // Orthogonally and at the same time it can be used to fetch or update
 // assertions by passing an AssertionQuery whose ToResolve specifies
@@ -300,7 +315,35 @@ func genInstanceKey(curSnap *CurrentSnap, salt string) (string, error) {
 // action of the SnapAction call.
 type SnapActionResult struct {
 	*snap.Info
+	Resources       []SnapResourceResult
 	RedirectChannel string
+}
+
+type SnapResourceResult struct {
+	DownloadInfo snap.DownloadInfo
+	Type         string
+	Name         string
+	Revision     int
+	Version      string
+	CreatedAt    string
+}
+
+func (sar *SnapActionResult) ResourceResult(resName string) *SnapResourceResult {
+	for _, res := range sar.Resources {
+		if res.Name == resName {
+			return &res
+		}
+	}
+	return nil
+}
+
+// ResourceToComponentType returns a validated component type from a resource type.
+func ResourceToComponentType(resType string) (snap.ComponentType, error) {
+	compTp := strings.TrimPrefix(resType, "component/")
+	if len(compTp) == len(resType) {
+		return "", fmt.Errorf("%s is not a component resource", resType)
+	}
+	return snap.ComponentTypeFromString(compTp)
 }
 
 // AssertionResult encapsulates the non-error result for one assertion
@@ -402,9 +445,6 @@ func (s *Store) snapAction(ctx context.Context, currentSnaps []*CurrentSnap, act
 			CohortKey:        a.CohortKey,
 			ValidationSets:   valsetKeyComponents,
 			IgnoreValidation: ignoreValidation,
-		}
-		if !a.Revision.Unset() {
-			a.Channel = ""
 		}
 
 		if a.Action == "install" {
@@ -527,11 +567,17 @@ func (s *Store) snapAction(ctx context.Context, currentSnaps []*CurrentSnap, act
 		}
 	}
 
+	fields := make([]string, len(snapActionFields))
+	copy(fields, snapActionFields)
+	if opts.IncludeResources {
+		fields = append(fields, "resources")
+	}
+
 	// build input for the install/refresh endpoint
 	jsonData, err := json.Marshal(snapActionRequest{
 		Context:             curSnapJSONs,
 		Actions:             actionJSONs,
-		Fields:              snapActionFields,
+		Fields:              fields,
 		AssertionMaxFormats: assertMaxFormats,
 	})
 	if err != nil {
@@ -655,7 +701,18 @@ func (s *Store) snapAction(ctx context.Context, currentSnaps []*CurrentSnap, act
 				return nil, nil, fmt.Errorf("unexpected invalid install/refresh API result: unexpected refresh")
 			}
 			rrev := snap.R(res.Snap.Revision)
-			if rrev == cur.Revision || findRev(rrev, cur.Block) {
+
+			// here we check a few things to decide if the snap truly has no
+			// updates.
+			// * if the action is defined as a resource install, then the
+			//   caller is just interested in the list of components so we
+			//   do not return an error
+			// * then, we check if the snap exactly matches the snap that is
+			//   currently installed. this considers the revision of the snap and
+			//   its resources that are currently installed. if that isn't true,
+			//   then we check if the snap's revision is in the list of blocked
+			//   revisions.
+			if !refreshes[res.InstanceKey].ResourceInstall && (currentSnapMatchesStoreSnap(cur, res.Snap) || findRev(rrev, cur.Block)) {
 				refreshErrors[cur.InstanceName] = ErrNoUpdateAvailable
 				continue
 			}
@@ -673,7 +730,23 @@ func (s *Store) snapAction(ctx context.Context, currentSnaps []*CurrentSnap, act
 		_, instanceKey := snap.SplitInstanceName(instanceName)
 		snapInfo.InstanceKey = instanceKey
 
-		sars = append(sars, SnapActionResult{Info: snapInfo, RedirectChannel: res.RedirectChannel})
+		resources := make([]SnapResourceResult, 0, len(res.Snap.Resources))
+		for _, r := range res.Snap.Resources {
+			resources = append(resources, SnapResourceResult{
+				DownloadInfo: downloadInfoFromStoreDownload(r.Download),
+				Type:         r.Type,
+				Name:         r.Name,
+				Version:      r.Version,
+				CreatedAt:    r.CreatedAt,
+				Revision:     r.Revision,
+			})
+		}
+
+		sars = append(sars, SnapActionResult{
+			Info:            snapInfo,
+			RedirectChannel: res.RedirectChannel,
+			Resources:       resources,
+		})
 	}
 
 	for _, errObj := range results.ErrorList {
@@ -701,6 +774,27 @@ func (s *Store) snapAction(ctx context.Context, currentSnaps []*CurrentSnap, act
 	}
 
 	return sars, ars, nil
+}
+
+func currentSnapMatchesStoreSnap(cur *CurrentSnap, storeSnap storeSnap) bool {
+	if cur.Revision.N != storeSnap.Revision {
+		return false
+	}
+
+	for _, res := range storeSnap.Resources {
+		curRes, ok := cur.Resources[res.Name]
+		if !ok {
+			continue
+		}
+
+		// TODO:COMPS: should local resources be considered when deciding if the
+		// snap has an update available?
+		if !curRes.Local() && curRes.N != res.Revision {
+			return false
+		}
+	}
+
+	return true
 }
 
 func findRev(needle snap.Revision, haystack []snap.Revision) bool {

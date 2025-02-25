@@ -21,7 +21,7 @@ package builtin
 
 import (
 	"fmt"
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -177,6 +177,12 @@ const udisks2ConnectedPlugAppArmor = `
 
 #include <abstractions/dbus-strict>
 
+dbus (send)
+    bus=system
+    path=/org/freedesktop/UDisks2
+    interface=org.freedesktop.DBus.Peer
+    member=Ping
+    peer=(label=###SLOT_SECURITY_TAGS###),
 dbus (receive, send)
     bus=system
     path=/org/freedesktop/UDisks2/**
@@ -421,7 +427,7 @@ func (iface *udisks2Interface) AppArmorConnectedPlug(spec *apparmor.Specificatio
 	if implicitSystemConnectedSlot(slot) {
 		new = "unconfined"
 	} else {
-		new = spec.SnapAppSet().SlotLabelExpression(slot)
+		new = slot.LabelExpression()
 	}
 	snippet := strings.Replace(udisks2ConnectedPlugAppArmor, old, new, -1)
 	spec.AddSnippet(snippet)
@@ -445,7 +451,7 @@ func (iface *udisks2Interface) UDevPermanentSlot(spec *udev.Specification, slot 
 			if err != nil {
 				return fmt.Errorf("cannot resolve udev-file: %v", err)
 			}
-			data, err := ioutil.ReadFile(filepath.Join(mountDir, resolvedPath))
+			data, err := os.ReadFile(filepath.Join(mountDir, resolvedPath))
 			if err != nil {
 				return fmt.Errorf("cannot open udev-file: %v", err)
 			}
@@ -463,7 +469,7 @@ func (iface *udisks2Interface) UDevPermanentSlot(spec *udev.Specification, slot 
 func (iface *udisks2Interface) AppArmorConnectedSlot(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
 	if !implicitSystemConnectedSlot(slot) {
 		old := "###PLUG_SECURITY_TAGS###"
-		new := spec.SnapAppSet().PlugLabelExpression(plug)
+		new := plug.LabelExpression()
 		snippet := strings.Replace(udisks2ConnectedSlotAppArmor, old, new, -1)
 		spec.AddSnippet(snippet)
 	}

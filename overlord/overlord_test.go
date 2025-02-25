@@ -24,7 +24,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -125,6 +124,7 @@ func (ovs *overlordSuite) TestNew(c *C) {
 	c.Check(o.DeviceManager(), NotNil)
 	c.Check(o.CommandManager(), NotNil)
 	c.Check(o.SnapshotManager(), NotNil)
+	c.Check(o.FDEManager(), NotNil)
 	c.Check(configstateInitCalled, Equals, true)
 
 	o.InterfaceManager().DisableUDevMonitor()
@@ -177,7 +177,8 @@ func (ovs *overlordSuite) TestNewWithGoodState(c *C) {
 		"last-change-id": 0,
 		"last-task-id": 0,
 		"last-lane-id": 0,
-		"last-notice-id": 0
+		"last-notice-id": 0,
+		"last-notice-timestamp":"0001-01-01T00:00:00Z"
 	}`, patch.Level, patch.Sublevel, snapdtool.Version))
 	err := os.WriteFile(dirs.SnapStateFile, fakeState, 0600)
 	c.Assert(err, IsNil)
@@ -1325,7 +1326,7 @@ func (ovs *overlordSuite) TestStartupTimeout(c *C) {
 }
 
 func (ovs *overlordSuite) TestLockWithTimeoutHappy(c *C) {
-	f, err := ioutil.TempFile("", "testlock-*")
+	f, err := os.CreateTemp("", "testlock-*")
 	defer func() {
 		f.Close()
 		os.Remove(f.Name())
@@ -1354,7 +1355,7 @@ func (ovs *overlordSuite) TestLockWithTimeoutFailed(c *C) {
 	})
 	defer restoreNotify()
 
-	f, err := ioutil.TempFile("", "testlock-*")
+	f, err := os.CreateTemp("", "testlock-*")
 	defer func() {
 		f.Close()
 		os.Remove(f.Name())

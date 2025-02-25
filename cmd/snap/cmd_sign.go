@@ -22,7 +22,8 @@ package main
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"os"
 
 	"github.com/jessevdk/go-flags"
 
@@ -77,9 +78,9 @@ func (x *cmdSign) Execute(args []string) error {
 		err       error
 	)
 	if !useStdin {
-		statement, err = ioutil.ReadFile(string(x.Positional.Filename))
+		statement, err = os.ReadFile(string(x.Positional.Filename))
 	} else {
-		statement, err = ioutil.ReadAll(Stdin)
+		statement, err = io.ReadAll(Stdin)
 	}
 	if err != nil {
 		return fmt.Errorf(i18n.G("cannot read assertion input: %v"), err)
@@ -138,7 +139,7 @@ func (x *cmdSign) Execute(args []string) error {
 		}
 	} else {
 		if accountKey == nil {
-			fmt.Fprintf(Stderr, i18n.G("WARNING: could not fetch account-key to cross-check signed assertion with key constraints.\n"))
+			fmt.Fprint(Stderr, i18n.G("WARNING: could not fetch account-key to cross-check signed assertion with key constraints.\n"))
 		}
 	}
 

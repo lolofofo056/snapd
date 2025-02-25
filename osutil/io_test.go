@@ -21,7 +21,7 @@ package osutil_test
 
 import (
 	"errors"
-	"io/ioutil"
+	"fmt"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -50,7 +50,7 @@ func (ts *AtomicWriteTestSuite) TestAtomicWriteFile(c *C) {
 	c.Check(p, testutil.FileEquals, "canary")
 
 	// no files left behind!
-	d, err := ioutil.ReadDir(tmpdir)
+	d, err := os.ReadDir(tmpdir)
 	c.Assert(err, IsNil)
 	c.Assert(len(d), Equals, 1)
 }
@@ -378,7 +378,7 @@ func (ts *AtomicSymlinkTestSuite) TestAtomicSymlink(c *C) {
 	checkLeftoverFiles(nestedBarSymlink, []string{nestedBarSymlink})
 }
 
-func (ts *AtomicSymlinkTestSuite) createCollisionSequence(c *C, baseName string, many int) {
+func createCollisionSequence(c *C, baseName string, many int) {
 	for i := 0; i < many; i++ {
 		expectedRandomness := randutil.RandomString(12) + "~"
 		// ensure we always get the same result
@@ -392,7 +392,7 @@ func (ts *AtomicSymlinkTestSuite) TestAtomicSymlinkCollisionError(c *C) {
 	// ensure we always get the same result
 	rand.Seed(1)
 	p := filepath.Join(tmpdir, "foo")
-	ts.createCollisionSequence(c, p, osutil.MaxSymlinkTries)
+	createCollisionSequence(c, p, osutil.MaxLinkTries)
 	// restart random number sequence
 	rand.Seed(1)
 
@@ -405,11 +405,107 @@ func (ts *AtomicSymlinkTestSuite) TestAtomicSymlinkCollisionHappy(c *C) {
 	// ensure we always get the same result
 	rand.Seed(1)
 	p := filepath.Join(tmpdir, "foo")
-	ts.createCollisionSequence(c, p, osutil.MaxSymlinkTries/2)
+	createCollisionSequence(c, p, osutil.MaxLinkTries/2)
 	// restart random number sequence
 	rand.Seed(1)
 
 	err := osutil.AtomicSymlink("target", p)
+	c.Assert(err, IsNil)
+}
+
+type AtomicLinkTestSuite struct{}
+
+var _ = Suite(&AtomicLinkTestSuite{})
+
+func (ts *AtomicLinkTestSuite) TestAtomicLink(c *C) {
+	mustReadLink := func(target, link string) {
+		match, err := osutil.ComparePathsByDeviceInode(target, link)
+		c.Assert(err, IsNil)
+		c.Check(match, Equals, true)
+	}
+
+	checkLeftoverFiles := func(link string, exp []string) {
+		res, err := filepath.Glob(link + "*")
+		c.Assert(err, IsNil)
+		if len(exp) != 0 {
+			c.Assert(res, DeepEquals, exp)
+		} else {
+			c.Assert(res, HasLen, 0)
+		}
+	}
+
+	d := c.MkDir()
+	target := filepath.Join(d, "target")
+	c.Assert(os.WriteFile(target, []byte("some data"), 0o644), IsNil)
+
+	barLink := filepath.Join(d, "bar")
+	err := osutil.AtomicLink(target, barLink)
+	c.Assert(err, IsNil)
+	mustReadLink(barLink, target)
+	checkLeftoverFiles(barLink, []string{barLink})
+
+	// no nested directory
+	nested := filepath.Join(d, "nested")
+	nestedBarLink := filepath.Join(nested, "bar")
+	err = osutil.AtomicLink(target, nestedBarLink)
+	c.Assert(err, ErrorMatches, fmt.Sprintf(`link %s /.*/nested/bar\..*~: no such file or directory`, target))
+	checkLeftoverFiles(nestedBarLink, nil)
+
+	if os.Geteuid() != 0 {
+		// create a dir without write permission
+		err = os.MkdirAll(nested, 0o644)
+		c.Assert(err, IsNil)
+
+		// no permission to write in dir
+		err = osutil.AtomicLink(target, nestedBarLink)
+		c.Assert(err, ErrorMatches, fmt.Sprintf(`link %s /.*/nested/bar\..*~: permission denied`, target))
+		checkLeftoverFiles(nestedBarLink, nil)
+
+		err = os.Chmod(nested, 0o755)
+		c.Assert(err, IsNil)
+	}
+
+	err = osutil.AtomicLink(target, nestedBarLink)
+	c.Assert(err, IsNil)
+	mustReadLink(nestedBarLink, target)
+	checkLeftoverFiles(nestedBarLink, []string{nestedBarLink})
+
+	// link gets replaced
+	newTarget := filepath.Join(d, "new-target")
+	c.Assert(os.WriteFile(newTarget, []byte(""), 0o644), IsNil)
+	err = osutil.AtomicLink(newTarget, nestedBarLink)
+	c.Assert(err, IsNil)
+	mustReadLink(nestedBarLink, newTarget)
+	checkLeftoverFiles(nestedBarLink, []string{nestedBarLink})
+}
+
+func (ts *AtomicLinkTestSuite) TestAtomicLinkCollisionError(c *C) {
+	tmpdir := c.MkDir()
+	// ensure we always get the same result
+	rand.Seed(1)
+	p := filepath.Join(tmpdir, "foo")
+	createCollisionSequence(c, p, osutil.MaxLinkTries)
+	// restart random number sequence
+	rand.Seed(1)
+
+	target := filepath.Join(tmpdir, "target")
+	c.Assert(os.WriteFile(target, []byte(""), 0o644), IsNil)
+	err := osutil.AtomicLink(target, p)
+	c.Assert(err, ErrorMatches, "cannot create a temporary link")
+}
+
+func (ts *AtomicLinkTestSuite) TestAtomicLinkCollisionHappy(c *C) {
+	tmpdir := c.MkDir()
+	// ensure we always get the same result
+	rand.Seed(1)
+	p := filepath.Join(tmpdir, "foo")
+	createCollisionSequence(c, p, osutil.MaxLinkTries/2)
+	// restart random number sequence
+	rand.Seed(1)
+
+	target := filepath.Join(tmpdir, "target")
+	c.Assert(os.WriteFile(target, []byte(""), 0o644), IsNil)
+	err := osutil.AtomicLink(target, p)
 	c.Assert(err, IsNil)
 }
 
@@ -509,12 +605,12 @@ func (ts *AtomicWriteTestSuite) TestAtomicRenameDir(c *C) {
 	err = osutil.AtomicRename(src+"/", dst+"/")
 	c.Assert(err, IsNil)
 
-	d, err := ioutil.ReadDir(dst)
+	d, err := os.ReadDir(dst)
 	c.Assert(err, IsNil)
 	c.Assert(len(d), Equals, 1)
 	c.Assert(d[0].Name(), Equals, "file")
 
-	data, err := ioutil.ReadFile(filepath.Join(dst, "file"))
+	data, err := os.ReadFile(filepath.Join(dst, "file"))
 	c.Assert(err, IsNil)
 	c.Assert(data, DeepEquals, contents)
 

@@ -20,13 +20,19 @@
 package ctlcmd
 
 import (
-	"fmt"
-	"os/user"
+	"context"
+	"errors"
 
 	"github.com/snapcore/snapd/asserts"
+	"github.com/snapcore/snapd/asserts/snapasserts"
+	"github.com/snapcore/snapd/client/clientutil"
+	"github.com/snapcore/snapd/confdb"
+	"github.com/snapcore/snapd/osutil/user"
+	"github.com/snapcore/snapd/overlord/confdbstate"
 	"github.com/snapcore/snapd/overlord/devicestate"
 	"github.com/snapcore/snapd/overlord/hookstate"
 	"github.com/snapcore/snapd/overlord/servicestate"
+	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/testutil"
@@ -68,6 +74,18 @@ func MockServicestateControlFunc(f func(*state.State, []*snap.AppInfo, *services
 	old := servicestateControl
 	servicestateControl = f
 	return func() { servicestateControl = old }
+}
+
+func MockSnapstateInstallComponentsFunc(f func(ctx context.Context, st *state.State, names []string, info *snap.Info, vsets *snapasserts.ValidationSets, opts snapstate.Options) ([]*state.TaskSet, error)) (restore func()) {
+	old := snapstateInstallComponents
+	snapstateInstallComponents = f
+	return func() { snapstateInstallComponents = old }
+}
+
+func MockSnapstateRemoveComponentsFunc(f func(st *state.State, snapName string, compName []string, opts snapstate.RemoveComponentsOpts) ([]*state.TaskSet, error)) (restore func()) {
+	old := snapstateRemoveComponents
+	snapstateRemoveComponents = f
+	return func() { snapstateRemoveComponents = old }
 }
 
 func MockDevicestateSystemModeInfoFromState(f func(*state.State) (*devicestate.SystemModeInfo, error)) (restore func()) {
@@ -127,15 +145,15 @@ func (c *MockCommand) Execute(args []string) error {
 	c.Args = args
 
 	if c.FakeStdout != "" {
-		c.printf(c.FakeStdout)
+		c.print(c.FakeStdout)
 	}
 
 	if c.FakeStderr != "" {
-		c.errorf(c.FakeStderr)
+		c.error(c.FakeStderr)
 	}
 
 	if c.ExecuteError {
-		return fmt.Errorf("failed at user request")
+		return errors.New("failed at user request")
 	}
 
 	return nil
@@ -154,5 +172,43 @@ func MockAutoRefreshForGatingSnap(f func(st *state.State, gatingSnap string) err
 	autoRefreshForGatingSnap = f
 	return func() {
 		autoRefreshForGatingSnap = old
+	}
+}
+
+func MockNewStatusDecorator(f func(ctx context.Context, isGlobal bool, uid string) clientutil.StatusDecorator) (restore func()) {
+	restore = testutil.Backup(&newStatusDecorator)
+	newStatusDecorator = f
+	return restore
+}
+
+func MockConfdbstateGetTransaction(f func(*hookstate.Context, *state.State, *confdb.View) (*confdbstate.Transaction, confdbstate.CommitTxFunc, error)) (restore func()) {
+	old := confdbstateGetTransaction
+	confdbstateGetTransaction = f
+	return func() {
+		confdbstateGetTransaction = old
+	}
+}
+
+func MockConfdbstateGetView(f func(st *state.State, account, confdbName, viewName string) (*confdb.View, error)) (restore func()) {
+	old := confdbstateGetView
+	confdbstateGetView = f
+	return func() {
+		confdbstateGetView = old
+	}
+}
+
+func MockConfdbstateNewTransaction(f func(*state.State, string, string) (*confdbstate.Transaction, error)) (restore func()) {
+	old := confdbstateNewTransaction
+	confdbstateNewTransaction = f
+	return func() {
+		confdbstateNewTransaction = old
+	}
+}
+
+func MockConfdbstateGetStoredTransaction(f func(*state.Task) (*confdbstate.Transaction, func(), error)) (restore func()) {
+	old := confdbstateGetStoredTransaction
+	confdbstateGetStoredTransaction = f
+	return func() {
+		confdbstateGetStoredTransaction = old
 	}
 }

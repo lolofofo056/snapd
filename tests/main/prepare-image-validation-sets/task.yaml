@@ -1,16 +1,27 @@
 summary: Verify that we are able to use validation sets with the model assertion through prepare-image 
 
+details: |
+    The `snap prepare-image` command performs some of the steps necessary for
+    creating device images.
+
+    This test verifies that in classic and Ubuntu Core systems, the prepare-image
+    command prepares properly an ubuntu-core 20 image using a model with
+    validation sets in enforce mode.
+
+    It is checked that the generated seed.manifest is created in working directory
+    and the expected revisions for the fundamental snaps are retrieved. Also it
+    is verified that snaps in the validation set are retrieved and the revisions
+    are correct.
+
 # autopkgtest run only a subset of tests that deals with the integration
 # with the distro
 backends: [-autopkgtest]
 
 # disable the following distributions
 # ubuntu-14, lack of systemd-run
-# ubuntu-18.04-32: pc gadget from 20 is not available
 # ubuntu-20.04-arm*, because we use pc kernel and gadget.
 systems:
 - -ubuntu-14.04-*
-- -ubuntu-18.04-32
 # The test downloads pc from track 20, which is not available for arm
 # TODO run the test also for a UC22 model
 - -ubuntu-*-arm-*
@@ -74,12 +85,6 @@ execute: |
         fakestore new-snap-revision --dir "${STORE_DIR}" "$SNAP_PATH" --snap-rev-json snap-"$SNAP_NAME"-rev.json
     }
     
-    # Ensure the following snaps are available on the host snap to avoid the
-    # store script trying to fetch these after setting up the fake store.
-    echo Installing required snaps we will need
-    snap install remarshal
-    snap install jq
-
     echo Download snaps needed for the the model
     snap download core
     snap download pc --channel=20/stable
@@ -118,7 +123,7 @@ execute: |
     "$TESTSTOOLS"/store-state make-snap-installable "$STORE_DIR" "$(ls snapd_*.snap)" PMrrV4ml8uWuEUDBT8dSGnKUYbevVhc4
     install_snap_to_fakestore test-snapd-sh 13
 
-    # Use the fake-store to verify behaviour, so we can use our own assertions
+    # Use the fake-store to verify behavior, so we can use our own assertions
     export SNAPPY_FORCE_API_URL=http://"$STORE_ADDR"
     echo Running prepare-image
     snap prepare-image --channel edge --write-revisions --snap core --snap test-snapd-sh ./model.assert "$ROOT"

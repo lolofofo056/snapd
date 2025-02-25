@@ -1,5 +1,13 @@
 summary: Checks for local install with metadata from assertions
 
+details: |
+    Snapd couples each snap package with an assertion document that provides
+    trusted properties, such as revision number. A typical installation request
+    downloads both files from the store, but the files may be equally well
+    downloaded and installed separately. The resulting installation is
+    indistinguishable from an online installation. Crucially, the user is no
+    longer required to use the "--dangerous" flag.
+
 # XXX we would need to bother with curl there atm
 systems: [-ubuntu-core-*]
 
@@ -8,7 +16,7 @@ execute: |
     snap download test-snapd-sh
 
     echo "Try to install the snap without assertions"
-    (snap install test-snapd-sh_*.snap 2>&1 || true) | MATCH 'cannot find signatures with metadata for snap "test-snapd-sh.*\.snap"'
+    (snap install test-snapd-sh_*.snap 2>&1 || true) | tr '\n' ' ' | tr -s ' ' | MATCH 'cannot find signatures with metadata for snap/component "test-snapd-sh.*\.snap"'
 
     echo "Add its assertions"
     snap ack test-snapd-sh_*.assert

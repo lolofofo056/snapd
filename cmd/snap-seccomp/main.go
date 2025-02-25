@@ -19,7 +19,7 @@
 
 package main
 
-//#cgo CFLAGS: -D_FILE_OFFSET_BITS=64
+//#cgo CFLAGS: -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE
 //#cgo pkg-config: libseccomp
 //#cgo LDFLAGS:
 //
@@ -210,14 +210,15 @@ import "C"
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"strconv"
 	"strings"
 	"syscall"
 
-	"github.com/seccomp/libseccomp-golang"
+	seccomp "github.com/seccomp/libseccomp-golang"
 
 	"github.com/snapcore/snapd/arch"
 	"github.com/snapcore/snapd/osutil"
@@ -578,16 +579,33 @@ func readNumber(token string, syscallName string) (uint64, error) {
 	return uint64(uint32(value)), nil
 }
 
+func readMaskedEqual(token string, syscallName string) (uint64, uint64, error) {
+	l := strings.Split(token, "|")
+	if len(l) != 2 {
+		return 0, 0, fmt.Errorf("cannot parse masked equal: unexpected number of tokens %v", len(l))
+	}
+	value, err := readNumber(l[0], syscallName)
+	if err != nil {
+		return 0, 0, err
+	}
+	value2, err := readNumber(l[1], syscallName)
+	if err != nil {
+		return 0, 0, err
+	}
+	return value, value2, nil
+}
+
 var (
 	errnoOnExplicitDenial int16 = C.EACCES
 	errnoOnImplicitDenial int16 = C.EPERM
 )
 
-func parseLine(line string, secFilter *seccomp.ScmpFilter) error {
+func parseLine(line string, secFilterAllow, secFilterDeny *seccomp.ScmpFilter) error {
 	// ignore comments and empty lines
 	if strings.HasPrefix(line, "#") || line == "" {
 		return nil
 	}
+	secFilter := secFilterAllow
 
 	// regular line
 	tokens := strings.Fields(line)
@@ -604,6 +622,7 @@ func parseLine(line string, secFilter *seccomp.ScmpFilter) error {
 	if strings.HasPrefix(syscallName, "~") {
 		action = seccomp.ActErrno.SetReturnCode(errnoOnExplicitDenial)
 		syscallName = syscallName[1:]
+		secFilter = secFilterDeny
 	}
 
 	secSyscall, err := seccomp.GetSyscallFromName(syscallName)
@@ -618,7 +637,7 @@ func parseLine(line string, secFilter *seccomp.ScmpFilter) error {
 	var conds []seccomp.ScmpCondition
 	for pos, arg := range tokens[1:] {
 		var cmpOp seccomp.ScmpCompareOp
-		var value uint64
+		var value, value2 uint64
 		var err error
 
 		if arg == "-" { // skip arg
@@ -643,6 +662,10 @@ func parseLine(line string, secFilter *seccomp.ScmpFilter) error {
 		} else if strings.HasPrefix(arg, "|") {
 			cmpOp = seccomp.CompareMaskedEqual
 			value, err = readNumber(arg[1:], syscallName)
+			value2 = value
+		} else if strings.Contains(arg, "|") {
+			cmpOp = seccomp.CompareMaskedEqual
+			value, value2, err = readMaskedEqual(arg, syscallName)
 		} else if strings.HasPrefix(arg, "u:") {
 			cmpOp = seccomp.CompareEqual
 			value, err = findUid(arg[2:])
@@ -674,7 +697,7 @@ func parseLine(line string, secFilter *seccomp.ScmpFilter) error {
 
 		var scmpCond seccomp.ScmpCondition
 		if cmpOp == seccomp.CompareMaskedEqual {
-			scmpCond, err = seccomp.MakeCondition(uint(pos), cmpOp, value, value)
+			scmpCond, err = seccomp.MakeCondition(uint(pos), cmpOp, value, value2)
 		} else if syscallsWithNegArgsMaskHi32[syscallName] {
 			scmpCond, err = seccomp.MakeCondition(uint(pos), seccomp.CompareMaskedEqual, 0xFFFFFFFF, value)
 		} else {
@@ -691,8 +714,11 @@ func parseLine(line string, secFilter *seccomp.ScmpFilter) error {
 	if err = secFilter.AddRuleConditionalExact(secSyscall, action, conds); err != nil {
 		err = secFilter.AddRuleConditional(secSyscall, action, conds)
 	}
+	if err != nil {
+		return fmt.Errorf("cannot add rule for line %q: %v", line, err)
+	}
 
-	return err
+	return nil
 }
 
 // used to mock in tests
@@ -789,18 +815,116 @@ func complainAction() seccomp.ScmpAction {
 	return seccomp.ActAllow
 }
 
+var osCreateTemp = os.CreateTemp
+
+func exportBPF(fout *os.File, filter *seccomp.ScmpFilter) (bpfLen int64, err error) {
+	// TODO: use a common way to handle prefixed errors across snapd
+	errPrefixFmt := "cannot export bpf filter: %w"
+
+	oldPos, err := fout.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return 0, fmt.Errorf(errPrefixFmt, err)
+	}
+	if err := filter.ExportBPF(fout); err != nil {
+		return 0, fmt.Errorf(errPrefixFmt, err)
+	}
+	nowPos, err := fout.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return 0, fmt.Errorf(errPrefixFmt, err)
+	}
+
+	return nowPos - oldPos, nil
+}
+
+// New .bin2 seccomp files are composed by the following header, and potentially one
+// allow filter and/or one deny filter (if lenAllowFilter and lenDenyFilter are greater
+// than 0 respectively). When more than one filter is loaded, the kernel applies
+// the most restrictive action, thus any explicit deny will take precedence.
+// This struct needs to be in sync with seccomp-support.c
+type scSeccompFileHeader struct {
+	Header  [2]byte
+	Version byte
+	// flags
+	Unrestricted byte
+	// unused
+	Padding [4]byte
+	// location of allow/deny, all offsets/len in bytes
+	LenAllowFilter uint32
+	LenDenyFilter  uint32
+	// reserved for future use
+	Reserved2 [112]byte
+}
+
+func writeUnrestrictedFilter(outFile string) error {
+	hdr := scSeccompFileHeader{
+		Header:  [2]byte{'S', 'C'},
+		Version: 0x1,
+		// tell snap-confine
+		Unrestricted: 0x1,
+	}
+	fout, err := osutil.NewAtomicFile(outFile, 0644, 0, osutil.NoChown, osutil.NoChown)
+	if err != nil {
+		return err
+	}
+	defer fout.Cancel()
+
+	if err := binary.Write(fout, arch.Endian(), hdr); err != nil {
+		return err
+	}
+	return fout.Commit()
+}
+
+func writeSeccompFilter(outFile string, filterAllow, filterDeny *seccomp.ScmpFilter) error {
+	fout, err := osutil.NewAtomicFile(outFile, 0644, 0, osutil.NoChown, osutil.NoChown)
+	if err != nil {
+		return err
+	}
+	defer fout.Cancel()
+
+	// Write preliminary header because we don't know the sizes of the
+	// seccomp filters yet and the only way to know is to export to
+	// a file (until seccomp_export_bpf_mem() becomes available)
+	hdr := scSeccompFileHeader{
+		Header:  [2]byte{'S', 'C'},
+		Version: 0x1,
+	}
+	if err := binary.Write(fout, arch.Endian(), hdr); err != nil {
+		return err
+	}
+	allowSize, err := exportBPF(fout.File, filterAllow)
+	if err != nil {
+		return err
+	}
+	denySize, err := exportBPF(fout.File, filterDeny)
+	if err != nil {
+		return err
+	}
+
+	// now write final header
+	hdr.LenAllowFilter = uint32(allowSize)
+	hdr.LenDenyFilter = uint32(denySize)
+	if _, err := fout.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	if err := binary.Write(fout, arch.Endian(), hdr); err != nil {
+		return err
+	}
+
+	return fout.Commit()
+}
+
 func compile(content []byte, out string) error {
 	var err error
-	var secFilter *seccomp.ScmpFilter
+	var secFilterAllow, secFilterDeny *seccomp.ScmpFilter
 
 	unrestricted, complain := preprocess(content)
 	switch {
 	case unrestricted:
-		return osutil.AtomicWrite(out, bytes.NewBufferString("@unrestricted\n"), 0644, 0)
+		return writeUnrestrictedFilter(out)
 	case complain:
 		var complainAct seccomp.ScmpAction = complainAction()
 
-		secFilter, err = seccomp.NewFilter(complainAct)
+		secFilterAllow, err = seccomp.NewFilter(complainAct)
 		if err != nil {
 			if complainAct != seccomp.ActAllow {
 				// ActLog is only supported in newer versions
@@ -808,8 +932,21 @@ func compile(content []byte, out string) error {
 				// libseccomp-golang. Attempt to fall back to
 				// ActAllow before erroring out.
 				complainAct = seccomp.ActAllow
-				secFilter, err = seccomp.NewFilter(complainAct)
+				secFilterAllow, err = seccomp.NewFilter(complainAct)
 			}
+		}
+		if err != nil {
+			return fmt.Errorf("cannot create allow seccomp filter: %s", err)
+		}
+
+		// Deny filter uses "act allow" as a default action, as it is only
+		// populated with deny rules. Any matching it does results in an
+		// explicit denial. When seccomp profiles are loaded the most
+		// restrictive action is used, so without any matching allow rules in
+		// the same filter, all system calls would be forever denied.
+		secFilterDeny, err = seccomp.NewFilter(seccomp.ActAllow)
+		if err != nil {
+			return fmt.Errorf("cannot create deny seccomp filter: %s", err)
 		}
 
 		// Set unrestricted to 'true' to fallback to the pre-ActLog
@@ -819,19 +956,31 @@ func compile(content []byte, out string) error {
 			unrestricted = true
 		}
 	default:
-		secFilter, err = seccomp.NewFilter(seccomp.ActErrno.SetReturnCode(errnoOnImplicitDenial))
+		secFilterAllow, err = seccomp.NewFilter(seccomp.ActErrno.SetReturnCode(errnoOnImplicitDenial))
+		if err != nil {
+			return fmt.Errorf("cannot create seccomp filter: %s", err)
+		}
+		// Deny filter uses "act allow" as a default action, as it is only
+		// populated with deny rules. Any matching it does results in an
+		// explicit denial. When seccomp profiles are loaded the most
+		// restrictive action is used, so without any matching allow rules in
+		// the same filter, all system calls would be forever denied.
+		secFilterDeny, err = seccomp.NewFilter(seccomp.ActAllow)
+		if err != nil {
+			return fmt.Errorf("cannot create seccomp filter: %s", err)
+		}
 	}
-	if err != nil {
-		return fmt.Errorf("cannot create seccomp filter: %s", err)
+	if err := addSecondaryArches(secFilterAllow); err != nil {
+		return err
 	}
-	if err := addSecondaryArches(secFilter); err != nil {
+	if err := addSecondaryArches(secFilterDeny); err != nil {
 		return err
 	}
 
 	if !unrestricted {
 		scanner := bufio.NewScanner(bytes.NewBuffer(content))
 		for scanner.Scan() {
-			if err := parseLine(scanner.Text(), secFilter); err != nil {
+			if err := parseLine(scanner.Text(), secFilterAllow, secFilterDeny); err != nil {
 				return fmt.Errorf("cannot parse line: %s", err)
 			}
 		}
@@ -841,21 +990,14 @@ func compile(content []byte, out string) error {
 	}
 
 	if osutil.GetenvBool("SNAP_SECCOMP_DEBUG") {
-		secFilter.ExportPFC(os.Stdout)
+		secFilterAllow.ExportPFC(os.Stdout)
+		secFilterDeny.ExportPFC(os.Stdout)
 	}
 
-	// write atomically
-	fout, err := osutil.NewAtomicFile(out, 0644, 0, osutil.NoChown, osutil.NoChown)
-	if err != nil {
+	if err := writeSeccompFilter(out, secFilterAllow, secFilterDeny); err != nil {
 		return err
 	}
-	// Cancel once Committed is a NOP
-	defer fout.Cancel()
-
-	if err := secFilter.ExportBPF(fout.File); err != nil {
-		return err
-	}
-	return fout.Commit()
+	return nil
 }
 
 // caches for uid and gid lookups
@@ -898,6 +1040,46 @@ func showSeccompLibraryVersion() error {
 	return nil
 }
 
+func dump(what, prefix string) error {
+	f, err := os.Open(what)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	var hdr scSeccompFileHeader
+
+	if err := binary.Read(f, arch.Endian(), &hdr); err != nil {
+		return fmt.Errorf("cannot read header: %w", err)
+	}
+
+	if !bytes.Equal(hdr.Header[:], []byte{'S', 'C'}) || hdr.Version != 0x01 {
+		return fmt.Errorf("unsupported header: %x version %v", hdr.Header, hdr.Version)
+	}
+
+	var allowRules bytes.Buffer
+	var denyRules bytes.Buffer
+
+	if _, err := io.CopyN(&allowRules, f, int64(hdr.LenAllowFilter)); err != nil {
+		return fmt.Errorf("cannot copy allow rules: %w", err)
+	}
+
+	if _, err := io.CopyN(&denyRules, f, int64(hdr.LenDenyFilter)); err != nil {
+		return fmt.Errorf("cannot copy deny rules: %w", err)
+	}
+
+	if err := os.WriteFile(prefix+".allow", allowRules.Bytes(), 0644); err != nil {
+		return fmt.Errorf("cannot write allow rules to file: %w", err)
+	}
+
+	if err := os.WriteFile(prefix+".deny", denyRules.Bytes(), 0644); err != nil {
+		// TODO remove allow file?
+		return fmt.Errorf("cannot write deny rules to file: %w", err)
+	}
+
+	return nil
+}
+
 func main() {
 	var err error
 	var content []byte
@@ -914,7 +1096,7 @@ func main() {
 			fmt.Println("compile needs an input and output file")
 			os.Exit(1)
 		}
-		content, err = ioutil.ReadFile(os.Args[2])
+		content, err = os.ReadFile(os.Args[2])
 		if err != nil {
 			break
 		}
@@ -923,6 +1105,14 @@ func main() {
 		err = showSeccompLibraryVersion()
 	case "version-info":
 		err = showVersionInfo()
+	case "dump":
+		if len(os.Args) < 4 {
+			fmt.Println("dump needs <file> and <prefix>")
+			os.Exit(1)
+		}
+		what := os.Args[2]
+		prefix := os.Args[3]
+		err = dump(what, prefix)
 	default:
 		err = fmt.Errorf("unsupported argument %q", cmd)
 	}

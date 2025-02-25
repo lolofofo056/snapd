@@ -46,10 +46,15 @@ the `snapd` project, please see [Contributing to snapd](./CONTRIBUTING.md).
 Build dependencies can automatically be resolved using `build-dep` on Ubuntu:
 
     cd ~/snapd
-    sudo apt-get build-dep .
+    sudo apt build-dep .
 
 Package build dependencies for other distributions can be found under the
-[./packaging/](./packaging/) directory.
+[./packaging/](./packaging/) directory. Eg. for Fedora use:
+
+    cd packaging/fedora
+    sudo dnf install -y rpmdevtools
+    sudo dnf install -y $(rpmspec -q --buildrequires snapd.spec)
+    sudo dnf install glibc-static.i686 glibc-devel.i686
 
 Source dependencies are automatically retrieved at build time.
 Sometimes, it might be useful to pull them without building:
@@ -65,25 +70,23 @@ go get ./... && ./get-deps.sh
 
 The easiest (though not the most efficient) way to test changes to snapd is to
 build the snapd snap using _snapcraft_ and then install that snapd snap. The
-[snapcraft.yaml](./build-aux/snapcraft.yaml) for the snapd snap is located at 
+[snapcraft.yaml](./build-aux/snap/snapcraft.yaml) for the snapd snap is located at
 [./build-aux/](./build-aux/), and
-can be built using snapcraft either in a LXD container or a multipass VM (or
-natively with `--destructive-mode` on a Ubuntu 16.04 host).
+can be built using snapcraft.
 
-> Currently, snapcraft's default track of 5.x does not support building the 
-snapd snap, since the snapd snap uses `build-base: core`. Building with a 
-`build-base` of core uses Ubuntu 16.04 as the base operating system (and thus 
-root filesystem) for building and Ubuntu 16.04 is now in Extended Security 
-Maintenance (ESM, see 
-[Ubuntu 16.04 LTS ESM](https://ubuntu.com/blog/ubuntu-16-04-lts-transitions-to-extended-security-maintenance-esm)),
-and as such only is buildable using snapcraft's 4.x channel. At some point in the future,
-the snapd snap should be moved to a newer `build-base`, but until then `4.x` 
-needs to be used.
+Snapcraft 8.x or later is expected.
 
-Install snapcraft from the 4.x channel:
+Install snapcraft:
 
 ```
-sudo snap install snapcraft --channel=4.x
+sudo snap install snapcraft --classic
+```
+
+Install and init lxd:
+
+```
+sudo snap install lxd
+sudo lxd init --minimal
 ```
 
 Then run snapcraft:
@@ -95,7 +98,7 @@ snapcraft
 Now the snapd snap that was just built can be installed with:
 
 ```
-snap install --dangerous snapd_*.snap
+sudo snap install --dangerous snapd_*.snap
 ```
 
 To go back to using snapd from the store instead of the custom version we 
@@ -106,27 +109,13 @@ can either use `snap revert snapd`, or you can refresh directly with
 #### Building for other architectures with snapcraft
 
 It is also sometimes useful to use snapcraft to build the snapd snap for
-other architectures using the `remote-build` feature. In order to build
-remotely with snapcraft, make sure you have at least version `6.x` installed:
-if the command `snap info snapcraft` shows that you are running an older
-version, upgrade with:
+other architectures using the `remote-build` feature.
 
-```
-snap refresh snapcraft --channel=latest/stable
-```
-
-Now you can use remote-build with snapcraft on the snapd tree for any desired 
+You can use remote-build with snapcraft on the snapd tree for any desired
 architectures:
 
 ```
 snapcraft remote-build --build-for=armhf,s390x,arm64
-```
-
-And to go back to building the snapd snap locally, just revert the channel back
-to 4.x:
-
-```
-snap refresh snapcraft --channel=4.x/stable
 ```
 
 #### Splicing the snapd snap into the core snap
@@ -392,11 +381,34 @@ with `gunzip` and placed into `~/.spread/qemu` as above.
 > An image for Ubuntu Core 20 that is pre-built for KVM can be downloaded from 
 [here](https://cdimage.ubuntu.com/ubuntu-core/20/stable/current/ubuntu-core-20-amd64.img.xz).
 
+#### Running spread
+
+For regular development work, the integration tests will be run with a prebuilt
+test variant of the snapd snap. The build happens automatically when starting
+the tests using `run-spread` helper like so:
+
+    $ ./run-spread <spread-args>
+
+Make sure you set up snapcraft following the [snapcraft build
+section](#building-the-snap-with-snapcraft).
+
+The test variant of the snapd snap may be built manually by invoking a helper
+script:
+
+    $ ./tests/build-test-snapd-snap
+    
+The artifact will be placed under `$PWD/built-snap`.
+
+On occasion, when working on a test and it is known that the snapd snap need not
+be rebuilt, the tests may be invoked with `NO_REBUILD=1` like so:
+
+    $ NO_REBUILD=1 ./run-spread <spread-args>
+
 #### Running spread with QEMU
 
 Finally, you can run the spread tests for Ubuntu 18.04 LTS 64-bit with:
 
-    $ spread -v qemu:ubuntu-18.04-64
+    $ ./run-spread -v qemu:ubuntu-18.04-64
 
 >To run for a different system, replace `ubuntu-18.04-64` with a different system
 name, which should be a basename of the [built](#building-spread-vm-images) or 
@@ -404,7 +416,7 @@ name, which should be a basename of the [built](#building-spread-vm-images) or
 
 For quick reuse you can use:
 
-    $ spread -reuse qemu:ubuntu-18.04-64
+    $ ./run-spread -reuse qemu:ubuntu-18.04-64
 
 It will print how to reuse the systems. Make sure to use
 `export REUSE_PROJECT=1` in your environment too.

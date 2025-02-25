@@ -25,9 +25,11 @@ import (
 
 	"github.com/snapcore/snapd/gadget"
 	"github.com/snapcore/snapd/gadget/quantity"
+	"github.com/snapcore/snapd/kernel"
 )
 
 type MkfsParams = mkfsParams
+type MntfsParams = mntfsParams
 
 var (
 	MakeFilesystem         = makeFilesystem
@@ -38,7 +40,7 @@ var (
 	RemoveCreatedPartitions = removeCreatedPartitions
 	EnsureNodesExist        = ensureNodesExist
 
-	CreatedDuringInstall        = createdDuringInstall
+	IndexIfCreatedDuringInstall = indexIfCreatedDuringInstall
 	TestCreateMissingPartitions = createMissingPartitions
 )
 
@@ -74,6 +76,14 @@ func MockMkfsMake(f func(typ, img, label string, devSize, sectorSize quantity.Si
 	}
 }
 
+func MockKernelEnsureKernelDriversTree(f func(kMntPts kernel.MountPoints, compsMntPts []kernel.ModulesCompMountPoints, destDir string, opts *kernel.KernelDriversTreeOptions) (err error)) (restore func()) {
+	old := kernelEnsureKernelDriversTree
+	kernelEnsureKernelDriversTree = f
+	return func() {
+		kernelEnsureKernelDriversTree = old
+	}
+}
+
 func CheckEncryptionSetupData(encryptSetup *EncryptionSetupData, labelToEncDevice map[string]string) error {
 	for label, part := range encryptSetup.parts {
 		switch part.role {
@@ -85,9 +95,6 @@ func CheckEncryptionSetupData(encryptSetup *EncryptionSetupData, labelToEncDevic
 		if part.encryptedDevice != labelToEncDevice[label] {
 			return fmt.Errorf("encrypted device in EncryptionSetupData (%q) different to expected (%q)",
 				encryptSetup.parts[label].encryptedDevice, labelToEncDevice[label])
-		}
-		if len(part.encryptionKey) == 0 {
-			return fmt.Errorf("encryption key for %q is empty", label)
 		}
 	}
 

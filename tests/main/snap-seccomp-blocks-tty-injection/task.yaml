@@ -1,5 +1,10 @@
 summary: Ensure that the snap-seccomp blocks tty command injection
 
+details: |
+    Check it is not allowed to make tty command injection. Verify snap-seccomp
+    generated a profile which results in  "Operation not permitted" message when 
+    attempt to inject a tty command is denied.
+
 # ubuntu-core: excluded because there is no gcc there
 systems: [-ubuntu-core-*]
 
@@ -21,7 +26,7 @@ execute: |
     # through AppArmor
     if [ "$(snap debug confinement)" = strict ]; then
         sed -i 's|^}$|  /dev/tty1  rw,\n}|' /var/lib/snapd/apparmor/profiles/snap.test-snapd-sh.sh
-        apparmor_parser -r /var/lib/snapd/apparmor/profiles/snap.test-snapd-sh.sh
+        systemctl restart snapd.apparmor.service
     fi
 
     # For 64bit systems TIOC{STI,LINUX} gets a EPERM because of the

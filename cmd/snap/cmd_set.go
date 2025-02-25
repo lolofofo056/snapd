@@ -20,13 +20,13 @@
 package main
 
 import (
-	"fmt"
+	"errors"
 	"strings"
 
 	"github.com/jessevdk/go-flags"
 
+	"github.com/snapcore/snapd/client/clientutil"
 	"github.com/snapcore/snapd/i18n"
-	"github.com/snapcore/snapd/jsonutil"
 )
 
 var shortSetHelp = i18n.G("Change configuration options")
@@ -46,11 +46,10 @@ Configuration option may be unset with exclamation mark:
     $ snap set snap-name author!
 `)
 
-var longAspectSetHelp = i18n.G(`
-If the first argument passed into set is an aspect identifier matching the
-format <account-id>/<bundle>/<aspect>, set will use the aspects configuration
-API. In this case, the command sets the values as provided for the dot-separated
-aspect paths.
+var longConfdbSetHelp = i18n.G(`
+If the first argument passed into set is a confdb identifier matching the
+format <account-id>/<confdb>/<view>, set will use the confdb API. In this
+case, the command sets the values as provided for the dot-separated view paths.
 `)
 
 type cmdSet struct {
@@ -65,8 +64,8 @@ type cmdSet struct {
 }
 
 func init() {
-	if err := validateAspectFeatureFlag(); err == nil {
-		longSetHelp += longAspectSetHelp
+	if err := validateConfdbFeatureFlag(); err == nil {
+		longSetHelp += longConfdbSetHelp
 	}
 
 	addCommand("set", shortSetHelp, longSetHelp, func() flags.Commander { return &cmdSet{} },
@@ -91,53 +90,29 @@ func init() {
 
 func (x *cmdSet) Execute([]string) error {
 	if x.String && x.Typed {
-		return fmt.Errorf(i18n.G("cannot use -t and -s together"))
+		return errors.New(i18n.G("cannot use -t and -s together"))
 	}
 
-	patchValues := make(map[string]interface{})
-	for _, patchValue := range x.Positional.ConfValues {
-		parts := strings.SplitN(patchValue, "=", 2)
-		if len(parts) == 1 && strings.HasSuffix(patchValue, "!") {
-			patchValues[strings.TrimSuffix(patchValue, "!")] = nil
-			continue
-		}
-		if len(parts) != 2 {
-			return fmt.Errorf(i18n.G("invalid configuration: %q (want key=value)"), patchValue)
-		}
-
-		if x.String {
-			patchValues[parts[0]] = parts[1]
-		} else {
-			var value interface{}
-			if err := jsonutil.DecodeWithNumber(strings.NewReader(parts[1]), &value); err != nil {
-				if x.Typed {
-					return fmt.Errorf("failed to parse JSON: %w", err)
-				}
-
-				// Not valid JSON-- just save the string as-is.
-				patchValues[parts[0]] = parts[1]
-			} else {
-				patchValues[parts[0]] = value
-			}
-		}
+	opts := &clientutil.ParseConfigOptions{String: x.String, Typed: x.Typed}
+	patchValues, _, err := clientutil.ParseConfigValues(x.Positional.ConfValues, opts)
+	if err != nil {
+		return err
 	}
 
 	snapName := string(x.Positional.Snap)
-
 	var chgID string
-	var err error
-	if isAspectID(snapName) {
-		if err := validateAspectFeatureFlag(); err != nil {
+	if isConfdbViewID(snapName) {
+		if err := validateConfdbFeatureFlag(); err != nil {
 			return err
 		}
 
-		// first argument is an aspectID, use the aspects API
-		aspectID := snapName
-		if err := validateAspectID(aspectID); err != nil {
+		// first argument is a confdbViewID, use the confdb API
+		confdbViewID := snapName
+		if err := validateConfdbViewID(confdbViewID); err != nil {
 			return err
 		}
 
-		chgID, err = x.client.AspectSet(aspectID, patchValues)
+		chgID, err = x.client.ConfdbSetViaView(confdbViewID, patchValues)
 	} else {
 		chgID, err = x.client.SetConf(snapName, patchValues)
 	}
@@ -156,15 +131,15 @@ func (x *cmdSet) Execute([]string) error {
 	return nil
 }
 
-func isAspectID(s string) bool {
+func isConfdbViewID(s string) bool {
 	return len(strings.Split(s, "/")) == 3
 }
 
-func validateAspectID(id string) error {
+func validateConfdbViewID(id string) error {
 	parts := strings.Split(id, "/")
 	for _, part := range parts {
 		if part == "" {
-			return fmt.Errorf(i18n.G("aspect identifier must conform to format: <account-id>/<bundle>/<aspect>"))
+			return errors.New(i18n.G("confdb identifier must conform to format: <account-id>/<confdb>/<view>"))
 		}
 	}
 

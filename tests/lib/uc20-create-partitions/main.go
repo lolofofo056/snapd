@@ -27,11 +27,13 @@ import (
 
 	"github.com/snapcore/snapd/asserts"
 	"github.com/snapcore/snapd/gadget"
+	"github.com/snapcore/snapd/gadget/device"
 	"github.com/snapcore/snapd/gadget/install"
 	"github.com/snapcore/snapd/i18n"
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/secboot"
 	"github.com/snapcore/snapd/secboot/keys"
+	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/timings"
 )
 
@@ -42,9 +44,11 @@ type cmdCreatePartitions struct {
 	Encrypt bool `long:"encrypt" description:"Encrypt the data partition"`
 
 	Positional struct {
-		GadgetRoot string `positional-arg-name:"<gadget-root>"`
-		KernelRoot string `positional-arg-name:"<kernel-root>"`
-		Device     string `positional-arg-name:"<device>"`
+		GadgetRoot     string `positional-arg-name:"<gadget-root>"`
+		KernelName     string `positional-arg-name:"<kernel-name>"`
+		KernelRoot     string `positional-arg-name:"<kernel-root>"`
+		KernelRevision string `positional-arg-name:"<kernel-revision>"`
+		Device         string `positional-arg-name:"<device>"`
 	} `positional-args:"yes"`
 }
 
@@ -54,7 +58,7 @@ func (o *simpleObserver) Observe(op gadget.ContentOperation, partRole, root, dst
 	return gadget.ChangeApply, nil
 }
 
-func (o *simpleObserver) ChosenEncryptionKey(key keys.EncryptionKey) {}
+func (o *simpleObserver) ChosenBootstrappedContainer(key secboot.BootstrappedContainer) {}
 
 type uc20Constraints struct{}
 
@@ -62,7 +66,7 @@ func (c uc20Constraints) Classic() bool             { return false }
 func (c uc20Constraints) Grade() asserts.ModelGrade { return asserts.ModelSigned }
 
 func main() {
-	if err := logger.SimpleSetup(); err != nil {
+	if err := logger.SimpleSetup(nil); err != nil {
 		fmt.Fprintf(os.Stderr, i18n.G("WARNING: failed to activate logging: %v\n"), err)
 	}
 
@@ -73,32 +77,56 @@ func main() {
 
 	obs := &simpleObserver{}
 
-	var encryptionType secboot.EncryptionType
+	var encryptionType device.EncryptionType
 	if args.Encrypt {
-		encryptionType = secboot.EncryptionTypeLUKS
+		encryptionType = device.EncryptionTypeLUKS
 	}
 
 	options := install.Options{
 		Mount:          args.Mount,
 		EncryptionType: encryptionType,
 	}
-	installSideData, err := installRun(uc20Constraints{}, args.Positional.GadgetRoot, args.Positional.KernelRoot, args.Positional.Device, options, obs, timings.New(nil))
+	kernelSnapInfo := &install.KernelSnapInfo{
+		Name:       args.Positional.KernelName,
+		MountPoint: args.Positional.KernelRoot,
+		Revision:   snap.R(args.Positional.KernelRevision),
+		IsCore:     true,
+	}
+	installSideData, err := installRun(uc20Constraints{}, args.Positional.GadgetRoot, kernelSnapInfo, args.Positional.Device, options, obs, timings.New(nil))
 	if err != nil {
 		panic(err)
 	}
 
 	if args.Encrypt {
-		if installSideData == nil || len(installSideData.KeyForRole) == 0 {
+		if installSideData == nil || len(installSideData.BootstrappedContainerForRole) == 0 {
 			panic("expected encryption keys")
 		}
-		dataKey := installSideData.KeyForRole[gadget.SystemData]
-		if dataKey == nil {
+		dataBootstrapKey := installSideData.BootstrappedContainerForRole[gadget.SystemData]
+		if dataBootstrapKey == nil {
 			panic("ubuntu-data encryption key is unset")
 		}
-		saveKey := installSideData.KeyForRole[gadget.SystemSave]
-		if saveKey == nil {
+
+		dataKey, err := keys.NewEncryptionKey()
+		if err != nil {
+			panic("cannot create data key")
+		}
+		if err := dataBootstrapKey.AddKey("", secboot.DiskUnlockKey(dataKey)); err != nil {
+			panic("cannot reset data key")
+		}
+
+		saveBootstrapKey := installSideData.BootstrappedContainerForRole[gadget.SystemSave]
+		if saveBootstrapKey == nil {
 			panic("ubuntu-save encryption key is unset")
 		}
+
+		saveKey, err := keys.NewEncryptionKey()
+		if err != nil {
+			panic("cannot create save key")
+		}
+		if err := saveBootstrapKey.AddKey("", secboot.DiskUnlockKey(saveKey)); err != nil {
+			panic("cannot reset save key")
+		}
+
 		toWrite := map[string][]byte{
 			"unsealed-key": dataKey[:],
 			"save-key":     saveKey[:],
@@ -107,6 +135,13 @@ func main() {
 			if err := os.WriteFile(keyFileName, keyData, 0644); err != nil {
 				panic(err)
 			}
+		}
+
+		if err := dataBootstrapKey.RemoveBootstrapKey(); err != nil {
+			panic(err)
+		}
+		if err := saveBootstrapKey.RemoveBootstrapKey(); err != nil {
+			panic(err)
 		}
 	}
 }

@@ -168,32 +168,32 @@ const asyncResp = `{
 	"status-code": 202
 }`
 
-type aspectsSuite struct {
+type confdbSuite struct {
 	BaseSnapSuite
 	tmpDir string
 }
 
-var _ = check.Suite(&aspectsSuite{})
+var _ = check.Suite(&confdbSuite{})
 
-func (s *aspectsSuite) SetUp(c *check.C) {
+func (s *confdbSuite) SetUp(c *check.C) {
 	s.BaseSnapSuite.SetUpTest(c)
 	s.tmpDir = c.MkDir()
 }
 
-func (s *aspectsSuite) mockAspectsFlag(c *check.C) (restore func()) {
+func (s *confdbSuite) mockConfdbFlag(c *check.C) (restore func()) {
 	old := dirs.FeaturesDir
 	dirs.FeaturesDir = s.tmpDir
 
-	aspectsCtlFile := features.AspectsConfiguration.ControlFile()
-	c.Assert(os.WriteFile(aspectsCtlFile, []byte(nil), 0644), check.IsNil)
+	confdbCtlFile := features.Confdbs.ControlFile()
+	c.Assert(os.WriteFile(confdbCtlFile, []byte(nil), 0644), check.IsNil)
 
 	return func() {
-		c.Assert(os.Remove(aspectsCtlFile), check.IsNil)
+		c.Assert(os.Remove(confdbCtlFile), check.IsNil)
 		dirs.FeaturesDir = old
 	}
 }
 
-func (s *aspectsSuite) mockAspectServer(c *check.C, expectedRequest string, nowait bool) {
+func (s *confdbSuite) mockConfdbServer(c *check.C, expectedRequest string, nowait bool) {
 	fail := func(w http.ResponseWriter, err error) {
 		w.WriteHeader(500)
 		fmt.Fprintf(w, `{"type": "error", "result": {"message": %q}}`, err)
@@ -205,7 +205,7 @@ func (s *aspectsSuite) mockAspectServer(c *check.C, expectedRequest string, nowa
 		switch reqs {
 		case 0:
 			c.Check(r.Method, check.Equals, "PUT")
-			c.Check(r.URL.Path, check.Equals, "/v2/aspects/foo/bar/baz")
+			c.Check(r.URL.Path, check.Equals, "/v2/confdb/foo/bar/baz")
 			c.Check(r.URL.Query(), check.HasLen, 0)
 
 			raw, err := io.ReadAll(r.Body)
@@ -233,11 +233,11 @@ func (s *aspectsSuite) mockAspectServer(c *check.C, expectedRequest string, nowa
 	})
 }
 
-func (s *aspectsSuite) TestAspectSet(c *check.C) {
-	restore := s.mockAspectsFlag(c)
+func (s *confdbSuite) TestConfdbSet(c *check.C) {
+	restore := s.mockConfdbFlag(c)
 	defer restore()
 
-	s.mockAspectServer(c, `{"abc":"cba"}`, false)
+	s.mockConfdbServer(c, `{"abc":"cba"}`, false)
 
 	rest, err := snapset.Parser(snapset.Client()).ParseArgs([]string{"set", "foo/bar/baz", `abc="cba"`})
 	c.Assert(err, check.IsNil)
@@ -247,11 +247,11 @@ func (s *aspectsSuite) TestAspectSet(c *check.C) {
 	c.Check(s.Stderr(), check.Equals, "")
 }
 
-func (s *aspectsSuite) TestAspectSetMany(c *check.C) {
-	restore := s.mockAspectsFlag(c)
+func (s *confdbSuite) TestConfdbSetMany(c *check.C) {
+	restore := s.mockConfdbFlag(c)
 	defer restore()
 
-	s.mockAspectServer(c, `{"abc":{"foo":1},"xyz":true}`, false)
+	s.mockConfdbServer(c, `{"abc":{"foo":1},"xyz":true}`, false)
 
 	rest, err := snapset.Parser(snapset.Client()).ParseArgs([]string{"set", "foo/bar/baz", `abc={"foo":1}`, "xyz=true"})
 	c.Assert(err, check.IsNil)
@@ -261,20 +261,20 @@ func (s *aspectsSuite) TestAspectSetMany(c *check.C) {
 	c.Check(s.Stderr(), check.Equals, "")
 }
 
-func (s *aspectsSuite) TestAspectSetInvalidAspectID(c *check.C) {
-	restore := s.mockAspectsFlag(c)
+func (s *confdbSuite) TestConfdbSetInvalidAspectID(c *check.C) {
+	restore := s.mockConfdbFlag(c)
 	defer restore()
 
 	_, err := snapset.Parser(snapset.Client()).ParseArgs([]string{"set", "foo//bar", "foo=bar"})
 	c.Assert(err, check.NotNil)
-	c.Check(err.Error(), check.Equals, "aspect identifier must conform to format: <account-id>/<bundle>/<aspect>")
+	c.Check(err.Error(), check.Equals, "confdb identifier must conform to format: <account-id>/<confdb>/<view>")
 }
 
-func (s *aspectsSuite) TestAspectSetNoWait(c *check.C) {
-	restore := s.mockAspectsFlag(c)
+func (s *confdbSuite) TestConfdbSetNoWait(c *check.C) {
+	restore := s.mockConfdbFlag(c)
 	defer restore()
 
-	s.mockAspectServer(c, `{"abc":1}`, true)
+	s.mockConfdbServer(c, `{"abc":1}`, true)
 
 	rest, err := snapset.Parser(snapset.Client()).ParseArgs([]string{"set", "--no-wait", "foo/bar/baz", "abc=1"})
 	c.Assert(err, check.IsNil)
@@ -284,7 +284,7 @@ func (s *aspectsSuite) TestAspectSetNoWait(c *check.C) {
 	c.Check(s.Stderr(), check.Equals, "")
 }
 
-func (s *aspectsSuite) TestAspectSetDisabledFlag(c *check.C) {
+func (s *confdbSuite) TestConfdbSetDisabledFlag(c *check.C) {
 	var reqs int
 	s.RedirectClientToTestServer(func(w http.ResponseWriter, r *http.Request) {
 		switch reqs {
@@ -299,15 +299,26 @@ func (s *aspectsSuite) TestAspectSetDisabledFlag(c *check.C) {
 	})
 
 	_, err := snapset.Parser(snapset.Client()).ParseArgs([]string{"set", "foo/bar/baz", "abc=1"})
-	c.Assert(err, check.ErrorMatches, "aspect-based configuration is disabled: you must set 'experimental.aspects-configuration' to true")
+	c.Assert(err, check.ErrorMatches, `the "confdbs" feature is disabled: set 'experimental.confdbs' to true`)
 }
 
-func (s *aspectsSuite) TestAspectSetExclamationMark(c *check.C) {
-	restore := s.mockAspectsFlag(c)
+func (s *confdbSuite) TestConfdbSetExclamationMark(c *check.C) {
+	restore := s.mockConfdbFlag(c)
 	defer restore()
 
-	s.mockAspectServer(c, `{"abc":null}`, false)
+	s.mockConfdbServer(c, `{"abc":null}`, false)
 
 	_, err := snapset.Parser(snapset.Client()).ParseArgs([]string{"set", "foo/bar/baz", "abc!"})
 	c.Assert(err, check.IsNil)
+}
+
+func (s *confdbSuite) TestSetEmptyKey(c *check.C) {
+	_, err := snapset.Parser(snapset.Client()).ParseArgs([]string{"set", "some-snap", "!"})
+	c.Assert(err, check.ErrorMatches, "configuration keys cannot be empty \\(use key! to unset a key\\)")
+
+	_, err = snapset.Parser(snapset.Client()).ParseArgs([]string{"set", "some-snap", "=value"})
+	c.Assert(err, check.ErrorMatches, "configuration keys cannot be empty")
+
+	_, err = snapset.Parser(snapset.Client()).ParseArgs([]string{"set", "some-snap", "="})
+	c.Assert(err, check.ErrorMatches, "configuration keys cannot be empty")
 }

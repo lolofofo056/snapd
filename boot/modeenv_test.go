@@ -23,7 +23,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -209,7 +208,7 @@ base_status=try
 	err = dupDiskModeenv.Write()
 	c.Assert(err, IsNil)
 	c.Assert(dirs.SnapModeenvFileUnder(s.tmpdir), testutil.FilePresent)
-	origBytes, err := ioutil.ReadFile(dirs.SnapModeenvFileUnder(s.tmpdir) + ".orig")
+	origBytes, err := os.ReadFile(dirs.SnapModeenvFileUnder(s.tmpdir) + ".orig")
 	c.Assert(err, IsNil)
 	// the files should be the same
 	c.Assert(dirs.SnapModeenvFileUnder(s.tmpdir), testutil.FileEquals, string(origBytes))
@@ -974,4 +973,75 @@ func (s *modeenvSuite) TestModeenvAccessFailsDuringPreseeding(c *C) {
 	var modeenv boot.Modeenv
 	err = modeenv.WriteTo(s.tmpdir)
 	c.Assert(err, ErrorMatches, `internal error: modeenv cannot be written during preseeding`)
+}
+
+func (s *modeenvSuite) TestMaybeReadModeenv(c *C) {
+	dirs.SetRootDir(s.tmpdir)
+	defer dirs.SetRootDir("")
+
+	// no modeenv
+	modeenv, err := boot.ReadModeenv("")
+	c.Assert(err, NotNil)
+	c.Assert(os.IsNotExist(err), Equals, true)
+	c.Check(modeenv, IsNil)
+
+	// still no modeenv
+	modeenv, err = boot.MaybeReadModeenv()
+	c.Assert(err, IsNil)
+	c.Check(modeenv, IsNil)
+
+	s.makeMockModeenvFile(c, `mode=run
+model=canonical/ubuntu-core-20-amd64
+classic=true
+`)
+
+	modeenv, err = boot.MaybeReadModeenv()
+	c.Assert(err, IsNil)
+	c.Assert(modeenv, NotNil)
+	c.Check(modeenv.Mode, Equals, boot.ModeRun)
+}
+
+func (s *modeenvSuite) TestSystemMode(c *C) {
+	dirs.SetRootDir(s.tmpdir)
+	defer dirs.SetRootDir("")
+
+	// no modeenv
+	mode, exp, err := boot.SystemMode("mock-fallback")
+	c.Assert(err, IsNil)
+	c.Check(exp, Equals, false)
+	c.Check(mode, Equals, "mock-fallback")
+
+	// no modeenv, but also empty fallback
+	mode, exp, err = boot.SystemMode("")
+	c.Assert(err, IsNil)
+	c.Check(exp, Equals, false)
+	// is returned as is
+	c.Check(mode, Equals, "")
+
+	s.makeMockModeenvFile(c, `mode=run
+model=canonical/ubuntu-core-20-amd64
+`)
+
+	mode, exp, err = boot.SystemMode("")
+	c.Assert(err, IsNil)
+	c.Check(exp, Equals, true)
+	c.Check(mode, Equals, boot.ModeRun)
+
+	s.makeMockModeenvFile(c, `mode=recover
+recovery_system=20191126
+`)
+
+	mode, exp, err = boot.SystemMode("")
+	c.Assert(err, IsNil)
+	c.Check(exp, Equals, true)
+	c.Check(mode, Equals, boot.ModeRecover)
+
+	s.makeMockModeenvFile(c, `mode=factory-reset
+recovery_system=20191126
+`)
+
+	mode, exp, err = boot.SystemMode("")
+	c.Assert(err, IsNil)
+	c.Check(exp, Equals, true)
+	c.Check(mode, Equals, boot.ModeFactoryReset)
 }

@@ -76,7 +76,14 @@ func Panicf(format string, v ...interface{}) {
 // Noticef notifies the user of something
 func Noticef(format string, v ...interface{}) {
 	msg := fmt.Sprintf(format, v...)
+	lock.Lock()
+	defer lock.Unlock()
 
+	logger.Notice(msg)
+}
+
+// Notice notifies the user of something
+func Notice(msg string) {
 	lock.Lock()
 	defer lock.Unlock()
 
@@ -86,7 +93,14 @@ func Noticef(format string, v ...interface{}) {
 // Debugf records something in the debug log
 func Debugf(format string, v ...interface{}) {
 	msg := fmt.Sprintf(format, v...)
+	lock.Lock()
+	defer lock.Unlock()
 
+	logger.Debug(msg)
+}
+
+// Debug records something in the debug log
+func Debug(msg string) {
 	lock.Lock()
 	defer lock.Unlock()
 
@@ -106,9 +120,19 @@ func NoGuardDebugf(format string, v ...interface{}) {
 // MockLogger replaces the existing logger with a buffer and returns
 // the log buffer and a restore function.
 func MockLogger() (buf *bytes.Buffer, restore func()) {
+	return mockLogger(&LoggerOptions{})
+}
+
+// MockDebugLogger replaces the existing logger with a buffer and returns
+// the log buffer and a restore function. The logger records debug messages.
+func MockDebugLogger() (buf *bytes.Buffer, restore func()) {
+	return mockLogger(&LoggerOptions{ForceDebug: true})
+}
+
+func mockLogger(opts *LoggerOptions) (buf *bytes.Buffer, restore func()) {
 	buf = &bytes.Buffer{}
 	oldLogger := logger
-	l, err := New(buf, DefaultFlags)
+	l, err := New(buf, DefaultFlags, opts)
 	if err != nil {
 		panic(err)
 	}
@@ -149,28 +173,44 @@ func (l *Log) debugEnabled() bool {
 // Debug only prints if SNAPD_DEBUG is set
 func (l *Log) Debug(msg string) {
 	if l.debugEnabled() {
-		l.NoGuardDebug(msg)
+		// this frame + single package level API func() + actual caller
+		calldepth := 1 + 1 + 1
+		l.log.Output(calldepth, "DEBUG: "+msg)
 	}
 }
 
 // Notice alerts the user about something, as well as putting in syslog
 func (l *Log) Notice(msg string) {
 	if !l.quiet || l.debugEnabled() {
-		l.log.Output(3, msg)
+		// this frame + single package level API func() + actual caller
+		calldepth := 1 + 1 + 1
+		l.log.Output(calldepth, msg)
 	}
 }
 
 // NoGuardDebug always prints the message, w/o gating it based on environment
 // variables or other configurations.
 func (l *Log) NoGuardDebug(msg string) {
-	l.log.Output(3, "DEBUG: "+msg)
+	// this frame + single package level API func() + actual caller
+	calldepth := 1 + 1 + 1
+	l.log.Output(calldepth, "DEBUG: "+msg)
 }
 
-// New creates a log.Logger using the given io.Writer and flag.
-func New(w io.Writer, flag int) (Logger, error) {
+type LoggerOptions struct {
+	// ForceDebug can be set if we want debug traces even if not directly
+	// enabled by environment or kernel command line.
+	ForceDebug bool
+}
+
+// New creates a log.Logger using the given io.Writer and flag, using the
+// options from opts.
+func New(w io.Writer, flag int, opts *LoggerOptions) (Logger, error) {
+	if opts == nil {
+		opts = &LoggerOptions{}
+	}
 	logger := &Log{
 		log:   log.New(w, "", flag),
-		debug: debugEnabledOnKernelCmdline(),
+		debug: opts.ForceDebug || debugEnabledOnKernelCmdline(),
 	}
 	return logger, nil
 }
@@ -185,9 +225,9 @@ func buildFlags() int {
 }
 
 // SimpleSetup creates the default (console) logger
-func SimpleSetup() error {
+func SimpleSetup(opts *LoggerOptions) error {
 	flags := buildFlags()
-	l, err := New(os.Stderr, flags)
+	l, err := New(os.Stderr, flags, opts)
 	if err == nil {
 		SetLogger(l)
 	}

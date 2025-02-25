@@ -323,7 +323,7 @@ func init() {
 	defaultConfig.DetailFields = jsonutil.StructFields((*snapDetails)(nil), "snap_yaml_raw")
 	defaultConfig.InfoFields = jsonutil.StructFields((*storeSnap)(nil), "snap-yaml")
 	defaultConfig.FindFields = append(jsonutil.StructFields((*storeSnap)(nil),
-		"architectures", "created-at", "epoch", "name", "snap-id", "snap-yaml"),
+		"architectures", "created-at", "epoch", "name", "snap-id", "snap-yaml", "resources"),
 		"channel")
 }
 
@@ -614,6 +614,13 @@ func (r *requestOptions) addHeader(k, v string) {
 	r.ExtraHeaders[k] = v
 }
 
+// iconRequestOptions specifies parameters for icon requests, which do not
+// require headers related to the store or snap. Just an ordinary GET request.
+type iconRequestOptions struct {
+	url  *url.URL
+	etag string
+}
+
 func cancelled(ctx context.Context) bool {
 	select {
 	case <-ctx.Done():
@@ -764,6 +771,26 @@ func (s *Store) doRequest(ctx context.Context, client *http.Client, reqOptions *
 
 		return resp, err
 	}
+}
+
+// doIconRequest does an unauthenticated GET request to the given URL.
+func doIconRequest(ctx context.Context, client *http.Client, reqOptions iconRequestOptions) (*http.Response, error) {
+	var body io.Reader // empty body
+	req, err := http.NewRequestWithContext(ctx, "GET", reqOptions.url.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	if reqOptions.etag != "" {
+		req.Header.Set("If-None-Match", reqOptions.etag)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	return resp, err
 }
 
 func (s *Store) buildLocationString() (string, error) {
@@ -1560,7 +1587,7 @@ func (s *Store) ReadyToBuy(user *auth.UserState) error {
 
 // abbreviated info structs just for the download info
 type storeInfoChannelAbbrev struct {
-	Download storeSnapDownload `json:"download"`
+	Download storeDownload `json:"download"`
 }
 
 type storeInfoAbbrev struct {

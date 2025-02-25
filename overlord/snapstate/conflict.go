@@ -66,17 +66,22 @@ var (
 	affectedSnapsByKind = make(map[string]AffectedSnapsFunc)
 )
 
-// RegisterAffectedSnapsByAttr registers an AffectedSnapsFunc for returning the affected snaps for tasks sporting the given identifying attribute, to use in conflicts detection.
+// RegisterAffectedSnapsByAttr registers an AffectedSnapsFunc for returning the
+// affected snaps for tasks sporting the given identifying attribute, to use in
+// conflicts detection.
 func RegisterAffectedSnapsByAttr(attr string, f AffectedSnapsFunc) {
 	affectedSnapsByAttr[attr] = f
 }
 
-// RegisterAffectedSnapsByKind registers an AffectedSnapsFunc for returning the affected snaps for tasks of the given kind, to use in conflicts detection. Whenever possible using RegisterAffectedSnapsByAttr should be preferred.
+// RegisterAffectedSnapsByKind registers an AffectedSnapsFunc for returning the
+// affected snaps for tasks of the given kind, to use in conflicts detection.
+// Whenever possible using RegisterAffectedSnapsByAttr should be preferred.
 func RegisterAffectedSnapsByKind(kind string, f AffectedSnapsFunc) {
 	affectedSnapsByKind[kind] = f
 }
 
-func affectedSnaps(t *state.Task) ([]string, error) {
+// SnapsAffectedByTask returns a list of names of snaps affected by the given task.
+func SnapsAffectedByTask(t *state.Task) ([]string, error) {
 	// snapstate's own styled tasks
 	if t.Has("snap-setup") || t.Has("snap-setup-task") {
 		snapsup, err := TaskSnapSetup(t)
@@ -281,7 +286,7 @@ func CheckChangeConflictMany(st *state.State, instanceNames []string, ignoreChan
 			continue
 		}
 
-		snaps, err := affectedSnaps(task)
+		snaps, err := SnapsAffectedByTask(task)
 		if err != nil {
 			return err
 		}

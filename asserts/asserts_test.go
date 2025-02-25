@@ -51,8 +51,9 @@ func (as *assertsSuite) TestTypeNames(c *C) {
 		"account",
 		"account-key",
 		"account-key-request",
-		"aspect-bundle",
 		"base-declaration",
+		"confdb",
+		"confdb-control",
 		"device-session-request",
 		"model",
 		"preseed",
@@ -85,7 +86,7 @@ func (as *assertsSuite) TestMaxSupportedFormats(c *C) {
 	systemUserMaxFormat := asserts.SystemUserType.MaxSupportedFormat()
 	// validity
 	c.Check(accountKeyMaxFormat >= 1, Equals, true)
-	c.Check(snapDeclMaxFormat >= 4, Equals, true)
+	c.Check(snapDeclMaxFormat >= 6, Equals, true)
 	c.Check(systemUserMaxFormat >= 2, Equals, true)
 	c.Check(asserts.MaxSupportedFormats(1), DeepEquals, map[string]int{
 		"account-key":      accountKeyMaxFormat,
@@ -1190,7 +1191,6 @@ func (as *assertsSuite) TestWithAuthority(c *C) {
 	withAuthority := []string{
 		"account",
 		"account-key",
-		"aspect-bundle",
 		"base-declaration",
 		"store",
 		"snap-declaration",
@@ -1201,16 +1201,18 @@ func (as *assertsSuite) TestWithAuthority(c *C) {
 		"snap-developer",
 		"model",
 		"preseed",
+		"confdb",
 		"serial",
 		"system-user",
 		"validation",
 		"validation-set",
 		"repair",
 	}
-	c.Check(withAuthority, HasLen, asserts.NumAssertionType-3) // excluding device-session-request, serial-request, account-key-request
+	// excluding device-session-request, serial-request, account-key-request, confdb-control
+	c.Check(withAuthority, HasLen, asserts.NumAssertionType-4)
 	for _, name := range withAuthority {
 		typ := asserts.Type(name)
-		_, err := asserts.AssembleAndSignInTest(typ, nil, nil, testPrivKey1)
+		_, err := asserts.AssembleAndSignInTest(typ, nil, []byte("{}"), testPrivKey1)
 		c.Check(err, ErrorMatches, `"authority-id" header is mandatory`)
 	}
 }

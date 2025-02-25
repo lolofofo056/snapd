@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2021 Canonical Ltd
+ * Copyright (C) 2021-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -20,7 +20,10 @@
 package daemon
 
 import (
+	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 
 	"github.com/snapcore/snapd/client"
@@ -31,11 +34,14 @@ import (
 	"github.com/snapcore/snapd/overlord/ifacestate"
 	"github.com/snapcore/snapd/polkit"
 	"github.com/snapcore/snapd/sandbox/cgroup"
+	"github.com/snapcore/snapd/strutil"
 )
 
 var polkitCheckAuthorization = polkit.CheckAuthorization
 
 var checkPolkitAction = checkPolkitActionImpl
+
+var osReadlink = os.Readlink
 
 func checkPolkitActionImpl(r *http.Request, ucred *ucrednet, action string) *apiError {
 	var flags polkit.CheckFlags
@@ -160,7 +166,31 @@ var (
 	requireInterfaceApiAccess = requireInterfaceApiAccessImpl
 )
 
-func requireInterfaceApiAccessImpl(d *Daemon, r *http.Request, ucred *ucrednet, interfaceName string) *apiError {
+type interfaceAccessReqs struct {
+	// Interfaces is a list of interfaces, at least one of which must be
+	// connected
+	Interfaces []string
+
+	// Slot when true, the snap must appear on the slot side
+	Slot bool
+	// Plug when true, the snap must appear on the plug side
+	Plug bool
+}
+
+func requireInterfaceApiAccessImpl(d *Daemon, r *http.Request,
+	ucred *ucrednet, req interfaceAccessReqs,
+) *apiError {
+	if !req.Slot && !req.Plug {
+		return InternalError("required connection side is unspecified")
+	}
+	if req.Slot && req.Plug {
+		return InternalError("snap cannot be specified on both sides of the connection")
+	}
+
+	if len(req.Interfaces) == 0 {
+		return InternalError("interfaces access check, but interfaces list is empty")
+	}
+
 	if ucred == nil {
 		return Forbidden("access denied")
 	}
@@ -189,44 +219,58 @@ func requireInterfaceApiAccessImpl(d *Daemon, r *http.Request, ucred *ucrednet, 
 	if err != nil {
 		return Forbidden("internal error: cannot get connections: %s", err)
 	}
+	foundMatchingInterface := false
 	for refStr, connState := range conns {
-		if !connState.Active() || connState.Interface != interfaceName {
+		if !connState.Active() || !strutil.ListContains(req.Interfaces, connState.Interface) {
 			continue
 		}
 		connRef, err := interfaces.ParseConnRef(refStr)
 		if err != nil {
 			return Forbidden("internal error: %s", err)
 		}
-		if connRef.PlugRef.Snap == snapName {
-			r.RemoteAddr = ucrednetAttachInterface(r.RemoteAddr, interfaceName)
-			return nil
+		matchOnSlot := req.Slot && connRef.SlotRef.Snap == snapName
+		matchOnPlug := req.Plug && connRef.PlugRef.Snap == snapName
+		if matchOnPlug || matchOnSlot {
+			r.RemoteAddr = ucrednetAttachInterface(r.RemoteAddr, connState.Interface)
+			// Do not return here, but keep processing connections for the side
+			// effect of attaching all connected interfaces we asked for to the
+			// remote address.
+			foundMatchingInterface = true
 		}
+	}
+	if foundMatchingInterface {
+		return nil
 	}
 	return Forbidden("access denied")
 }
 
 // interfaceOpenAccess behaves like openAccess, but allows requests from
-// snapd-snap.socket for snaps that plug the provided interface.
+// snapd-snap.socket for snaps that plug one of the provided interfaces.
 type interfaceOpenAccess struct {
-	// TODO: allow a list of interfaces
-	Interface string
+	Interfaces []string
 }
 
 func (ac interfaceOpenAccess) CheckAccess(d *Daemon, r *http.Request, ucred *ucrednet, user *auth.UserState) *apiError {
-	return requireInterfaceApiAccess(d, r, ucred, ac.Interface)
+	return requireInterfaceApiAccess(d, r, ucred, interfaceAccessReqs{
+		Interfaces: ac.Interfaces,
+		Plug:       true,
+	})
 }
 
 // interfaceAuthenticatedAccess behaves like authenticatedAccess, but
-// allows requests from snapd-snap.socket that plug the provided
-// interface.
+// allows requests from snapd-snap.socket that plug one of the provided
+// interfaces.
 type interfaceAuthenticatedAccess struct {
-	// TODO: allow a list of interfaces
-	Interface string
-	Polkit    string
+	Interfaces []string
+	Polkit     string
 }
 
 func (ac interfaceAuthenticatedAccess) CheckAccess(d *Daemon, r *http.Request, ucred *ucrednet, user *auth.UserState) *apiError {
-	if rspe := requireInterfaceApiAccess(d, r, ucred, ac.Interface); rspe != nil {
+	rspe := requireInterfaceApiAccess(d, r, ucred, interfaceAccessReqs{
+		Interfaces: ac.Interfaces,
+		Plug:       true,
+	})
+	if rspe != nil {
 		return rspe
 	}
 
@@ -248,4 +292,65 @@ func (ac interfaceAuthenticatedAccess) CheckAccess(d *Daemon, r *http.Request, u
 	}
 
 	return Unauthorized("access denied")
+}
+
+// interfaceProviderRootAccess behaves like rootAccess, but also allows requests
+// over snapd-snap.socket for snaps that have a connection of specific interface
+// and are present on the slot side of that connection.
+type interfaceProviderRootAccess struct {
+	Interfaces []string
+}
+
+func (ac interfaceProviderRootAccess) CheckAccess(d *Daemon, r *http.Request, ucred *ucrednet, user *auth.UserState) *apiError {
+	rsperr := requireInterfaceApiAccess(d, r, ucred, interfaceAccessReqs{
+		Interfaces: ac.Interfaces,
+		Slot:       true,
+	})
+	if rsperr != nil {
+		return rsperr
+	}
+
+	if ucred.Uid == 0 {
+		return nil
+	}
+
+	return Unauthorized("access denied")
+}
+
+// isRequestFromSnapCmd checks that the request is coming from snap command.
+//
+// It checks that the request process "/proc/PID/exe" points to one of the
+// known locations of the snap command. This not a security-oriented check.
+func isRequestFromSnapCmd(r *http.Request) (bool, error) {
+	ucred, err := ucrednetGet(r.RemoteAddr)
+	if err != nil {
+		return false, err
+	}
+	exe, err := osReadlink(fmt.Sprintf("/proc/%d/exe", ucred.Pid))
+	if err != nil {
+		return false, err
+	}
+
+	// SNAP_REEXEC=0
+	if exe == filepath.Join(dirs.GlobalRootDir, "/usr/bin/snap") {
+		return true, nil
+	}
+
+	// Check if re-exec in snapd
+	path := filepath.Join(dirs.SnapMountDir, "snapd/*/usr/bin/snap")
+	if matched, err := filepath.Match(path, exe); err != nil {
+		return false, err
+	} else if matched {
+		return true, nil
+	}
+
+	// Check if re-exec in core
+	path = filepath.Join(dirs.SnapMountDir, "core/*/usr/bin/snap")
+	if matched, err := filepath.Match(path, exe); err != nil {
+		return false, err
+	} else if matched {
+		return true, nil
+	}
+
+	return false, nil
 }

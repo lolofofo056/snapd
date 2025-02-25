@@ -1,13 +1,27 @@
 summary: Ensure that the core.proxy.* settings are honored without core
 
+details: |
+  Snapd provides the core.proxy.* config which can be used to setup the proxy used.
+
+  This test verifies that when a proxy config is set, the snapd commands go through
+  the proxy. In this scenario it is verified that snap install works even without
+  an installed core (to install core).
+
 # only needs a test on classic
 systems: [ubuntu-16.04-64, ubuntu-18.04-64]
 
 prepare: |
-    # Make sure there is not any .partial for the core snap to be resumed,
-    # otherwise it is not going to use the proxy to download it. The .partial
-    # file is being automatically restored with the snapd state.
+    # Ensure there is no .partial for the core snap to be resumed, otherwise
+    # it is not going to use the proxy to download it. The .partial file is
+    # being automatically restored with the snapd state.
     rm -f /var/lib/snapd/snaps/core_*.partial
+
+    # Ensure core snap is not available in cache, otherwise it is not going
+    # to use the proxy to download it.
+    find /var/lib/snapd/snaps -name "core_*.snap" -printf "%i\n" -delete | \
+    while read -r inum ; do
+        find /var/lib/snapd/cache -inum "$inum" -delete
+    done
 
 restore: |
     iptables -D OUTPUT -m owner --uid-owner "$(id -u test)" -j ACCEPT -p tcp

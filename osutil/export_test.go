@@ -22,14 +22,13 @@ package osutil
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
-	"os/user"
 	"syscall"
 	"time"
 
 	"github.com/snapcore/snapd/osutil/sys"
+	"github.com/snapcore/snapd/osutil/user"
 	"github.com/snapcore/snapd/strutil"
 	"github.com/snapcore/snapd/testutil"
 )
@@ -73,13 +72,6 @@ func MockSyscallSettimeofday(f func(*syscall.Timeval) error) (restore func()) {
 	return func() {
 		syscallSettimeofday = old
 	}
-}
-
-func MockUserLookup(mock func(name string) (*user.User, error)) func() {
-	realUserLookup := userLookup
-	userLookup = mock
-
-	return func() { userLookup = realUserLookup }
 }
 
 func MockUserCurrent(mock func() (*user.User, error)) func() {
@@ -184,7 +176,7 @@ func MockOsReadlink(f func(string) (string, error)) func() {
 // MockEtcFstab mocks content of /etc/fstab read by IsHomeUsingNFS
 func MockEtcFstab(text string) (restore func()) {
 	old := etcFstab
-	f, err := ioutil.TempFile("", "fstab")
+	f, err := os.CreateTemp("", "fstab")
 	if err != nil {
 		panic(fmt.Errorf("cannot open temporary file: %s", err))
 	}
@@ -228,7 +220,7 @@ func MockFindGidNoFallback(mock func(name string) (uint64, error)) (restore func
 	return func() { findGidNoGetentFallback = old }
 }
 
-const MaxSymlinkTries = maxSymlinkTries
+const MaxLinkTries = maxLinkTries
 
 var ParseRawEnvironment = parseRawEnvironment
 
@@ -246,4 +238,8 @@ func ParseRawExpandableEnv(entries []string) (ExpandableEnv, error) {
 		om.Set(key, value)
 	}
 	return ExpandableEnv{OrderedMap: om}, nil
+}
+
+func ReadGoBuildID(fname string) (string, error) {
+	return readGenericBuildID(fname, goElfNote, goHdrType)
 }

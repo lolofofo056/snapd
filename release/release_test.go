@@ -21,7 +21,6 @@ package release_test
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
@@ -45,11 +44,7 @@ func (s *ReleaseTestSuite) TestSetup(c *C) {
 	c.Check(release.Series, Equals, "16")
 }
 
-func mockOSRelease(c *C) string {
-	// FIXME: use AddCleanup here once available so that we
-	//        can do release.SetLSBReleasePath() here directly
-	mockOSRelease := filepath.Join(c.MkDir(), "mock-os-release")
-	s := `
+const refMockOSRelease = `
 NAME="Ubuntu"
 VERSION="18.09 (Awesome Artichoke)"
 ID=ubuntu
@@ -60,16 +55,28 @@ HOME_URL="http://www.ubuntu.com/"
 SUPPORT_URL="http://help.ubuntu.com/"
 BUG_REPORT_URL="http://bugs.launchpad.net/ubuntu/"
 `
-	err := os.WriteFile(mockOSRelease, []byte(s), 0644)
-	c.Assert(err, IsNil)
 
-	return mockOSRelease
+const refMockUbuntuCoreInitrdRelease = `
+NAME="Ubuntu Core Initramfs"
+VERSION="1"
+ID=ubuntucoreinitramfs
+PRETTY_NAME="Ubuntu Core Initramfs Kelly's Eye - Number One"
+VERSION_ID="1"
+VERSION_CODENAME=keelyseye
+`
+
+func mockOSRelease(c *C, root string, filesWithContent [][]string) {
+	for _, e := range filesWithContent {
+		target := filepath.Join(root, e[0])
+		c.Assert(os.MkdirAll(filepath.Dir(target), 0o755), IsNil)
+		c.Assert(os.WriteFile(target, []byte(e[1]), 0o644), IsNil)
+	}
 }
 
 // MockFilesystemRootType changes relase.ProcMountsPath so that it points to a temp file
 // generated to contain the provided filesystem type
 func MockFilesystemRootType(c *C, fsType string) (restorer func()) {
-	tmpfile, err := ioutil.TempFile(c.MkDir(), "proc_mounts_mock_")
+	tmpfile, err := os.CreateTemp(c.MkDir(), "proc_mounts_mock_")
 	c.Assert(err, IsNil)
 
 	// Sample contents of /proc/mounts. The second line is the one that matters.
@@ -110,16 +117,67 @@ func mockWSLsetup(c *C, settings mockWsl) func() {
 }
 
 func (s *ReleaseTestSuite) TestReadOSRelease(c *C) {
-	reset := release.MockOSReleasePath(mockOSRelease(c))
-	defer reset()
+	root := c.MkDir()
+	mockOSRelease(c, root, [][]string{
+		{"/etc/os-release", refMockOSRelease},
+	})
 
-	os := release.ReadOSRelease()
+	os := release.ReadOSReleaseFromRoot(root)
 	c.Check(os.ID, Equals, "ubuntu")
 	c.Check(os.VersionID, Equals, "18.09")
 }
 
+func (s *ReleaseTestSuite) TestReadOSReleaseSymlink(c *C) {
+	root := c.MkDir()
+	mockOSRelease(c, root, [][]string{
+		{"/etc/mock-release", refMockOSRelease},
+	})
+
+	// now try again but with a symlink
+	c.Assert(os.Symlink("mock-release", filepath.Join(root, "/etc/os-release")), IsNil)
+
+	osRel := release.ReadOSReleaseFromRoot(root)
+	c.Check(osRel.ID, Equals, "ubuntu")
+	c.Check(osRel.VersionID, Equals, "18.09")
+}
+
+func (s *ReleaseTestSuite) TestReadOSReleaseFallback(c *C) {
+	root := c.MkDir()
+	mockOSRelease(c, root, [][]string{
+		{"/usr/lib/os-release", refMockOSRelease},
+	})
+
+	os := release.ReadOSReleaseFromRoot(root)
+	c.Check(os.ID, Equals, "ubuntu")
+	c.Check(os.VersionID, Equals, "18.09")
+}
+
+func (s *ReleaseTestSuite) TestReadOSReleaseInitrdDirect(c *C) {
+	root := c.MkDir()
+	mockOSRelease(c, root, [][]string{
+		{"/etc/initrd-release", refMockUbuntuCoreInitrdRelease},
+	})
+
+	os := release.ReadOSReleaseFromRoot(root)
+	c.Check(os.ID, Equals, "ubuntucoreinitramfs")
+	c.Check(os.VersionID, Equals, "1")
+}
+
+func (s *ReleaseTestSuite) TestReadOSReleaseInitrdSymlink(c *C) {
+	root := c.MkDir()
+	mockOSRelease(c, root, [][]string{
+		{"/etc/mock-initrd-release", refMockUbuntuCoreInitrdRelease},
+	})
+
+	// now try again but with a symlink
+	c.Assert(os.Symlink("mock-initrd-release", filepath.Join(root, "/etc/os-release")), IsNil)
+
+	osRel := release.ReadOSReleaseFromRoot(root)
+	c.Check(osRel.ID, Equals, "ubuntucoreinitramfs")
+	c.Check(osRel.VersionID, Equals, "1")
+}
+
 func (s *ReleaseTestSuite) TestReadWonkyOSRelease(c *C) {
-	mockOSRelease := filepath.Join(c.MkDir(), "mock-os-release")
 	dump := `NAME="elementary OS"
 VERSION="0.4 Loki"
 ID="elementary OS"
@@ -129,71 +187,66 @@ VERSION_ID="0.4"
 HOME_URL="http://elementary.io/"
 SUPPORT_URL="http://elementary.io/support/"
 BUG_REPORT_URL="https://bugs.launchpad.net/elementary/+filebug"`
-	err := os.WriteFile(mockOSRelease, []byte(dump), 0644)
-	c.Assert(err, IsNil)
 
-	reset := release.MockOSReleasePath(mockOSRelease)
-	defer reset()
+	root := c.MkDir()
+	mockOSRelease(c, root, [][]string{
+		{"/etc/os-release", dump},
+	})
 
-	os := release.ReadOSRelease()
+	os := release.ReadOSReleaseFromRoot(root)
 	c.Check(os.ID, Equals, "elementary")
 	c.Check(os.VersionID, Equals, "0.4")
 }
 
 func (s *ReleaseTestSuite) TestFamilyOSRelease(c *C) {
-	mockOSRelease := filepath.Join(c.MkDir(), "mock-os-release")
-	dump := `NAME="CentOS Linux"
-VERSION="7 (Core)"
+	dump := `NAME="CentOS Stream"
+VERSION="9"
 ID="centos"
 ID_LIKE="rhel fedora"
-VERSION_ID="7"
-PRETTY_NAME="CentOS Linux 7 (Core)"
+VERSION_ID="9"
+PLATFORM_ID="platform:el9"
+PRETTY_NAME="CentOS Stream 9"
 ANSI_COLOR="0;31"
-CPE_NAME="cpe:/o:centos:centos:7"
-HOME_URL="https://www.centos.org/"
-BUG_REPORT_URL="https://bugs.centos.org/"
+LOGO="fedora-logo-icon"
+CPE_NAME="cpe:/o:centos:centos:9"
+HOME_URL="https://centos.org/"
+BUG_REPORT_URL="https://issues.redhat.com/"
+REDHAT_SUPPORT_PRODUCT="Red Hat Enterprise Linux 9"
+REDHAT_SUPPORT_PRODUCT_VERSION="CentOS Stream"`
 
-CENTOS_MANTISBT_PROJECT="CentOS-7"
-CENTOS_MANTISBT_PROJECT_VERSION="7"
-REDHAT_SUPPORT_PRODUCT="centos"
-REDHAT_SUPPORT_PRODUCT_VERSION="7"`
-	err := os.WriteFile(mockOSRelease, []byte(dump), 0644)
-	c.Assert(err, IsNil)
+	root := c.MkDir()
+	mockOSRelease(c, root, [][]string{
+		{"/etc/os-release", dump},
+	})
 
-	reset := release.MockOSReleasePath(mockOSRelease)
-	defer reset()
-
-	os := release.ReadOSRelease()
+	os := release.ReadOSReleaseFromRoot(root)
 	c.Check(os.ID, Equals, "centos")
-	c.Check(os.VersionID, Equals, "7")
+	c.Check(os.VersionID, Equals, "9")
 	c.Check(os.IDLike, DeepEquals, []string{"rhel", "fedora"})
 }
 
 func (s *ReleaseTestSuite) TestUbuntuCoreVariantRelease(c *C) {
-	mockOSRelease := filepath.Join(c.MkDir(), "mock-os-release")
 	dump := `NAME="Ubuntu Core Desktop"
 VERSION="22"
 ID="ubuntu-core"
 VARIANT_ID="desktop"
 VERSION_ID="22"
 "`
-	err := os.WriteFile(mockOSRelease, []byte(dump), 0644)
-	c.Assert(err, IsNil)
 
-	reset := release.MockOSReleasePath(mockOSRelease)
-	defer reset()
+	root := c.MkDir()
+	mockOSRelease(c, root, [][]string{
+		{"/etc/os-release", dump},
+	})
 
-	os := release.ReadOSRelease()
+	os := release.ReadOSReleaseFromRoot(root)
 	c.Check(os.ID, Equals, "ubuntu-core")
 	c.Check(os.VariantID, Equals, "desktop")
 	c.Check(os.VersionID, Equals, "22")
 }
 
 func (s *ReleaseTestSuite) TestReadOSReleaseNotFound(c *C) {
-	reset := release.MockOSReleasePath("not-there")
-	defer reset()
-
-	os := release.ReadOSRelease()
+	root := c.MkDir()
+	os := release.ReadOSReleaseFromRoot(root)
 	c.Assert(os, DeepEquals, release.OS{ID: "linux"})
 }
 

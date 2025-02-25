@@ -31,21 +31,26 @@ import (
 	"github.com/snapcore/snapd/store"
 	"github.com/snapcore/snapd/testutil"
 	userclient "github.com/snapcore/snapd/usersession/client"
+	"github.com/snapcore/snapd/wrappers"
 )
 
 type (
 	ManagerBackend managerBackend
 
 	MinimalInstallInfo  = minimalInstallInfo
+	SnapUpdate          = update
 	InstallSnapInfo     = installSnapInfo
-	ByType              = byType
 	DirMigrationOptions = dirMigrationOptions
 	Migration           = migration
 
 	ReRefreshSetup = reRefreshSetup
 
 	TooSoonError = tooSoonError
+
+	Target = target
 )
+
+var ComponentSetupTask = componentSetupTask
 
 const (
 	None         = none
@@ -67,10 +72,10 @@ func MockSnapReadInfo(mock func(name string, si *snap.SideInfo) (*snap.Info, err
 	return func() { snapReadInfo = old }
 }
 
-func MockReadComponentInfo(mock func(compMntDir string) (*snap.ComponentInfo, error)) (restore func()) {
-	old := readComponentInfo
-	readComponentInfo = mock
-	return func() { readComponentInfo = old }
+func MockReadComponentInfo(mock func(compMntDir string, snapInfo *snap.Info, csi *snap.ComponentSideInfo) (*snap.ComponentInfo, error)) (restore func()) {
+	old := readComponentInfoAt
+	readComponentInfoAt = mock
+	return func() { readComponentInfoAt = old }
 }
 
 func MockMountPollInterval(intv time.Duration) (restore func()) {
@@ -136,6 +141,8 @@ var (
 	ArrangeSnapToWaitForBaseIfPresent    = arrangeSnapToWaitForBaseIfPresent
 	ArrangeSnapTaskSetsLinkageAndRestart = arrangeSnapTaskSetsLinkageAndRestart
 	ReRefreshSummary                     = reRefreshSummary
+
+	MaybeFindTasksetForSnap = maybeFindTasksetForSnap
 )
 
 const (
@@ -162,6 +169,11 @@ var (
 // dbus
 var (
 	CheckDBusServiceConflicts = checkDBusServiceConflicts
+)
+
+// desktop-file-ids
+var (
+	CheckDesktopFileIDsConflicts = checkDesktopFileIDsConflicts
 )
 
 // readme files
@@ -269,11 +281,27 @@ func MockLocalInstallLastCleanup(t time.Time) (restore func()) {
 	}
 }
 
-func MockAsyncPendingRefreshNotification(fn func(context.Context, *userclient.Client, *userclient.PendingSnapRefreshInfo)) (restore func()) {
+func MockAsyncPendingRefreshNotification(fn func(context.Context, *userclient.PendingSnapRefreshInfo)) (restore func()) {
 	old := asyncPendingRefreshNotification
 	asyncPendingRefreshNotification = fn
 	return func() {
 		asyncPendingRefreshNotification = old
+	}
+}
+
+func MockHasActiveConnection(fn func(st *state.State, iface string) (bool, error)) (restore func()) {
+	old := HasActiveConnection
+	HasActiveConnection = fn
+	return func() {
+		HasActiveConnection = old
+	}
+}
+
+func MockOnRefreshInhibitionTimeout(fn func(chg *state.Change, snapName string) error) (restore func()) {
+	old := onRefreshInhibitionTimeout
+	onRefreshInhibitionTimeout = fn
+	return func() {
+		onRefreshInhibitionTimeout = old
 	}
 }
 
@@ -304,15 +332,7 @@ func MockReRefreshRetryTimeout(d time.Duration) (restore func()) {
 	}
 }
 
-// aux store info
-var (
-	AuxStoreInfoFilename = auxStoreInfoFilename
-	RetrieveAuxStoreInfo = retrieveAuxStoreInfo
-	KeepAuxStoreInfo     = keepAuxStoreInfo
-	DiscardAuxStoreInfo  = discardAuxStoreInfo
-)
-
-type AuxStoreInfo = auxStoreInfo
+type DisabledServices = disabledServices
 
 // link, misc handlers
 var (
@@ -367,7 +387,7 @@ func MockInstallSize(f func(st *state.State, snaps []minimalInstallInfo, userID 
 	}
 }
 
-func MockGenerateSnapdWrappers(f func(snapInfo *snap.Info, opts *backend.GenerateSnapdWrappersOptions) error) func() {
+func MockGenerateSnapdWrappers(f func(snapInfo *snap.Info, opts *backend.GenerateSnapdWrappersOptions) (wrappers.SnapdRestart, error)) func() {
 	old := generateSnapdWrappers
 	generateSnapdWrappers = f
 	return func() {
@@ -381,10 +401,11 @@ var (
 
 // autorefresh
 var (
-	InhibitRefresh               = inhibitRefresh
-	MaxInhibition                = maxInhibition
-	MaxDuration                  = maxDuration
-	MaybeAddRefreshInhibitNotice = maybeAddRefreshInhibitNotice
+	InhibitRefresh                       = inhibitRefresh
+	MaxDuration                          = maxDuration
+	MaxInhibitionDuration                = maxInhibitionDuration
+	MaybeAddRefreshInhibitNotice         = maybeAddRefreshInhibitNotice
+	MaybeAsyncPendingRefreshNotification = maybeAsyncPendingRefreshNotification
 )
 
 type RefreshCandidate = refreshCandidate
@@ -548,4 +569,34 @@ func SetRestoredMonitoring(snapmgr *SnapManager, value bool) {
 
 func SetPreseed(snapmgr *SnapManager, value bool) {
 	snapmgr.preseed = value
+}
+
+func SplitEssentialUpdates(deviceCtx DeviceContext, updates []SnapUpdate) (essential, nonEssential []SnapUpdate) {
+	return splitEssentialUpdates(deviceCtx, updates)
+}
+
+func MockAffectedSnapsByAttr(value map[string]AffectedSnapsFunc) (restore func()) {
+	old := affectedSnapsByAttr
+	affectedSnapsByAttr = value
+	return func() {
+		affectedSnapsByAttr = old
+	}
+}
+
+func MockAffectedSnapsByKind(value map[string]AffectedSnapsFunc) (restore func()) {
+	old := affectedSnapsByKind
+	affectedSnapsByKind = value
+	return func() {
+		affectedSnapsByKind = old
+	}
+}
+
+// CustomInstallGoal allows us to define custom implementations of installGoal
+// to be used in tests.
+type CustomInstallGoal struct {
+	ToInstall func(context.Context, *state.State, Options) ([]Target, error)
+}
+
+func (c *CustomInstallGoal) toInstall(ctx context.Context, st *state.State, opts Options) ([]Target, error) {
+	return c.ToInstall(ctx, st, opts)
 }

@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2014-2022 Canonical Ltd
+ * Copyright (C) 2014-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -22,6 +22,7 @@ package boot
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 
 	"github.com/snapcore/snapd/asserts"
@@ -30,6 +31,7 @@ import (
 	"github.com/snapcore/snapd/gadget"
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
+	"github.com/snapcore/snapd/osutil/kcmdline"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/snap/snapfile"
 	"github.com/snapcore/snapd/strutil"
@@ -56,6 +58,18 @@ type BootableSet struct {
 
 	// Recovery is set when making the recovery partition bootable.
 	Recovery bool
+
+	// KernelMods contains kernel-modules components in the system.
+	KernelMods []BootableKModsComponents
+}
+
+// BootableComponent represents kernel-modules components, which are
+// needed as part of a BootableSet.
+type BootableKModsComponents struct {
+	// CompPlaceInfo is used to build the file name with the right revision.
+	CompPlaceInfo snap.ContainerPlaceInfo
+	// CompPath is the path where we will copy the file from.
+	CompPath string
 }
 
 // MakeBootableImage sets up the given bootable set and target filesystem
@@ -332,9 +346,10 @@ type makeRunnableOptions struct {
 	AfterDataReset bool
 	SeedDir        string
 	StateUnlocker  Unlocker
+	UseTokens      bool
 }
 
-func copyBootSnap(orig string, dstInfo *snap.Info, dstSnapBlobDir string) error {
+func copyBootSnap(orig string, filename string, dstSnapBlobDir string) error {
 	// if the source path is a symlink, don't copy the symlink, copy the
 	// target file instead of copying the symlink, as the initramfs won't
 	// follow the symlink when it goes to mount the base and kernel snaps by
@@ -347,17 +362,63 @@ func copyBootSnap(orig string, dstInfo *snap.Info, dstSnapBlobDir string) error 
 		}
 		orig = link
 	}
-	// note that we need to use the "Filename()" here because unasserted
-	// snaps will have names like pc-kernel_5.19.4.snap but snapd expects
-	// "pc-kernel_x1.snap"
-	dst := filepath.Join(dstSnapBlobDir, dstInfo.Filename())
+	dst := filepath.Join(dstSnapBlobDir, filename)
 	if err := osutil.CopyFile(orig, dst, osutil.CopyFlagPreserveAll|osutil.CopyFlagSync); err != nil {
 		return err
 	}
 	return nil
 }
 
-func makeRunnableSystem(model *asserts.Model, bootWith *BootableSet, sealer *TrustedAssetsInstallObserver, makeOpts makeRunnableOptions) error {
+func cryptsetupSupportsTokenReplaceImpl() bool {
+	cmd := exec.Command("cryptsetup", "--test-args", "token", "import", "--token-id", "0", "--token-replace", "/dev/null")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		logger.Noticef("WARNING: cryptsetup does not support option --token-replace: %v: %s", err, out)
+		return false
+	}
+	return true
+}
+
+var cryptsetupSupportsTokenReplace = cryptsetupSupportsTokenReplaceImpl
+
+// UseTokens decides whether KeyData for disk encryption should be
+// stored in the LUKS2 header in tokens. If not it means they should
+// be stored in files in legacy paths.
+func UseTokens(model *asserts.Model) bool {
+	// For now we enable writing key data in tokens only for
+	// classic when it is possible.
+	if model.Classic() {
+		// For classic, we cannot match the version because
+		// the base used in the model does not reflect what is
+		// installed. For some reason new version of hybrid
+		// use core22. So we need to verify that cryptsetup is
+		// new enough. It is likely that the cryptsetup in the
+		// installer will be around the same version as the
+		// one installed, and will contain the same features.
+		return cryptsetupSupportsTokenReplace()
+	} else {
+		if m, err := kcmdline.KeyValues("ubuntu-core.force-experimental-tokens"); err != nil {
+			logger.Noticef("WARNING: error while reading kernel command line: %v", err)
+		} else {
+			value, hasValue := m["ubuntu-core.force-experimental-tokens"]
+			if hasValue {
+				switch value {
+				case "0":
+					return false
+				case "1":
+					return true
+				default:
+					logger.Noticef("WARNING: unexpected value for snapd.force-experimental-tokens")
+				}
+			}
+		}
+
+		// Later we can start to enable tokens on UC24+
+		return false
+	}
+}
+
+func makeRunnableSystem(model *asserts.Model, bootWith *BootableSet, observer TrustedAssetsInstallObserver, makeOpts makeRunnableOptions) error {
 	if model.Grade() == asserts.ModelGradeUnset {
 		return fmt.Errorf("internal error: cannot make pre-UC20 system runnable")
 	}
@@ -372,19 +433,27 @@ func makeRunnableSystem(model *asserts.Model, bootWith *BootableSet, sealer *Tru
 	//   install the boot.sel onto ubuntu-boot directly, but the file should be
 	//   managed by snapd instead
 
-	// copy kernel/base/gadget into the ubuntu-data partition
+	// Copy kernel/base/gadget and kernel-modules components into the
+	// ubuntu-data partition. Note that we need to use the "Filename()"
+	// here because unasserted snaps/components will have names like
+	// pc-kernel_5.19.4.snap but snapd expects "pc-kernel_x1.snap"
 	snapBlobDir := dirs.SnapBlobDirUnder(InstallHostWritableDir(model))
 	if err := os.MkdirAll(snapBlobDir, 0755); err != nil {
 		return err
 	}
 	for _, origDest := range []struct {
 		orig     string
-		destInfo *snap.Info
+		fileName string
 	}{
-		{orig: bootWith.BasePath, destInfo: bootWith.Base},
-		{orig: bootWith.KernelPath, destInfo: bootWith.Kernel},
-		{orig: bootWith.GadgetPath, destInfo: bootWith.Gadget}} {
-		if err := copyBootSnap(origDest.orig, origDest.destInfo, snapBlobDir); err != nil {
+		{orig: bootWith.BasePath, fileName: bootWith.Base.Filename()},
+		{orig: bootWith.KernelPath, fileName: bootWith.Kernel.Filename()},
+		{orig: bootWith.GadgetPath, fileName: bootWith.Gadget.Filename()}} {
+		if err := copyBootSnap(origDest.orig, origDest.fileName, snapBlobDir); err != nil {
+			return err
+		}
+	}
+	for _, kmod := range bootWith.KernelMods {
+		if err := copyBootSnap(kmod.CompPath, kmod.CompPlaceInfo.Filename(), snapBlobDir); err != nil {
 			return err
 		}
 	}
@@ -396,9 +465,15 @@ func makeRunnableSystem(model *asserts.Model, bootWith *BootableSet, sealer *Tru
 
 	var currentTrustedBootAssets bootAssetsMap
 	var currentTrustedRecoveryBootAssets bootAssetsMap
-	if sealer != nil {
-		currentTrustedBootAssets = sealer.currentTrustedBootAssetsMap()
-		currentTrustedRecoveryBootAssets = sealer.currentTrustedRecoveryBootAssetsMap()
+	var observerImpl *trustedAssetsInstallObserverImpl
+	if observer != nil {
+		impl, ok := observer.(*trustedAssetsInstallObserverImpl)
+		if !ok {
+			return fmt.Errorf("internal error: expected a trustedAssetsInstallObserverImpl")
+		}
+		observerImpl = impl
+		currentTrustedBootAssets = observerImpl.currentTrustedBootAssetsMap()
+		currentTrustedRecoveryBootAssets = observerImpl.currentTrustedRecoveryBootAssetsMap()
 	}
 	recoverySystemLabel := bootWith.RecoverySystemLabel
 	// write modeenv on the ubuntu-data partition
@@ -532,10 +607,17 @@ func makeRunnableSystem(model *asserts.Model, bootWith *BootableSet, sealer *Tru
 		return fmt.Errorf("cannot write modeenv: %v", err)
 	}
 
-	if sealer != nil {
+	if observer != nil && observerImpl.useEncryption {
 		hasHook, err := HasFDESetupHook(bootWith.Kernel)
 		if err != nil {
 			return fmt.Errorf("cannot check for fde-setup hook: %v", err)
+		}
+
+		tokens := UseTokens(model)
+		if tokens {
+			logger.Debugf("key data will be stored in tokens")
+		} else {
+			logger.Debugf("key data will be stored in files")
 		}
 
 		flags := sealKeyToModeenvFlags{
@@ -543,12 +625,13 @@ func makeRunnableSystem(model *asserts.Model, bootWith *BootableSet, sealer *Tru
 			FactoryReset:    makeOpts.AfterDataReset,
 			SeedDir:         makeOpts.SeedDir,
 			StateUnlocker:   makeOpts.StateUnlocker,
+			UseTokens:       tokens,
 		}
 		if makeOpts.Standalone {
 			flags.SnapsDir = snapBlobDir
 		}
 		// seal the encryption key to the parameters specified in modeenv
-		if err := sealKeyToModeenv(sealer.dataEncryptionKey, sealer.saveEncryptionKey, model, modeenv, flags); err != nil {
+		if err := sealKeyToModeenv(observerImpl.dataBootstrappedContainer, observerImpl.saveBootstrappedContainer, observerImpl.primaryKey, observerImpl.volumesAuth, model, modeenv, flags); err != nil {
 			return err
 		}
 	}
@@ -558,6 +641,13 @@ func makeRunnableSystem(model *asserts.Model, bootWith *BootableSet, sealer *Tru
 	if err := MarkRecoveryCapableSystem(recoverySystemLabel); err != nil {
 		return fmt.Errorf("cannot record %q as a recovery capable system: %v", recoverySystemLabel, err)
 	}
+
+	if observer != nil {
+		if err := observer.UpdateBootEntry(); err != nil {
+			logger.Debugf("WARNING: %v", err)
+		}
+	}
+
 	return nil
 }
 
@@ -612,8 +702,8 @@ func buildOptionalKernelCommandLine(model *asserts.Model, gadgetSnapOrDir string
 // something like boot.EnsureNextBootToRunMode(). This is to enable separately
 // setting up a run system and actually transitioning to it, with hooks, etc.
 // running in between.
-func MakeRunnableSystem(model *asserts.Model, bootWith *BootableSet, sealer *TrustedAssetsInstallObserver) error {
-	return makeRunnableSystem(model, bootWith, sealer, makeRunnableOptions{
+func MakeRunnableSystem(model *asserts.Model, bootWith *BootableSet, observer TrustedAssetsInstallObserver) error {
+	return makeRunnableSystem(model, bootWith, observer, makeRunnableOptions{
 		SeedDir: dirs.SnapSeedDir,
 	})
 }
@@ -621,10 +711,10 @@ func MakeRunnableSystem(model *asserts.Model, bootWith *BootableSet, sealer *Tru
 // MakeRunnableStandaloneSystem operates like MakeRunnableSystem but does
 // not assume that the run system being set up is related to the current
 // system. This is appropriate e.g when installing from a classic installer.
-func MakeRunnableStandaloneSystem(model *asserts.Model, bootWith *BootableSet, sealer *TrustedAssetsInstallObserver, unlocker Unlocker) error {
+func MakeRunnableStandaloneSystem(model *asserts.Model, bootWith *BootableSet, observer TrustedAssetsInstallObserver, unlocker Unlocker) error {
 	// TODO consider merging this back into MakeRunnableSystem but need
 	// to consider the properties of the different input used for sealing
-	return makeRunnableSystem(model, bootWith, sealer, makeRunnableOptions{
+	return makeRunnableSystem(model, bootWith, observer, makeRunnableOptions{
 		Standalone:    true,
 		SeedDir:       dirs.SnapSeedDir,
 		StateUnlocker: unlocker,
@@ -633,10 +723,10 @@ func MakeRunnableStandaloneSystem(model *asserts.Model, bootWith *BootableSet, s
 
 // MakeRunnableStandaloneSystemFromInitrd is the same as MakeRunnableStandaloneSystem
 // but uses seed dir path expected in initrd.
-func MakeRunnableStandaloneSystemFromInitrd(model *asserts.Model, bootWith *BootableSet, sealer *TrustedAssetsInstallObserver) error {
+func MakeRunnableStandaloneSystemFromInitrd(model *asserts.Model, bootWith *BootableSet, observer TrustedAssetsInstallObserver) error {
 	// TODO consider merging this back into MakeRunnableSystem but need
 	// to consider the properties of the different input used for sealing
-	return makeRunnableSystem(model, bootWith, sealer, makeRunnableOptions{
+	return makeRunnableSystem(model, bootWith, observer, makeRunnableOptions{
 		Standalone: true,
 		SeedDir:    filepath.Join(InitramfsRunMntDir, "ubuntu-seed"),
 	})
@@ -645,8 +735,8 @@ func MakeRunnableStandaloneSystemFromInitrd(model *asserts.Model, bootWith *Boot
 // MakeRunnableSystemAfterDataReset sets up the system to be able to boot, but it is
 // intended to be called from UC20 factory reset mode right before switching
 // back to the new run system.
-func MakeRunnableSystemAfterDataReset(model *asserts.Model, bootWith *BootableSet, sealer *TrustedAssetsInstallObserver) error {
-	return makeRunnableSystem(model, bootWith, sealer, makeRunnableOptions{
+func MakeRunnableSystemAfterDataReset(model *asserts.Model, bootWith *BootableSet, observer TrustedAssetsInstallObserver) error {
+	return makeRunnableSystem(model, bootWith, observer, makeRunnableOptions{
 		AfterDataReset: true,
 		SeedDir:        dirs.SnapSeedDir,
 	})

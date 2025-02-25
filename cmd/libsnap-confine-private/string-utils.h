@@ -38,7 +38,7 @@ bool sc_startswith(const char *str, const char *prefix);
 
 /**
  * Allocate and return a copy of a string.
-**/
+ **/
 char *sc_strdup(const char *str);
 
 /**
@@ -46,8 +46,7 @@ char *sc_strdup(const char *str);
  *
  * This version dies on any error condition.
  **/
-__attribute__((format(printf, 3, 4)))
-int sc_must_snprintf(char *str, size_t size, const char *format, ...);
+__attribute__((format(printf, 3, 4))) int sc_must_snprintf(char *str, size_t size, const char *format, ...);
 
 /**
  * Append a string to a buffer containing a string.
@@ -112,5 +111,15 @@ void sc_string_init(char *buf, size_t buf_size);
  * terminator character.
  **/
 void sc_string_quote(char *buf, size_t buf_size, const char *str);
+
+/**
+ * Split a string into two parts on the first occurrence of a delimiter.
+ *
+ * The size of prefix must be large enough to hold the prefix part of the
+ * string, and the size of suffix must be large enough to hold the suffix part
+ * of the string.
+ **/
+void sc_string_split(const char *string, char delimiter, char *prefix_buf, size_t prefix_size, char *suffix_buf,
+                     size_t suffix_size);
 
 #endif

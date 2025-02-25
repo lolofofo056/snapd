@@ -90,7 +90,35 @@ dbus (send)
      path="/org/freedesktop/resolve1"
      interface="org.freedesktop.resolve1.Manager"
      member="SetLink{DefaultRoute,DNSOverTLS,DNS,DNSEx,DNSSEC,DNSSECNegativeTrustAnchors,MulticastDNS,Domains,LLMNR}"
-     peer=(label=unconfined),
+     peer=(name="org.freedesktop.resolve1", label=unconfined),
+
+dbus (send)
+     bus=system
+     path="/org/freedesktop/resolve1"
+     interface="org.freedesktop.resolve1.Manager"
+     member="GetLink"
+     peer=(name="org.freedesktop.resolve1", label=unconfined),
+
+dbus (send)
+     bus=system
+     path="/org/freedesktop/resolve1/link/*"
+     interface="org.freedesktop.resolve1.Link"
+     member="Set{DNS,DNSSEC,DNSSECNegativeTrustAnchors,MulticastDNS,Domains,LLMNR}"
+     peer=(name="org.freedesktop.resolve1", label=unconfined),
+
+dbus (send)
+     bus=system
+     path="/org/freedesktop/resolve1"
+     interface="org.freedesktop.resolve1.Manager"
+     member="FlushCaches"
+     peer=(name="org.freedesktop.resolve1", label=unconfined),
+
+dbus (send)
+     bus=system
+     path="/org/freedesktop/resolve1"
+     interface="org.freedesktop.DBus.Peer"
+     member="Ping"
+     peer=(name="org.freedesktop.resolve1", label=unconfined),
 
 # required by resolvectl command
 dbus (send)
@@ -123,6 +151,18 @@ dbus (receive)
      interface="org.freedesktop.DBus.Properties"
      member=PropertiesChanged
      peer=(label=unconfined),
+
+# Allow access to wpa-supplicant for managing WiFi networks
+dbus (receive, send)
+    bus=system
+    path=/fi/w1/wpa_supplicant1{,/**}
+    interface=fi.w1.wpa_supplicant1*
+    peer=(label=unconfined),
+dbus (receive, send)
+    bus=system
+    path=/fi/w1/wpa_supplicant1{,/**}
+    interface=org.freedesktop.DBus.*
+    peer=(label=unconfined),
 
 #include <abstractions/ssl_certs>
 

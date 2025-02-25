@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2023 Canonical Ltd
+ * Copyright (C) 2023-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -55,36 +55,50 @@ func (s *listenerSuite) SetUpTest(c *C) {
 
 	dirs.SetRootDir(c.MkDir())
 	s.AddCleanup(func() { dirs.SetRootDir("") })
+
+	restore := notify.MockVersionKnown(func(v notify.ProtocolVersion) bool {
+		// treat every non-zero version as known
+		return v != 0
+	})
+	s.AddCleanup(restore)
 }
 
 func (*listenerSuite) TestReply(c *C) {
-	rc := make(chan interface{}, 1)
+	rc := make(chan any, 1)
 	req := listener.FakeRequestWithClassAndReplyChan(notify.AA_CLASS_FILE, rc)
-	reply := true
-	req.Reply(reply)
+	response := notify.FilePermission(1234)
+	req.Reply(response)
 	resp := <-rc
-	c.Assert(resp, Equals, reply)
+	c.Assert(resp, Equals, response)
+}
+
+func (*listenerSuite) TestReplyNil(c *C) {
+	rc := make(chan any, 1)
+	req := listener.FakeRequestWithClassAndReplyChan(notify.AA_CLASS_FILE, rc)
+	req.Reply(nil)
+	resp := <-rc
+	var response any
+	c.Assert(resp, Equals, response)
 }
 
 func (*listenerSuite) TestBadReply(c *C) {
-	rc := make(chan interface{}, 1)
+	rc := make(chan any, 1)
 	req := listener.FakeRequestWithClassAndReplyChan(notify.AA_CLASS_FILE, rc)
-	reply := 1
-	err := req.Reply(reply)
-	c.Assert(err, ErrorMatches, "invalid reply: response must be of type bool")
+	response := "read"
+	err := req.Reply(response)
+	c.Assert(err, ErrorMatches, "invalid reply: response permission must be of type notify.FilePermission")
 }
 
 func (*listenerSuite) TestReplyTwice(c *C) {
-	rc := make(chan interface{}, 1)
+	rc := make(chan any, 1)
 	req := listener.FakeRequestWithClassAndReplyChan(notify.AA_CLASS_FILE, rc)
-	reply := false
-	err := req.Reply(reply)
+	response := notify.FilePermission(1234)
+	err := req.Reply(response)
 	c.Assert(err, IsNil)
 	resp := <-rc
-	c.Assert(resp, Equals, reply)
+	c.Assert(resp, Equals, response)
 
-	reply = true
-	err = req.Reply(reply)
+	err = req.Reply(response)
 	c.Assert(err, Equals, listener.ErrAlreadyReplied)
 }
 
@@ -92,13 +106,13 @@ func (*listenerSuite) TestRegisterClose(c *C) {
 	restoreOpen := listener.MockOsOpenWithSocket()
 	defer restoreOpen()
 
+	restoreRegisterFileDescriptor := listener.MockNotifyRegisterFileDescriptor(func(fd uintptr) (notify.ProtocolVersion, error) {
+		return notify.ProtocolVersion(12345), nil
+	})
+	defer restoreRegisterFileDescriptor()
+
 	restoreIoctl := listener.MockNotifyIoctl(func(fd uintptr, req notify.IoctlRequest, buf notify.IoctlRequestBuffer) ([]byte, error) {
-		expected := notify.MsgNotificationFilter{ModeSet: notify.APPARMOR_MODESET_USER}
-		expectedBytes, err := expected.MarshalBinary()
-		c.Assert(err, IsNil)
-		expectedBuf := notify.IoctlRequestBuffer(expectedBytes)
-		c.Assert(req, Equals, notify.APPARMOR_NOTIF_SET_FILTER)
-		c.Assert(buf, DeepEquals, expectedBuf)
+		c.Fatalf("unexpectedly called notifyIoctl directly: req: %v, buf: %v", req, buf)
 		return make([]byte, 0), nil
 	})
 	defer restoreIoctl()
@@ -122,8 +136,13 @@ func (*listenerSuite) TestRegisterOverridePath(c *C) {
 	})
 	defer restoreOpen()
 
+	restoreRegisterFileDescriptor := listener.MockNotifyRegisterFileDescriptor(func(fd uintptr) (notify.ProtocolVersion, error) {
+		return notify.ProtocolVersion(12345), nil
+	})
+	defer restoreRegisterFileDescriptor()
+
 	restoreIoctl := listener.MockNotifyIoctl(func(fd uintptr, req notify.IoctlRequest, buf notify.IoctlRequestBuffer) ([]byte, error) {
-		c.Assert(req, Equals, notify.APPARMOR_NOTIF_SET_FILTER)
+		c.Fatalf("unexpectedly called notifyIoctl directly: req: %v, buf: %v", req, buf)
 		return make([]byte, 0), nil
 	})
 	defer restoreIoctl()
@@ -182,15 +201,20 @@ func (*listenerSuite) TestRegisterErrors(c *C) {
 	})
 	defer restoreOpen()
 
+	restoreRegisterFileDescriptor := listener.MockNotifyRegisterFileDescriptor(func(fd uintptr) (notify.ProtocolVersion, error) {
+		return 0, customError
+	})
+	defer restoreRegisterFileDescriptor()
+
 	restoreIoctl := listener.MockNotifyIoctl(func(fd uintptr, req notify.IoctlRequest, buf notify.IoctlRequestBuffer) ([]byte, error) {
-		c.Assert(req, Equals, notify.APPARMOR_NOTIF_SET_FILTER)
-		return nil, customError
+		c.Fatalf("unexpectedly called notifyIoctl directly: req: %v, buf: %v", req, buf)
+		return make([]byte, 0), nil
 	})
 	defer restoreIoctl()
 
 	l, err = listener.Register()
 	c.Assert(l, IsNil)
-	c.Assert(err, ErrorMatches, fmt.Sprintf("cannot notify ioctl to modeset user on %q: %v", notify.SysPath, customError))
+	c.Assert(err, Equals, customError)
 
 	restoreOpen = listener.MockOsOpen(func(name string) (*os.File, error) {
 		badFd := ^uintptr(0)
@@ -199,11 +223,10 @@ func (*listenerSuite) TestRegisterErrors(c *C) {
 	})
 	defer restoreOpen()
 
-	restoreIoctl = listener.MockNotifyIoctl(func(fd uintptr, req notify.IoctlRequest, buf notify.IoctlRequestBuffer) ([]byte, error) {
-		c.Assert(req, Equals, notify.APPARMOR_NOTIF_SET_FILTER)
-		return make([]byte, 0), nil
+	restoreRegisterFileDescriptor = listener.MockNotifyRegisterFileDescriptor(func(fd uintptr) (notify.ProtocolVersion, error) {
+		return notify.ProtocolVersion(12345), nil
 	})
-	defer restoreIoctl()
+	defer restoreRegisterFileDescriptor()
 
 	l, err = listener.Register()
 	c.Assert(l, IsNil)
@@ -246,7 +269,9 @@ func (*listenerSuite) TestRunSimple(c *C) {
 	restoreOpen := listener.MockOsOpenWithSocket()
 	defer restoreOpen()
 
-	recvChan, sendChan, restoreEpollIoctl := listener.MockEpollWaitNotifyIoctl()
+	protoVersion := notify.ProtocolVersion(12345)
+
+	recvChan, sendChan, restoreEpollIoctl := listener.MockEpollWaitNotifyIoctl(protoVersion)
 	defer restoreEpollIoctl()
 
 	var t tomb.Tomb
@@ -266,21 +291,23 @@ func (*listenerSuite) TestRunSimple(c *C) {
 	path := "/home/Documents/foo"
 	aBits := uint32(0b1010)
 	dBits := uint32(0b0101)
+	// simulate user only explicitly giving permission for final two bits
+	respBits := dBits & 0b0011
 
 	for _, id := range ids {
-		msg := newMsgNotificationFile(id, label, path, aBits, dBits)
+		msg := newMsgNotificationFile(protoVersion, id, label, path, aBits, dBits)
 		buf, err := msg.MarshalBinary()
 		c.Assert(err, IsNil)
 		recvChan <- buf
 
 		select {
 		case req := <-l.Reqs():
-			c.Assert(req.PID(), Equals, msg.Pid)
-			c.Assert(req.Label(), Equals, label)
-			c.Assert(req.SubjectUID(), Equals, msg.SUID)
-			c.Assert(req.Path(), Equals, path)
-			c.Assert(req.Class(), Equals, notify.AA_CLASS_FILE)
-			perm, ok := req.Permission().(notify.FilePermission)
+			c.Assert(req.PID, Equals, msg.Pid)
+			c.Assert(req.Label, Equals, label)
+			c.Assert(req.SubjectUID, Equals, msg.SUID)
+			c.Assert(req.Path, Equals, path)
+			c.Assert(req.Class, Equals, notify.AA_CLASS_FILE)
+			perm, ok := req.Permission.(notify.FilePermission)
 			c.Assert(ok, Equals, true)
 			c.Assert(perm, Equals, notify.FilePermission(dBits))
 			requests = append(requests, req)
@@ -290,18 +317,15 @@ func (*listenerSuite) TestRunSimple(c *C) {
 	}
 
 	for i, id := range ids {
-		switch i % 2 {
-		case 0:
-			err = requests[i].Reply(false)
-		case 1:
-			err = requests[i].Reply(true)
-		}
-		c.Assert(err, IsNil)
+		response := notify.FilePermission(respBits)
 
-		allow := aBits | (dBits * uint32(i))
-		deny := dBits * uint32(1-i)
-		resp := newMsgNotificationResponse(id, allow, deny)
-		desiredBuf, err := resp.MarshalBinary()
+		var desiredBuf []byte
+		allow := aBits | (respBits & dBits)
+		deny := (^respBits) & dBits
+		resp := newMsgNotificationResponse(protoVersion, id, allow, deny)
+		desiredBuf, err = resp.MarshalBinary()
+		c.Assert(err, IsNil)
+		err = requests[i].Reply(response)
 		c.Assert(err, IsNil)
 
 		received := <-sendChan
@@ -315,7 +339,9 @@ func (*listenerSuite) TestRegisterWriteRun(c *C) {
 	restoreOpen := listener.MockOsOpenWithSocket()
 	defer restoreOpen()
 
-	recvChan, _, restoreEpollIoctl := listener.MockEpollWaitNotifyIoctl()
+	protoVersion := notify.ProtocolVersion(0xabc)
+
+	recvChan, _, restoreEpollIoctl := listener.MockEpollWaitNotifyIoctl(protoVersion)
 	defer restoreEpollIoctl()
 
 	var t tomb.Tomb
@@ -332,7 +358,7 @@ func (*listenerSuite) TestRegisterWriteRun(c *C) {
 	aBits := uint32(0b1010)
 	dBits := uint32(0b0101)
 
-	msg := newMsgNotificationFile(id, label, path, aBits, dBits)
+	msg := newMsgNotificationFile(protoVersion, id, label, path, aBits, dBits)
 	buf, err := msg.MarshalBinary()
 	c.Assert(err, IsNil)
 
@@ -361,7 +387,7 @@ func (*listenerSuite) TestRegisterWriteRun(c *C) {
 	select {
 	case req, ok := <-l.Reqs():
 		c.Assert(ok, Equals, true)
-		c.Assert(req.Path(), Equals, path)
+		c.Assert(req.Path, Equals, path)
 	case <-l.Dying():
 		c.Fatalf("listener encountered unexpected error: %v", l.Err())
 	case <-timer.C:
@@ -375,7 +401,9 @@ func (*listenerSuite) TestRunMultipleRequestsInBuffer(c *C) {
 	restoreOpen := listener.MockOsOpenWithSocket()
 	defer restoreOpen()
 
-	recvChan, _, restoreEpollIoctl := listener.MockEpollWaitNotifyIoctl()
+	protoVersion := notify.ProtocolVersion(0x43)
+
+	recvChan, _, restoreEpollIoctl := listener.MockEpollWaitNotifyIoctl(protoVersion)
 	defer restoreEpollIoctl()
 
 	var t tomb.Tomb
@@ -396,7 +424,7 @@ func (*listenerSuite) TestRunMultipleRequestsInBuffer(c *C) {
 
 	var megaBuf []byte
 	for i, path := range paths {
-		msg := newMsgNotificationFile(uint64(i), label, path, aBits, dBits)
+		msg := newMsgNotificationFile(protoVersion, uint64(i), label, path, aBits, dBits)
 		buf, err := msg.MarshalBinary()
 		c.Assert(err, IsNil)
 		megaBuf = append(megaBuf, buf...)
@@ -408,7 +436,7 @@ func (*listenerSuite) TestRunMultipleRequestsInBuffer(c *C) {
 		timer := time.NewTimer(100 * time.Millisecond)
 		select {
 		case req := <-l.Reqs():
-			c.Assert(req.Path(), DeepEquals, path)
+			c.Assert(req.Path, DeepEquals, path)
 		case <-l.Dying():
 			c.Fatalf("listener encountered unexpected error during request %d: %v", i, l.Err())
 		case <-timer.C:
@@ -430,11 +458,16 @@ func (*listenerSuite) TestRunEpoll(c *C) {
 	})
 	defer restoreOpen()
 
+	restoreRegisterFileDescriptor := listener.MockNotifyRegisterFileDescriptor(func(fd uintptr) (notify.ProtocolVersion, error) {
+		return notify.ProtocolVersion(12345), nil
+	})
+	defer restoreRegisterFileDescriptor()
+
 	restoreIoctl := listener.MockNotifyIoctl(func(fd uintptr, req notify.IoctlRequest, buf notify.IoctlRequestBuffer) ([]byte, error) {
 		c.Assert(fd, Equals, uintptr(notifyFile.Fd()))
 		switch req {
 		case notify.APPARMOR_NOTIF_SET_FILTER:
-			return make([]byte, 0), nil
+			c.Fatalf("unexpectedly called notifyIoctl directly: req: %v, buf: %v", req, buf)
 		case notify.APPARMOR_NOTIF_RECV:
 			buf := notify.NewIoctlRequestBuffer()
 			n, err := unix.Read(int(fd), buf)
@@ -447,13 +480,14 @@ func (*listenerSuite) TestRunEpoll(c *C) {
 	})
 	defer restoreIoctl()
 
+	protoVersion := notify.ProtocolVersion(12345)
 	id := uint64(0x1234)
 	label := "snap.foo.bar"
 	path := "/home/Documents/foo/bar"
 	aBits := uint32(0b1010)
 	dBits := uint32(0b0101)
 
-	msg := newMsgNotificationFile(id, label, path, aBits, dBits)
+	msg := newMsgNotificationFile(protoVersion, id, label, path, aBits, dBits)
 	recvBuf, err := msg.MarshalBinary()
 	c.Assert(err, IsNil)
 
@@ -469,7 +503,7 @@ func (*listenerSuite) TestRunEpoll(c *C) {
 	requestTimer := time.NewTimer(time.Second)
 	select {
 	case req := <-l.Reqs():
-		c.Assert(req.Path(), Equals, path)
+		c.Assert(req.Path, Equals, path)
 	case <-l.Dying():
 		c.Fatalf("listener encountered unexpected error: %v", l.Err())
 	case <-requestTimer.C:
@@ -501,8 +535,13 @@ func (*listenerSuite) TestRunNoEpoll(c *C) {
 	})
 	defer restoreEpoll()
 
+	restoreRegisterFileDescriptor := listener.MockNotifyRegisterFileDescriptor(func(fd uintptr) (notify.ProtocolVersion, error) {
+		return notify.ProtocolVersion(12345), nil
+	})
+	defer restoreRegisterFileDescriptor()
+
 	restoreIoctl := listener.MockNotifyIoctl(func(fd uintptr, req notify.IoctlRequest, buf notify.IoctlRequestBuffer) ([]byte, error) {
-		c.Assert(req, Equals, notify.APPARMOR_NOTIF_SET_FILTER)
+		c.Fatalf("unexpectedly called notifyIoctl directly: req: %v, buf: %v", req, buf)
 		return make([]byte, 0), nil
 	})
 	defer restoreIoctl()
@@ -532,7 +571,9 @@ func (*listenerSuite) TestRunNoReceiver(c *C) {
 	restoreOpen := listener.MockOsOpenWithSocket()
 	defer restoreOpen()
 
-	recvChan, _, restoreEpollIoctl := listener.MockEpollWaitNotifyIoctl()
+	protoVersion := notify.ProtocolVersion(5)
+
+	recvChan, _, restoreEpollIoctl := listener.MockEpollWaitNotifyIoctl(protoVersion)
 	defer restoreEpollIoctl()
 
 	var t tomb.Tomb
@@ -547,7 +588,7 @@ func (*listenerSuite) TestRunNoReceiver(c *C) {
 	aBits := uint32(0b1010)
 	dBits := uint32(0b0101)
 
-	msg := newMsgNotificationFile(id, label, path, aBits, dBits)
+	msg := newMsgNotificationFile(protoVersion, id, label, path, aBits, dBits)
 	buf, err := msg.MarshalBinary()
 	c.Assert(err, IsNil)
 	recvChan <- buf
@@ -562,7 +603,9 @@ func (*listenerSuite) TestRunNoReply(c *C) {
 	restoreOpen := listener.MockOsOpenWithSocket()
 	defer restoreOpen()
 
-	recvChan, _, restoreEpollIoctl := listener.MockEpollWaitNotifyIoctl()
+	protoVersion := notify.ProtocolVersion(0x1234)
+
+	recvChan, _, restoreEpollIoctl := listener.MockEpollWaitNotifyIoctl(protoVersion)
 	defer restoreEpollIoctl()
 
 	var t tomb.Tomb
@@ -577,7 +620,7 @@ func (*listenerSuite) TestRunNoReply(c *C) {
 	aBits := uint32(0b1010)
 	dBits := uint32(0b0101)
 
-	msg := newMsgNotificationFile(id, label, path, aBits, dBits)
+	msg := newMsgNotificationFile(protoVersion, id, label, path, aBits, dBits)
 	buf, err := msg.MarshalBinary()
 	c.Assert(err, IsNil)
 	recvChan <- buf
@@ -586,14 +629,15 @@ func (*listenerSuite) TestRunNoReply(c *C) {
 
 	c.Check(l.Close(), IsNil)
 
-	req.Reply(true)
+	response := true // doesn't matter what the response is
+	req.Reply(response)
 
 	c.Check(t.Wait(), Equals, listener.ErrClosed)
 }
 
-func newMsgNotificationFile(id uint64, label, name string, allow, deny uint32) *notify.MsgNotificationFile {
+func newMsgNotificationFile(protocolVersion notify.ProtocolVersion, id uint64, label, name string, allow, deny uint32) *notify.MsgNotificationFile {
 	msg := notify.MsgNotificationFile{}
-	msg.Version = 3
+	msg.Version = protocolVersion
 	msg.NotificationType = notify.APPARMOR_NOTIF_OP
 	msg.NoCache = 1
 	msg.ID = id
@@ -607,8 +651,12 @@ func newMsgNotificationFile(id uint64, label, name string, allow, deny uint32) *
 	return &msg
 }
 
-func newMsgNotificationResponse(id uint64, allow, deny uint32) *notify.MsgNotificationResponse {
+func newMsgNotificationResponse(protocolVersion notify.ProtocolVersion, id uint64, allow, deny uint32) *notify.MsgNotificationResponse {
+	msgHeader := notify.MsgHeader{
+		Version: protocolVersion,
+	}
 	msgNotification := notify.MsgNotification{
+		MsgHeader:        msgHeader,
 		NotificationType: notify.APPARMOR_NOTIF_RESP,
 		NoCache:          1,
 		ID:               id,
@@ -624,10 +672,14 @@ func newMsgNotificationResponse(id uint64, allow, deny uint32) *notify.MsgNotifi
 }
 
 func (*listenerSuite) TestRunErrors(c *C) {
+	listener.ExitOnError()
+
 	restoreOpen := listener.MockOsOpenWithSocket()
 	defer restoreOpen()
 
-	recvChan, _, restoreEpollIoctl := listener.MockEpollWaitNotifyIoctl()
+	protoVersion := notify.ProtocolVersion(1123)
+
+	recvChan, _, restoreEpollIoctl := listener.MockEpollWaitNotifyIoctl(protoVersion)
 	defer restoreEpollIoctl()
 
 	for _, testCase := range []struct {
@@ -659,8 +711,15 @@ func (*listenerSuite) TestRunErrors(c *C) {
 		},
 		{
 			msgNotificationFile{
+				Version: 99,
+				Length:  52,
+			},
+			`unexpected protocol version: listener registered with 1123, but received 99`,
+		},
+		{
+			msgNotificationFile{
 				Length:           52,
-				Version:          3,
+				Version:          1123,
 				NotificationType: notify.APPARMOR_NOTIF_CANCEL,
 			},
 			`unsupported notification type: APPARMOR_NOTIF_CANCEL`,
@@ -668,7 +727,7 @@ func (*listenerSuite) TestRunErrors(c *C) {
 		{
 			msgNotificationFile{
 				Length:           52,
-				Version:          3,
+				Version:          1123,
 				NotificationType: notify.APPARMOR_NOTIF_OP,
 				Class:            uint16(notify.AA_CLASS_DBUS),
 			},
@@ -687,6 +746,8 @@ func (*listenerSuite) TestRunErrors(c *C) {
 		select {
 		case r := <-l.Reqs():
 			c.Check(r, IsNil, Commentf("should not have received non-nil request; expected error: %v", testCase.err))
+		case <-time.NewTimer(time.Second).C:
+			c.Error("done waiting for expected error", testCase.err)
 		case <-t.Dying():
 		}
 		err = t.Wait()
@@ -709,8 +770,13 @@ func (*listenerSuite) TestRunMultipleTimes(c *C) {
 	})
 	defer restoreEpoll()
 
+	restoreRegisterFileDescriptor := listener.MockNotifyRegisterFileDescriptor(func(fd uintptr) (notify.ProtocolVersion, error) {
+		return notify.ProtocolVersion(12345), nil
+	})
+	defer restoreRegisterFileDescriptor()
+
 	restoreIoctl := listener.MockNotifyIoctl(func(fd uintptr, req notify.IoctlRequest, buf notify.IoctlRequestBuffer) ([]byte, error) {
-		c.Assert(req, Equals, notify.APPARMOR_NOTIF_SET_FILTER)
+		c.Fatalf("unexpectedly called notifyIoctl directly: req: %v, buf: %v", req, buf)
 		return make([]byte, 0), nil
 	})
 	defer restoreIoctl()
@@ -743,8 +809,13 @@ func (*listenerSuite) TestCloseThenRun(c *C) {
 	restoreOpen := listener.MockOsOpenWithSocket()
 	defer restoreOpen()
 
+	restoreRegisterFileDescriptor := listener.MockNotifyRegisterFileDescriptor(func(fd uintptr) (notify.ProtocolVersion, error) {
+		return notify.ProtocolVersion(12345), nil
+	})
+	defer restoreRegisterFileDescriptor()
+
 	restoreIoctl := listener.MockNotifyIoctl(func(fd uintptr, req notify.IoctlRequest, buf notify.IoctlRequestBuffer) ([]byte, error) {
-		c.Assert(req, Equals, notify.APPARMOR_NOTIF_SET_FILTER)
+		c.Fatalf("unexpectedly called notifyIoctl directly: req: %v, buf: %v", req, buf)
 		return make([]byte, 0), nil
 	})
 	defer restoreIoctl()
@@ -766,7 +837,9 @@ func (*listenerSuite) TestRunConcurrency(c *C) {
 	restoreOpen := listener.MockOsOpenWithSocket()
 	defer restoreOpen()
 
-	recvChan, sendChan, restoreEpollIoctl := listener.MockEpollWaitNotifyIoctl()
+	protoVersion := notify.ProtocolVersion(0xaaaa)
+
+	recvChan, sendChan, restoreEpollIoctl := listener.MockEpollWaitNotifyIoctl(protoVersion)
 	epollIoctlRestored := false
 	defer func() {
 		if !epollIoctlRestored {
@@ -789,11 +862,11 @@ func (*listenerSuite) TestRunConcurrency(c *C) {
 	reqAllow := uint32(0b1010)
 	reqDeny := uint32(0b0101)
 
-	msg := newMsgNotificationFile(0, label, path, reqAllow, reqDeny)
+	msg := newMsgNotificationFile(protoVersion, 0, label, path, reqAllow, reqDeny)
 
 	respAllow := uint32(0b1111)
 	respDeny := uint32(0b0000)
-	resp := newMsgNotificationResponse(0, respAllow, respDeny)
+	resp := newMsgNotificationResponse(protoVersion, 0, respAllow, respDeny)
 
 	templateBuf, err := resp.MarshalBinary()
 	c.Assert(err, IsNil)
@@ -825,8 +898,9 @@ func (*listenerSuite) TestRunConcurrency(c *C) {
 	replyCount := 0
 	go func() {
 		// reply to all requests as they are received, until l.Reqs() closes
+		response := notify.FilePermission(1234)
 		for req := range l.Reqs() {
-			err := req.Reply(true)
+			err := req.Reply(response)
 			c.Check(err, IsNil)
 			replyCount += 1
 		}
@@ -885,4 +959,139 @@ func (*listenerSuite) TestRunConcurrency(c *C) {
 	c.Check(requestsSent > 1, Equals, true, Commentf("should have sent more than one request"))
 	c.Check(replyCount > 1, Equals, true, Commentf("should have replied to more than one request"))
 	c.Check(responseCount > 1, Equals, true, Commentf("should have received more than one response"))
+}
+
+func (*listenerSuite) TestWaitAndRespondAaClassFile(c *C) {
+	respChan := make(chan *notify.MsgNotificationResponse, 1)
+	restore := listener.MockEncodeAndSendResponse(func(l *listener.Listener, resp *notify.MsgNotificationResponse) error {
+		respChan <- resp
+		return nil
+	})
+	defer restore()
+
+	fakeListener := &listener.Listener{}
+
+	// Define allow and deny permissions which explore all possibilities of
+	// omitted/included and disjoint/overlapping permissions.
+	msgAllow := uint32(0b0101)
+	msgDeny := uint32(0b0011)
+
+	for _, testCase := range []struct {
+		allowedPermission any
+		respAllow         uint32
+		respDeny          uint32
+	}{
+		{
+			nil,
+			0b0100,
+			0b0011,
+		},
+		{
+			notify.FilePermission(0b0000),
+			0b0100,
+			0b0011,
+		},
+		{
+			notify.FilePermission(0b0001),
+			0b0101,
+			0b0010,
+		},
+		{
+			notify.FilePermission(0b0010),
+			0b0110,
+			0b0001,
+		},
+		{
+			notify.FilePermission(0b0011),
+			0b0111,
+			0b0000,
+		},
+		{
+			notify.FilePermission(0b0100),
+			0b0100,
+			0b0011,
+		},
+		{
+			notify.FilePermission(0b0101),
+			0b0101,
+			0b0010,
+		},
+		{
+			notify.FilePermission(0b0110),
+			0b0110,
+			0b0001,
+		},
+		{
+			notify.FilePermission(0b0111),
+			0b0111,
+			0b0000,
+		},
+		{
+			notify.FilePermission(0b1000),
+			0b0100,
+			0b0011,
+		},
+		{
+			notify.FilePermission(0b1001),
+			0b0101,
+			0b0010,
+		},
+		{
+			notify.FilePermission(0b1010),
+			0b0110,
+			0b0001,
+		},
+		{
+			notify.FilePermission(0b1011),
+			0b0111,
+			0b0000,
+		},
+		{
+			notify.FilePermission(0b1100),
+			0b0100,
+			0b0011,
+		},
+		{
+			notify.FilePermission(0b1101),
+			0b0101,
+			0b0010,
+		},
+		{
+			notify.FilePermission(0b1110),
+			0b0110,
+			0b0001,
+		},
+		{
+			notify.FilePermission(0b1111),
+			0b0111,
+			0b0000,
+		},
+	} {
+		replyChan := make(chan any, 1)
+		req := listener.FakeRequestWithClassAndReplyChan(notify.AA_CLASS_FILE, replyChan)
+
+		msg := &notify.MsgNotificationFile{
+			MsgNotificationOp: notify.MsgNotificationOp{
+				Allow: msgAllow,
+				Deny:  msgDeny,
+			},
+			SUID: 0,
+			OUID: 0,
+			Name: "/home/test/foo",
+		}
+
+		// Send reply
+		replyChan <- testCase.allowedPermission
+
+		// Wait for and respond to reply we just sent
+		fakeListener.WaitAndRespondAaClassFile(req, msg)
+
+		select {
+		case resp := <-respChan:
+			c.Check(resp.Allow, Equals, testCase.respAllow, Commentf("test case: %+v", testCase))
+			c.Check(resp.Deny, Equals, testCase.respDeny, Commentf("test case: %+v", testCase))
+		case <-time.NewTimer(10 * time.Millisecond).C:
+			c.Errorf("failed to receive response for test case: %+v", testCase)
+		}
+	}
 }

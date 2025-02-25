@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -281,19 +282,23 @@ func (s *noticesSuite) TestNoticesFilterType(c *C) {
 
 	addNotice(c, st, nil, state.RefreshInhibitNotice, "-", nil)
 	time.Sleep(time.Microsecond)
+	addNotice(c, st, nil, state.InterfacesRequestsPromptNotice, "443", nil)
+	time.Sleep(time.Microsecond)
 	addNotice(c, st, nil, state.ChangeUpdateNotice, "123", nil)
 	time.Sleep(time.Microsecond)
 	addNotice(c, st, nil, state.WarningNotice, "Warning 1!", nil)
 	time.Sleep(time.Microsecond)
 	addNotice(c, st, nil, state.WarningNotice, "Warning 2!", nil)
+	time.Sleep(time.Microsecond)
+	addNotice(c, st, nil, state.SnapRunInhibitNotice, "snap-name", nil)
 
 	// No filter
 	notices := st.Notices(nil)
-	c.Assert(notices, HasLen, 4)
+	c.Assert(notices, HasLen, 6)
 
 	// No types
 	notices = st.Notices(&state.NoticeFilter{})
-	c.Assert(notices, HasLen, 4)
+	c.Assert(notices, HasLen, 6)
 
 	// One type
 	notices = st.Notices(&state.NoticeFilter{Types: []state.NoticeType{state.WarningNotice}})
@@ -308,14 +313,6 @@ func (s *noticesSuite) TestNoticesFilterType(c *C) {
 	c.Check(n["key"], Equals, "Warning 2!")
 
 	// Another type
-	notices = st.Notices(&state.NoticeFilter{Types: []state.NoticeType{state.ChangeUpdateNotice}})
-	c.Assert(notices, HasLen, 1)
-	n = noticeToMap(c, notices[0])
-	c.Check(n["user-id"], Equals, nil)
-	c.Check(n["type"], Equals, "change-update")
-	c.Check(n["key"], Equals, "123")
-
-	// Another type
 	notices = st.Notices(&state.NoticeFilter{Types: []state.NoticeType{state.RefreshInhibitNotice}})
 	c.Assert(notices, HasLen, 1)
 	n = noticeToMap(c, notices[0])
@@ -323,16 +320,24 @@ func (s *noticesSuite) TestNoticesFilterType(c *C) {
 	c.Check(n["type"], Equals, "refresh-inhibit")
 	c.Check(n["key"], Equals, "-")
 
+	// Another type
+	notices = st.Notices(&state.NoticeFilter{Types: []state.NoticeType{state.SnapRunInhibitNotice}})
+	c.Assert(notices, HasLen, 1)
+	n = noticeToMap(c, notices[0])
+	c.Check(n["user-id"], Equals, nil)
+	c.Check(n["type"], Equals, "snap-run-inhibit")
+	c.Check(n["key"], Equals, "snap-name")
+
 	// Multiple types
 	notices = st.Notices(&state.NoticeFilter{Types: []state.NoticeType{
 		state.ChangeUpdateNotice,
-		state.RefreshInhibitNotice,
+		state.InterfacesRequestsPromptNotice,
 	}})
 	c.Assert(notices, HasLen, 2)
 	n = noticeToMap(c, notices[0])
 	c.Check(n["user-id"], Equals, nil)
-	c.Check(n["type"], Equals, "refresh-inhibit")
-	c.Check(n["key"], Equals, "-")
+	c.Check(n["type"], Equals, "interfaces-requests-prompt")
+	c.Check(n["key"], Equals, "443")
 	n = noticeToMap(c, notices[1])
 	c.Check(n["user-id"], Equals, nil)
 	c.Check(n["type"], Equals, "change-update")
@@ -649,18 +654,76 @@ func (s *noticesSuite) TestValidateNotice(c *C) {
 
 	// Invalid type
 	id, err := st.AddNotice(nil, "bad-type", "123", nil)
-	c.Check(err, ErrorMatches, `internal error: attempted to add notice with invalid type "bad-type"`)
+	c.Check(err, ErrorMatches, `internal error: cannot add notice with invalid type "bad-type"`)
 	c.Check(id, Equals, "")
 
 	// Empty key
 	id, err = st.AddNotice(nil, state.ChangeUpdateNotice, "", nil)
-	c.Check(err, ErrorMatches, `internal error: attempted to add change-update notice with invalid key ""`)
+	c.Check(err, ErrorMatches, `internal error: cannot add change-update notice with invalid key ""`)
+	c.Check(id, Equals, "")
+
+	// Large key
+	id, err = st.AddNotice(nil, state.ChangeUpdateNotice, strings.Repeat("x", 257), nil)
+	c.Check(err, ErrorMatches, `internal error: cannot add change-update notice with invalid key: key must be 256 bytes or less`)
 	c.Check(id, Equals, "")
 
 	// Unxpected key for refresh-inhibit notice
 	id, err = st.AddNotice(nil, state.RefreshInhibitNotice, "123", nil)
-	c.Check(err, ErrorMatches, `internal error: attempted to add refresh-inhibit notice with invalid key "123", only "-" key is supported`)
+	c.Check(err, ErrorMatches, `internal error: cannot add refresh-inhibit notice with invalid key "123": only "-" key is supported`)
 	c.Check(id, Equals, "")
+}
+
+func (s *noticesSuite) TestAvoidTwoNoticesWithSameDateTime(c *C) {
+	st := state.New(nil)
+	st.Lock()
+	defer st.Unlock()
+
+	testDate := time.Date(2024, time.April, 11, 11, 24, 5, 21, time.UTC)
+	restore := state.MockTime(testDate)
+	defer restore()
+
+	id1, err := st.AddNotice(nil, state.ChangeUpdateNotice, "123", nil)
+	c.Assert(err, IsNil)
+	notice1 := noticeToMap(c, st.Notice(id1))
+	c.Assert(notice1, NotNil)
+
+	id2, err := st.AddNotice(nil, state.ChangeUpdateNotice, "456", nil)
+	c.Assert(err, IsNil)
+	notice2 := noticeToMap(c, st.Notice(id2))
+	c.Assert(notice2, NotNil)
+
+	id3, err := st.AddNotice(nil, state.ChangeUpdateNotice, "789", nil)
+	c.Assert(err, IsNil)
+	notice3 := noticeToMap(c, st.Notice(id3))
+	c.Assert(notice3, NotNil)
+
+	testDate2 := time.Date(2024, time.April, 11, 11, 24, 5, 40, time.UTC)
+	restore2 := state.MockTime(testDate2)
+	defer restore2()
+
+	id4, err := st.AddNotice(nil, state.ChangeUpdateNotice, "ABC", nil)
+	c.Assert(err, IsNil)
+	notice4 := noticeToMap(c, st.Notice(id4))
+	c.Assert(notice4, NotNil)
+
+	// ensure that the notices are ordered in time
+	lastOccurred1, err := time.Parse(time.RFC3339, notice1["last-occurred"].(string))
+	c.Assert(err, IsNil)
+	lastOccurred2, err := time.Parse(time.RFC3339, notice2["last-occurred"].(string))
+	c.Assert(err, IsNil)
+	lastOccurred3, err := time.Parse(time.RFC3339, notice3["last-occurred"].(string))
+	c.Assert(err, IsNil)
+	lastOccurred4, err := time.Parse(time.RFC3339, notice4["last-occurred"].(string))
+	c.Assert(err, IsNil)
+
+	c.Assert(lastOccurred1.Equal(testDate), Equals, true)
+	c.Assert(lastOccurred2.Equal(testDate), Equals, false)
+	c.Assert(lastOccurred3.Equal(testDate), Equals, false)
+	c.Assert(lastOccurred1.Before(lastOccurred2), Equals, true)
+	c.Assert(lastOccurred1.Before(lastOccurred3), Equals, true)
+	c.Assert(lastOccurred2.Before(lastOccurred3), Equals, true)
+	c.Assert(lastOccurred4.Equal(testDate2), Equals, true)
+	c.Assert(lastOccurred4.After(lastOccurred3), Equals, true)
 }
 
 // noticeToMap converts a Notice to a map using a JSON marshal-unmarshal round trip.

@@ -20,18 +20,31 @@
 package ctlcmd_test
 
 import (
+	"fmt"
 	"strings"
 
 	. "gopkg.in/check.v1"
 
+	"github.com/snapcore/snapd/asserts"
+	"github.com/snapcore/snapd/asserts/assertstest"
+	"github.com/snapcore/snapd/confdb"
+	"github.com/snapcore/snapd/dirs"
+	"github.com/snapcore/snapd/features"
+	"github.com/snapcore/snapd/i18n"
 	"github.com/snapcore/snapd/interfaces"
+	"github.com/snapcore/snapd/interfaces/ifacetest"
+	"github.com/snapcore/snapd/overlord/assertstate"
+	"github.com/snapcore/snapd/overlord/assertstate/assertstatetest"
+	"github.com/snapcore/snapd/overlord/confdbstate"
 	"github.com/snapcore/snapd/overlord/configstate"
 	"github.com/snapcore/snapd/overlord/configstate/config"
 	"github.com/snapcore/snapd/overlord/hookstate"
 	"github.com/snapcore/snapd/overlord/hookstate/ctlcmd"
 	"github.com/snapcore/snapd/overlord/hookstate/hooktest"
+	"github.com/snapcore/snapd/overlord/ifacestate/ifacerepo"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/testutil"
 )
 
 type getSuite struct {
@@ -434,5 +447,466 @@ func (s *getAttrSuite) TestSlotHookTests(c *C) {
 			c.Check(string(stderr), Equals, "")
 			c.Check(string(stdout), Equals, test.stdout)
 		}
+	}
+}
+
+type confdbSuite struct {
+	testutil.BaseTest
+
+	state     *state.State
+	signingDB *assertstest.SigningDB
+	devAccID  string
+
+	mockContext *hookstate.Context
+	mockHandler *hooktest.MockHandler
+}
+
+var _ = Suite(&confdbSuite{})
+
+func (s *confdbSuite) SetUpTest(c *C) {
+	s.BaseTest.SetUpTest(c)
+	dirs.SetRootDir(c.MkDir())
+	s.AddCleanup(func() {
+		dirs.SetRootDir("/")
+	})
+
+	s.mockHandler = hooktest.NewMockHandler()
+	s.state = state.New(nil)
+	s.state.Lock()
+	task := s.state.NewTask("test-task", "my test task")
+	setup := &hookstate.HookSetup{Snap: "test-snap", Revision: snap.R(1), Hook: "test-hook"}
+	s.state.Unlock()
+
+	var err error
+	s.mockContext, err = hookstate.NewContext(task, s.state, setup, s.mockHandler, "")
+	c.Assert(err, IsNil)
+
+	storeSigning := assertstest.NewStoreStack("can0nical", nil)
+	db, err := asserts.OpenDatabase(&asserts.DatabaseConfig{
+		Backstore: asserts.NewMemoryBackstore(),
+		Trusted:   storeSigning.Trusted,
+	})
+	c.Assert(err, IsNil)
+	c.Assert(db.Add(storeSigning.StoreAccountKey("")), IsNil)
+
+	s.state.Lock()
+	defer s.state.Unlock()
+	assertstate.ReplaceDB(s.state, db)
+
+	// add developer1's account and account-key assertions
+	devAcc := assertstest.NewAccount(storeSigning, "developer1", nil, "")
+	c.Assert(storeSigning.Add(devAcc), IsNil)
+
+	devPrivKey, _ := assertstest.GenerateKey(752)
+	devAccKey := assertstest.NewAccountKey(storeSigning, devAcc, nil, devPrivKey.PublicKey(), "")
+	s.devAccID = devAccKey.AccountID()
+
+	assertstatetest.AddMany(s.state, storeSigning.StoreAccountKey(""), devAcc, devAccKey)
+
+	s.signingDB = assertstest.NewSigningDB("developer1", devPrivKey)
+	c.Check(s.signingDB, NotNil)
+	c.Assert(storeSigning.Add(devAccKey), IsNil)
+
+	headers := map[string]interface{}{
+		"authority-id": s.devAccID,
+		"account-id":   s.devAccID,
+		"name":         "network",
+		"views": map[string]interface{}{
+			"read-wifi": map[string]interface{}{
+				"rules": []interface{}{
+					map[string]interface{}{"request": "ssid", "storage": "wifi.ssid", "access": "read"},
+					map[string]interface{}{"request": "password", "storage": "wifi.psk", "access": "read"},
+				},
+			},
+			"write-wifi": map[string]interface{}{
+				"rules": []interface{}{
+					map[string]interface{}{"request": "ssid", "storage": "wifi.ssid", "access": "write"},
+					map[string]interface{}{"request": "password", "storage": "wifi.psk", "access": "write"},
+				},
+			},
+		},
+		"timestamp": "2030-11-06T09:16:26Z",
+	}
+
+	body := []byte(`{
+  "storage": {
+    "schema": {
+      "wifi": "any"
+    }
+  }
+}`)
+
+	as, err := s.signingDB.Sign(asserts.ConfdbType, headers, body, "")
+	c.Assert(err, IsNil)
+	c.Assert(assertstate.Add(s.state, as), IsNil)
+
+	repo := interfaces.NewRepository()
+	ifacerepo.Replace(s.state, repo)
+
+	regIface := &ifacetest.TestInterface{InterfaceName: "confdb"}
+	err = repo.AddInterface(regIface)
+	c.Assert(err, IsNil)
+
+	snapYaml := fmt.Sprintf(`name: test-snap
+type: app
+version: 1
+plugs:
+  read-wifi:
+    interface: confdb
+    account: %[1]s
+    view: network/read-wifi
+    role: observer
+  write-wifi:
+    interface: confdb
+    account: %[1]s
+    view: network/write-wifi
+    role: custodian
+  other:
+    interface: confdb
+    account: %[1]s
+    view: other/other
+`, s.devAccID)
+	info := mockInstalledSnap(c, s.state, snapYaml, "")
+
+	appSet, err := interfaces.NewSnapAppSet(info, nil)
+	c.Assert(err, IsNil)
+	err = repo.AddAppSet(appSet)
+	c.Assert(err, IsNil)
+
+	const coreYaml = `name: core
+version: 1.0
+type: os
+slots:
+ confdb-slot:
+  interface: confdb
+`
+	info = mockInstalledSnap(c, s.state, coreYaml, "")
+
+	coreSet, err := interfaces.NewSnapAppSet(info, nil)
+	c.Assert(err, IsNil)
+
+	err = repo.AddAppSet(coreSet)
+	c.Assert(err, IsNil)
+
+	ref := &interfaces.ConnRef{
+		PlugRef: interfaces.PlugRef{Snap: "test-snap", Name: "read-wifi"},
+		SlotRef: interfaces.SlotRef{Snap: "core", Name: "confdb-slot"},
+	}
+	_, err = repo.Connect(ref, nil, nil, nil, nil, nil)
+	c.Assert(err, IsNil)
+
+	s.setConfdbFlag(true, c)
+}
+
+func (s *confdbSuite) setConfdbFlag(val bool, c *C) {
+	tr := config.NewTransaction(s.state)
+	_, confOption := features.Confdbs.ConfigOption()
+	err := tr.Set("core", confOption, val)
+	c.Assert(err, IsNil)
+	tr.Commit()
+}
+
+func (s *confdbSuite) TestConfdbGetSingleView(c *C) {
+	restore := ctlcmd.MockConfdbstateNewTransaction(func(st *state.State, account string, confdbName string) (*confdbstate.Transaction, error) {
+		c.Assert(account, Equals, s.devAccID)
+		c.Assert(confdbName, Equals, "network")
+
+		tx, _ := confdbstate.NewTransaction(st, account, confdbName)
+		c.Assert(tx.Set("wifi.ssid", "my-ssid"), IsNil)
+
+		return tx, nil
+	})
+	defer restore()
+
+	stdout, stderr, err := ctlcmd.Run(s.mockContext, []string{"get", "--view", ":read-wifi", "ssid"}, 0)
+	c.Assert(err, IsNil)
+	c.Check(string(stdout), Equals, "my-ssid\n")
+	c.Check(stderr, IsNil)
+}
+
+func (s *confdbSuite) TestConfdbGetManyViews(c *C) {
+	restore := ctlcmd.MockConfdbstateNewTransaction(func(st *state.State, account string, confdbName string) (*confdbstate.Transaction, error) {
+		c.Assert(account, Equals, s.devAccID)
+		c.Assert(confdbName, Equals, "network")
+
+		tx, _ := confdbstate.NewTransaction(st, account, confdbName)
+		c.Assert(tx.Set("wifi.ssid", "my-ssid"), IsNil)
+		c.Assert(tx.Set("wifi.psk", "secret"), IsNil)
+
+		return tx, nil
+	})
+	defer restore()
+
+	stdout, stderr, err := ctlcmd.Run(s.mockContext, []string{"get", "--view", ":read-wifi", "ssid", "password"}, 0)
+	c.Assert(err, IsNil)
+	c.Check(string(stdout), Equals, `{
+	"password": "secret",
+	"ssid": "my-ssid"
+}
+`)
+	c.Check(stderr, IsNil)
+}
+
+func (s *confdbSuite) TestConfdbGetNoRequest(c *C) {
+	restore := ctlcmd.MockConfdbstateNewTransaction(func(st *state.State, account string, confdbName string) (*confdbstate.Transaction, error) {
+		c.Assert(account, Equals, s.devAccID)
+		c.Assert(confdbName, Equals, "network")
+
+		tx, _ := confdbstate.NewTransaction(st, account, confdbName)
+		c.Assert(tx.Set("wifi.ssid", "my-ssid"), IsNil)
+		c.Assert(tx.Set("wifi.psk", "secret"), IsNil)
+
+		return tx, nil
+	})
+	defer restore()
+
+	stdout, stderr, err := ctlcmd.Run(s.mockContext, []string{"get", "--view", ":read-wifi"}, 0)
+	c.Assert(err, IsNil)
+	c.Check(string(stdout), Equals, `{
+	"password": "secret",
+	"ssid": "my-ssid"
+}
+`)
+	c.Check(stderr, IsNil)
+}
+
+func (s *confdbSuite) TestConfdbGetInvalid(c *C) {
+	type testcase struct {
+		args []string
+		err  string
+	}
+
+	tcs := []testcase{
+		{
+			args: []string{"--slot", ":something"},
+			err:  `cannot use --plug or --slot with --view`,
+		},
+		{
+			args: []string{"--plug", ":something"},
+			err:  `cannot use --plug or --slot with --view`,
+		},
+		{
+			args: []string{":non-existent"},
+			err:  `cannot find plug :non-existent for snap "test-snap"`,
+		},
+	}
+
+	for _, tc := range tcs {
+		stdout, stderr, err := ctlcmd.Run(s.mockContext, append([]string{"get", "--view"}, tc.args...), 0)
+		c.Assert(err, ErrorMatches, tc.err)
+		c.Check(stdout, IsNil)
+		c.Check(stderr, IsNil)
+	}
+}
+
+func (s *confdbSuite) TestConfdbGetAndSetNonConfdbPlug(c *C) {
+	dirs.SetRootDir(c.MkDir())
+	s.AddCleanup(func() {
+		dirs.SetRootDir("/")
+	})
+
+	s.state.Lock()
+	repo := interfaces.NewRepository()
+	ifacerepo.Replace(s.state, repo)
+
+	err := repo.AddInterface(&ifacetest.TestInterface{InterfaceName: "random"})
+	c.Assert(err, IsNil)
+
+	snapYaml := `name: test-snap
+type: app
+version: 1
+plugs:
+  my-plug:
+    interface: random
+`
+	info := mockInstalledSnap(c, s.state, snapYaml, "")
+
+	appSet, err := interfaces.NewSnapAppSet(info, nil)
+	c.Assert(err, IsNil)
+	err = repo.AddAppSet(appSet)
+	c.Assert(err, IsNil)
+
+	const coreYaml = `name: core
+version: 1.0
+type: os
+slots:
+  my-slot:
+    interface: random
+`
+	info = mockInstalledSnap(c, s.state, coreYaml, "")
+
+	coreSet, err := interfaces.NewSnapAppSet(info, nil)
+	c.Assert(err, IsNil)
+
+	err = repo.AddAppSet(coreSet)
+	c.Assert(err, IsNil)
+
+	ref := &interfaces.ConnRef{
+		PlugRef: interfaces.PlugRef{Snap: "test-snap", Name: "my-plug"},
+		SlotRef: interfaces.SlotRef{Snap: "core", Name: "my-slot"},
+	}
+	_, err = repo.Connect(ref, nil, nil, nil, nil, nil)
+	c.Assert(err, IsNil)
+	s.state.Unlock()
+
+	stdout, stderr, err := ctlcmd.Run(s.mockContext, []string{"get", "--view", ":my-plug"}, 0)
+	c.Assert(err, ErrorMatches, "cannot use --view with non-confdb plug :my-plug")
+	c.Check(stdout, IsNil)
+	c.Check(stderr, IsNil)
+
+	stdout, stderr, err = ctlcmd.Run(s.mockContext, []string{"set", "--view", ":my-plug", "ssid=my-ssid"}, 0)
+	c.Assert(err, ErrorMatches, "cannot use --view with non-confdb plug :my-plug")
+	c.Check(stdout, IsNil)
+	c.Check(stderr, IsNil)
+}
+
+func (s *confdbSuite) TestConfdbGetAndSetAssertionNotFound(c *C) {
+	storeSigning := assertstest.NewStoreStack("can0nical", nil)
+	db, err := asserts.OpenDatabase(&asserts.DatabaseConfig{
+		Backstore: asserts.NewMemoryBackstore(),
+		Trusted:   storeSigning.Trusted,
+	})
+	c.Assert(err, IsNil)
+	c.Assert(db.Add(storeSigning.StoreAccountKey("")), IsNil)
+
+	s.state.Lock()
+	assertstate.ReplaceDB(s.state, db)
+	s.state.Unlock()
+
+	stdout, stderr, err := ctlcmd.Run(s.mockContext, []string{"get", "--view", ":read-wifi"}, 0)
+	c.Assert(err, ErrorMatches, fmt.Sprintf("cannot find confdb %s/network: assertion not found", s.devAccID))
+	c.Check(stdout, IsNil)
+	c.Check(stderr, IsNil)
+
+	stdout, stderr, err = ctlcmd.Run(s.mockContext, []string{"set", "--view", ":write-wifi", "ssid=my-ssid"}, 0)
+	c.Assert(err, ErrorMatches, fmt.Sprintf("cannot find confdb %s/network: assertion not found", s.devAccID))
+	c.Check(stdout, IsNil)
+	c.Check(stderr, IsNil)
+}
+
+func (s *confdbSuite) TestConfdbGetAndSetViewNotFound(c *C) {
+	headers := map[string]interface{}{
+		"authority-id": s.devAccID,
+		"account-id":   s.devAccID,
+		"revision":     "1",
+		"name":         "network",
+		"views": map[string]interface{}{
+			"other": map[string]interface{}{
+				"rules": []interface{}{
+					map[string]interface{}{"request": "a", "storage": "a"},
+				},
+			},
+		},
+		"timestamp": "2030-11-06T09:16:26Z",
+	}
+
+	body := []byte(`{
+  "storage": {
+    "schema": {
+      "a": "any"
+    }
+  }
+}`)
+
+	as, err := s.signingDB.Sign(asserts.ConfdbType, headers, body, "")
+	c.Assert(err, IsNil)
+	s.state.Lock()
+	c.Assert(assertstate.Add(s.state, as), IsNil)
+	s.state.Unlock()
+
+	stdout, stderr, err := ctlcmd.Run(s.mockContext, []string{"get", "--view", ":read-wifi"}, 0)
+	c.Assert(err, ErrorMatches, fmt.Sprintf("cannot find view \"read-wifi\" in confdb %s/network", s.devAccID))
+	c.Check(stdout, IsNil)
+	c.Check(stderr, IsNil)
+
+	stdout, stderr, err = ctlcmd.Run(s.mockContext, []string{"set", "--view", ":write-wifi", "ssid=my-ssid"}, 0)
+	c.Assert(err, ErrorMatches, fmt.Sprintf("cannot find view \"write-wifi\" in confdb %s/network", s.devAccID))
+	c.Check(stdout, IsNil)
+	c.Check(stderr, IsNil)
+}
+
+func (s *confdbSuite) TestConfdbGetPristine(c *C) {
+	restore := ctlcmd.MockConfdbstateGetStoredTransaction(func(*state.Task) (*confdbstate.Transaction, func(), error) {
+		tx, _ := confdbstate.NewTransaction(s.state, s.devAccID, "network")
+		c.Assert(tx.Set("wifi.ssid", "foo"), IsNil)
+		c.Assert(tx.Commit(s.state, confdb.NewJSONSchema()), IsNil)
+
+		c.Assert(tx.Set("wifi.ssid", "bar"), IsNil)
+		return tx, func() {}, nil
+	})
+	defer restore()
+
+	s.state.Lock()
+	defer s.state.Unlock()
+	task := s.state.NewTask("run-hook", "")
+	setup := &hookstate.HookSetup{Snap: "test-snap", Hook: "save-view-plug"}
+	ctx, err := hookstate.NewContext(task, s.state, setup, s.mockHandler, "")
+	c.Assert(err, IsNil)
+
+	s.state.Unlock()
+	defer s.state.Lock()
+
+	stdout, stderr, err := ctlcmd.Run(ctx, []string{"get", "--view", "--pristine", ":read-wifi", "ssid"}, 0)
+	c.Assert(err, IsNil)
+	c.Check(string(stdout), Equals, "foo\n")
+	c.Check(stderr, IsNil)
+
+	stdout, stderr, err = ctlcmd.Run(ctx, []string{"get", "--view", ":read-wifi", "ssid"}, 0)
+	c.Assert(err, IsNil)
+	c.Check(string(stdout), Equals, "bar\n")
+	c.Check(stderr, IsNil)
+}
+
+func (s *confdbSuite) TestConfdbGetDifferentViewThanOngoingTx(c *C) {
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	tx, err := confdbstate.NewTransaction(s.state, s.devAccID, "network")
+	c.Assert(err, IsNil)
+
+	err = tx.Set("wifi.ssid", "foo")
+	c.Assert(err, IsNil)
+
+	task := s.state.NewTask("run-hook", "")
+	setup := &hookstate.HookSetup{Snap: "test-snap", Hook: "save-view-plug"}
+	ctx, err := hookstate.NewContext(task, s.state, setup, s.mockHandler, "")
+	c.Assert(err, IsNil)
+
+	// set ongoing tx related to the network confdb
+	task.Set("confdb-transaction", tx)
+
+	s.state.Unlock()
+	defer s.state.Lock()
+
+	restore := ctlcmd.MockConfdbstateGetView(func(st *state.State, account, confdbName, viewName string) (*confdb.View, error) {
+		reg, err := confdb.New(s.devAccID, "other", map[string]interface{}{
+			"other": map[string]interface{}{
+				"rules": []interface{}{
+					map[string]interface{}{"request": "ssid", "storage": "ssid"},
+				},
+			},
+		}, confdb.NewJSONSchema())
+		c.Assert(err, IsNil)
+		return reg.View("other"), nil
+	})
+	defer restore()
+
+	stdout, stderr, err := ctlcmd.Run(ctx, []string{"get", "--view", ":other", "ssid"}, 0)
+	// error is for no stored value, meaning we read the right confdb
+	c.Assert(err, ErrorMatches, `.*: no view data`)
+	c.Check(stdout, IsNil)
+	c.Check(stderr, IsNil)
+}
+
+func (s *confdbSuite) TestConfdbExperimentalFlag(c *C) {
+	s.state.Lock()
+	s.setConfdbFlag(false, c)
+	s.state.Unlock()
+
+	for _, cmd := range []string{"get", "set", "unset"} {
+		stdout, stderr, err := ctlcmd.Run(s.mockContext, []string{cmd, "--view", ":read-wifi"}, 0)
+		c.Assert(err, ErrorMatches, i18n.G(`"confdbs" feature flag is disabled: set 'experimental.confdbs' to true`))
+		c.Check(stdout, IsNil)
+		c.Check(stderr, IsNil)
 	}
 }

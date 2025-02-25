@@ -21,12 +21,14 @@ package client_test
 
 import (
 	"encoding/json"
-	"io/ioutil"
+	"io"
+	"time"
 
 	"gopkg.in/check.v1"
 
 	"github.com/snapcore/snapd/client"
 	"github.com/snapcore/snapd/gadget"
+	"github.com/snapcore/snapd/gadget/device"
 	"github.com/snapcore/snapd/snap"
 )
 
@@ -140,7 +142,7 @@ func (cs *clientSuite) TestRequestSystemActionHappy(c *check.C) {
 	c.Check(cs.req.Method, check.Equals, "POST")
 	c.Check(cs.req.URL.Path, check.Equals, "/v2/systems/1234")
 
-	body, err := ioutil.ReadAll(cs.req.Body)
+	body, err := io.ReadAll(cs.req.Body)
 	c.Assert(err, check.IsNil)
 	var req map[string]interface{}
 	err = json.Unmarshal(body, &req)
@@ -182,7 +184,7 @@ func (cs *clientSuite) TestRequestSystemRebootHappy(c *check.C) {
 	c.Check(cs.req.Method, check.Equals, "POST")
 	c.Check(cs.req.URL.Path, check.Equals, "/v2/systems/20201212")
 
-	body, err := ioutil.ReadAll(cs.req.Body)
+	body, err := io.ReadAll(cs.req.Body)
 	c.Assert(err, check.IsNil)
 	var req map[string]interface{}
 	err = json.Unmarshal(body, &req)
@@ -367,9 +369,16 @@ func (cs *clientSuite) TestRequestSystemInstallHappy(c *check.C) {
 			},
 		},
 	}
+	volumesAuth := &device.VolumesAuthOptions{
+		Mode:       device.AuthModePassphrase,
+		Passphrase: "1234",
+		KDFType:    "argon2i",
+		KDFTime:    2 * time.Second,
+	}
 	opts := &client.InstallSystemOptions{
-		Step:      client.InstallStepFinish,
-		OnVolumes: vols,
+		Step:        client.InstallStepFinish,
+		OnVolumes:   vols,
+		VolumesAuth: volumesAuth,
 	}
 	chgID, err := cs.cli.InstallSystem("1234", opts)
 	c.Assert(err, check.IsNil)
@@ -377,7 +386,7 @@ func (cs *clientSuite) TestRequestSystemInstallHappy(c *check.C) {
 	c.Check(cs.req.Method, check.Equals, "POST")
 	c.Check(cs.req.URL.Path, check.Equals, "/v2/systems/1234")
 
-	body, err := ioutil.ReadAll(cs.req.Body)
+	body, err := io.ReadAll(cs.req.Body)
 	c.Assert(err, check.IsNil)
 	var req map[string]interface{}
 	err = json.Unmarshal(body, &req)
@@ -411,6 +420,12 @@ func (cs *clientSuite) TestRequestSystemInstallHappy(c *check.C) {
 					},
 				},
 			},
+		},
+		"volumes-auth": map[string]interface{}{
+			"mode":       "passphrase",
+			"passphrase": "1234",
+			"kdf-type":   "argon2i",
+			"kdf-time":   float64(2 * time.Second),
 		},
 	})
 }

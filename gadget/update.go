@@ -31,6 +31,7 @@ import (
 	"github.com/snapcore/snapd/gadget/quantity"
 	"github.com/snapcore/snapd/kernel"
 	"github.com/snapcore/snapd/logger"
+	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/osutil/disks"
 	"github.com/snapcore/snapd/strutil"
 )
@@ -243,6 +244,8 @@ func isCompatibleSchema(gadgetSchema, diskSchema string) bool {
 		return diskSchema == "gpt"
 	case "mbr":
 		return diskSchema == "dos"
+	case "emmc":
+		return diskSchema == "emmc"
 	default:
 		return false
 	}
@@ -817,12 +820,12 @@ var errSkipUpdateProceedRefresh = errors.New("cannot identify disk for gadget as
 // traits object from disk-mapping.json. It is meant to be used only with all
 // UC16/UC18 installs as well as UC20 installs from before we started writing
 // disk-mapping.json during install mode.
-func buildNewVolumeToDeviceMapping(mod Model, old GadgetData, vols map[string]*Volume) (map[string]DiskVolumeDeviceTraits, error) {
+func buildNewVolumeToDeviceMapping(mod Model, oldVolumes, newVolumes map[string]*Volume) (map[string]DiskVolumeDeviceTraits, error) {
 	var likelySystemBootVolume string
 
 	isPreUC20 := (mod.Grade() == asserts.ModelGradeUnset)
 
-	if len(old.Info.Volumes) == 1 {
+	if len(oldVolumes) == 1 {
 		// If we only have one volume, then that is the volume we are concerned
 		// with, we do not validate that it has a system-boot role on it like
 		// we do in the multi-volume case below, this is because we used to
@@ -830,7 +833,7 @@ func buildNewVolumeToDeviceMapping(mod Model, old GadgetData, vols map[string]*V
 		// at all
 
 		// then we only have one volume to be concerned with
-		for volName := range old.Info.Volumes {
+		for volName := range oldVolumes {
 			likelySystemBootVolume = volName
 		}
 	} else {
@@ -838,7 +841,7 @@ func buildNewVolumeToDeviceMapping(mod Model, old GadgetData, vols map[string]*V
 		// effort and mainly focused on the main volume with system-* roles
 		// on it, we need to pick the volume with that role
 	volumeLoop:
-		for volName, vol := range old.Info.Volumes {
+		for volName, vol := range oldVolumes {
 			for _, structure := range vol.Structure {
 				if structure.Role == SystemBoot {
 					// this is the volume
@@ -865,41 +868,14 @@ func buildNewVolumeToDeviceMapping(mod Model, old GadgetData, vols map[string]*V
 		return nil, fmt.Errorf("cannot find any volume with system-boot, gadget is broken")
 	}
 
-	vol := vols[likelySystemBootVolume]
+	vol := newVolumes[likelySystemBootVolume]
 
 	// search for matching devices that correspond to the gadget volume
-	dev := ""
-	for i := range vol.Structure {
-		// here it is okay that we require there to be either a partition label
-		// or a filesystem label since we require there to be a system-boot role
-		// on this volume which by definition must have a filesystem
-		structureDevice, err := FindDeviceForStructure(&vol.Structure[i])
-		if err == ErrDeviceNotFound {
-			continue
-		}
-		if err != nil {
-			// TODO: should this be a fatal error?
-			return nil, err
-		}
-
-		// we found a device for this structure, get the parent disk
-		// and save that as the device for this volume
-		disk, err := disks.DiskFromPartitionDeviceNode(structureDevice)
-		if err != nil {
-			// TODO: should we keep looping instead and try again with
-			// another structure? it probably wouldn't work because we found
-			// something on disk with the same name as something from the
-			// gadget.yaml, but then we failed to make a disk from that
-			// partition which suggests something is inconsistent with the
-			// state of the disk/udev database
-			return nil, err
-		}
-
-		dev = disk.KernelDeviceNode()
-		break
-	}
-
-	if dev == "" {
+	dev, err := MaybeDeviceForVolume(vol)
+	if err != nil {
+		// TODO: should this be a fatal error?
+		return nil, err
+	} else if dev == "" {
 		// couldn't find a disk at all, pre-UC20 we just warn about this
 		// but let the update continue
 		if isPreUC20 {
@@ -972,11 +948,105 @@ type StructureLocation struct {
 	RootMountPoint string
 }
 
+func buildLocationsForVolumeStructures(vol *Volume, disk disks.Disk, structs map[int]*OnDiskStructure, encryptionParams map[string]StructureEncryptionParameters) (map[int]StructureLocation, error) {
+	locations := make(map[int]StructureLocation)
+	// the index here is 0-based and is equal to VolumeStructure.YamlIndex
+	for volYamlIndex, volStruct := range vol.Structure {
+		structStartOffset := structs[volYamlIndex].StartOffset
+		loc := StructureLocation{}
+
+		if volStruct.HasFilesystem() {
+			// Here we know what disk is associated with this volume, so we
+			// just need to find what partition is associated with this
+			// structure to find it's root mount points. On GPT since
+			// partition labels/names are unique in the partition table, we
+			// could do a lookup by matching partition label, but this won't
+			// work on MBR which doesn't have such a concept, so instead we
+			// use the start offset to locate which disk partition this
+			// structure is equal to.
+			partitions, err := disk.Partitions()
+			if err != nil {
+				return nil, err
+			}
+
+			var foundP disks.Partition
+			found := false
+			for _, p := range partitions {
+				if p.StartInBytes == uint64(structStartOffset) {
+					foundP = p
+					found = true
+					break
+				}
+			}
+			if !found {
+				return nil, fmt.Errorf("cannot locate structure %d on volume %s: no matching start offset", volYamlIndex, vol.Name)
+			}
+
+			// if this structure is an encrypted one, then we can't just
+			// get the root mount points for the device node, we would need
+			// to find the decrypted mapper device for the encrypted device
+			// node and then find the root mount point of the mapper device
+			if _, ok := encryptionParams[volStruct.Name]; ok {
+				logger.Noticef("gadget asset update for assets on encrypted partition %s unsupported", volStruct.Name)
+
+				// leaving this structure as an empty location will
+				// mean when an update to this structure is actually
+				// performed it will fail, but we won't fail updates to
+				// other structures - it is treated like an unmounted
+				// partition
+				locations[volYamlIndex] = loc
+				continue
+			}
+
+			// otherwise normal unencrypted filesystem, find the rw mount
+			// points
+			mountpts, err := disks.MountPointsForPartitionRoot(foundP, map[string]string{"rw": ""})
+			if err != nil {
+				return nil, fmt.Errorf("cannot locate structure %d on volume %s: error searching for root mount points: %v", volYamlIndex, vol.Name, err)
+			}
+			var mountpt string
+			if len(mountpts) == 0 {
+				// this filesystem is not already mounted, we probably
+				// should mount it in order to proceed with the update?
+
+				// TODO: do something better here?
+				logger.Noticef("structure %d on volume %s (%s) is not mounted read/write anywhere to be able to update it", volYamlIndex, vol.Name, foundP.KernelDeviceNode)
+			} else {
+				// use the first one, it doesn't really matter to us
+				// which one is used to update the contents
+				mountpt = mountpts[0]
+			}
+			loc.RootMountPoint = mountpt
+		} else {
+			// no filesystem, the device for this one is just the device
+			// for the disk itself
+			loc.Device = disk.KernelDeviceNode()
+			loc.Offset = structStartOffset
+
+			// Specifically for eMMC devices, the boot0 and boot1 partitions are not
+			// really partitions, but actually pseudo devices. So even though there
+			// is no filesystem, we still must address each sub-device like if the
+			// device had a filesystem
+			if vol.Schema == schemaEMMC {
+				switch volStruct.Name {
+				case "boot0", "boot1":
+					loc.Device += volStruct.Name
+				// rpmb also exists but we do not handle this
+				default:
+					return nil, fmt.Errorf("structure %s on volume %s is not a valid eMMC partition", volStruct.Name, vol.Name)
+				}
+			}
+		}
+		locations[volYamlIndex] = loc
+	}
+	return locations, nil
+}
+
 // buildVolumeStructureToLocation builds a map of gadget volumes to
 // locations and to matched disk structures.
 func buildVolumeStructureToLocation(mod Model,
-	old GadgetData,
-	vols map[string]*Volume,
+	oldVolumes map[string]*Volume,
+	newVolumes map[string]*Volume,
 	volToDeviceMapping map[string]DiskVolumeDeviceTraits,
 	missingInitialMapping bool,
 ) (map[string]map[int]StructureLocation, map[string]map[int]*OnDiskStructure, error) {
@@ -993,8 +1063,8 @@ func buildVolumeStructureToLocation(mod Model,
 		return err
 	}
 
-	volumeStructureToLocation := make(map[string]map[int]StructureLocation, len(old.Info.Volumes))
-	gadgetVolToPartMap := make(map[string]map[int]*OnDiskStructure, len(old.Info.Volumes))
+	volumeStructureToLocation := make(map[string]map[int]StructureLocation, len(oldVolumes))
+	gadgetVolToPartMap := make(map[string]map[int]*OnDiskStructure, len(oldVolumes))
 
 	// now for each volume, iterate over the structures, putting the
 	// necessary info into the map for that volume as we iterate
@@ -1004,15 +1074,14 @@ func buildVolumeStructureToLocation(mod Model,
 	// unsupported structure change is present in the new one, but we check that
 	// situation after we have built the mapping
 	for volName, diskDeviceTraits := range volToDeviceMapping {
-		volumeStructureToLocation[volName] = make(map[int]StructureLocation)
 		gadgetVolToPartMap[volName] = make(map[int]*OnDiskStructure)
-		oldVol, ok := old.Info.Volumes[volName]
+		oldVol, ok := oldVolumes[volName]
 		if !ok {
 			return nil, nil, fmt.Errorf("internal error: volume %s not present in gadget.yaml but present in traits mapping", volName)
 		}
 
-		newVol := vols[volName]
-		if newVol == nil {
+		newVol, ok := newVolumes[volName]
+		if !ok {
 			return nil, nil, fmt.Errorf("internal error: missing volume %s", volName)
 		}
 
@@ -1031,92 +1100,17 @@ func buildVolumeStructureToLocation(mod Model,
 		}
 		gadgetVolToPartMap[volName] = gadgetToDiskStruct
 
-		// the index here is 0-based and is equal to VolumeStructure.YamlIndex
-		for volYamlIndex, volStruct := range oldVol.Structure {
-			structStartOffset := gadgetToDiskStruct[volYamlIndex].StartOffset
-
-			loc := StructureLocation{}
-
-			if volStruct.HasFilesystem() {
-				// Here we know what disk is associated with this volume, so we
-				// just need to find what partition is associated with this
-				// structure to find it's root mount points. On GPT since
-				// partition labels/names are unique in the partition table, we
-				// could do a lookup by matching partition label, but this won't
-				// work on MBR which doesn't have such a concept, so instead we
-				// use the start offset to locate which disk partition this
-				// structure is equal to.
-
-				partitions, err := disk.Partitions()
-				if err != nil {
-					return nil, nil, err
-				}
-
-				var foundP disks.Partition
-				found := false
-				for _, p := range partitions {
-					if p.StartInBytes == uint64(structStartOffset) {
-						foundP = p
-						found = true
-						break
-					}
-				}
-				if !found {
-					dieErr := fmt.Errorf("cannot locate structure %d on volume %s: no matching start offset", volYamlIndex, volName)
-					return nil, nil, maybeFatalError(dieErr)
-				}
-
-				// if this structure is an encrypted one, then we can't just
-				// get the root mount points for the device node, we would need
-				// to find the decrypted mapper device for the encrypted device
-				// node and then find the root mount point of the mapper device
-				if _, ok := diskDeviceTraits.StructureEncryption[volStruct.Name]; ok {
-					logger.Noticef("gadget asset update for assets on encrypted partition %s unsupported", volStruct.Name)
-
-					// leaving this structure as an empty location will
-					// mean when an update to this structure is actually
-					// performed it will fail, but we won't fail updates to
-					// other structures - it is treated like an unmounted
-					// partition
-					volumeStructureToLocation[volName][volYamlIndex] = loc
-					continue
-				}
-
-				// otherwise normal unencrypted filesystem, find the rw mount
-				// points
-				mountpts, err := disks.MountPointsForPartitionRoot(foundP, map[string]string{"rw": ""})
-				if err != nil {
-					dieErr := fmt.Errorf("cannot locate structure %d on volume %s: error searching for root mount points: %v", volYamlIndex, volName, err)
-					return nil, nil, maybeFatalError(dieErr)
-				}
-				var mountpt string
-				if len(mountpts) == 0 {
-					// this filesystem is not already mounted, we probably
-					// should mount it in order to proceed with the update?
-
-					// TODO: do something better here?
-					logger.Noticef("structure %d on volume %s (%s) is not mounted read/write anywhere to be able to update it", volYamlIndex, volName, foundP.KernelDeviceNode)
-				} else {
-					// use the first one, it doesn't really matter to us
-					// which one is used to update the contents
-					mountpt = mountpts[0]
-				}
-				loc.RootMountPoint = mountpt
-			} else {
-				// no filesystem, the device for this one is just the device
-				// for the disk itself
-				loc.Device = disk.KernelDeviceNode()
-				loc.Offset = structStartOffset
-			}
-
-			volumeStructureToLocation[volName][volYamlIndex] = loc
+		locations, err := buildLocationsForVolumeStructures(oldVol, disk, gadgetToDiskStruct, diskDeviceTraits.StructureEncryption)
+		if err != nil {
+			return nil, nil, maybeFatalError(err)
 		}
+		volumeStructureToLocation[volName] = locations
 	}
 
 	return volumeStructureToLocation, gadgetVolToPartMap, nil
 }
 
-func MockVolumeStructureToLocationMap(f func(_ GadgetData, _ Model, _ map[string]*Volume) (
+func MockVolumeStructureToLocationMap(f func(_ Model, _, _ map[string]*Volume) (
 	map[string]map[int]StructureLocation, map[string]map[int]*OnDiskStructure, error)) (restore func()) {
 	old := volumeStructureToLocationMap
 	volumeStructureToLocationMap = f
@@ -1137,7 +1131,7 @@ var volumeStructureToLocationMap = volumeStructureToLocationMapImpl
 // is the volume name and the second key is the yaml index of the
 // structure in the gadget definition. The value is the disk structure
 // that matches the gadget description.
-func volumeStructureToLocationMapImpl(old GadgetData, mod Model, vols map[string]*Volume) (
+func volumeStructureToLocationMapImpl(mod Model, oldVolumes, newVolumes map[string]*Volume) (
 	map[string]map[int]StructureLocation, map[string]map[int]*OnDiskStructure, error) {
 
 	// first try to load the disk-mapping.json volume trait info
@@ -1172,7 +1166,7 @@ func volumeStructureToLocationMapImpl(old GadgetData, mod Model, vols map[string
 		// cases below, we treat this heuristic mapping data the same
 		missingInitialMapping = true
 		var err error
-		volToDeviceMapping, err = buildNewVolumeToDeviceMapping(mod, old, vols)
+		volToDeviceMapping, err = buildNewVolumeToDeviceMapping(mod, oldVolumes, newVolumes)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1185,7 +1179,7 @@ func volumeStructureToLocationMapImpl(old GadgetData, mod Model, vols map[string
 
 		// if there are multiple volumes leave a message that we are only
 		// performing updates for the volume with the system-boot role
-		if len(old.Info.Volumes) != 1 {
+		if len(oldVolumes) != 1 {
 			logger.Noticef("WARNING: gadget has multiple volumes but updates are only being performed for volume %s", volName)
 		}
 	}
@@ -1196,11 +1190,48 @@ func volumeStructureToLocationMapImpl(old GadgetData, mod Model, vols map[string
 	// location to update given the VolumeStructure
 	return buildVolumeStructureToLocation(
 		mod,
-		old,
-		vols,
+		oldVolumes,
+		newVolumes,
 		volToDeviceMapping,
 		missingInitialMapping,
 	)
+}
+
+func validateVolumesMatch(old, new map[string]*Volume) error {
+	oldVolumes := make([]string, 0, len(old))
+	newVolumes := make([]string, 0, len(new))
+
+	for oldVol := range old {
+		oldVolumes = append(oldVolumes, oldVol)
+	}
+	for newVol := range new {
+		newVolumes = append(newVolumes, newVol)
+	}
+	common := strutil.Intersection(newVolumes, oldVolumes)
+	// check dissimilar cases between common, new and old
+	switch {
+	case len(common) != len(newVolumes) && len(common) != len(oldVolumes):
+		// there are both volumes removed from old and volumes added to new
+		return fmt.Errorf("cannot update gadget assets: volumes were both added and removed")
+	case len(common) != len(newVolumes):
+		// then there are volumes in old that are not in new, i.e. a volume
+		// was removed
+		return fmt.Errorf("cannot update gadget assets: volumes were removed")
+	case len(common) != len(oldVolumes):
+		// then there are volumes in new that are not in old, i.e. a volume
+		// was added
+		return fmt.Errorf("cannot update gadget assets: volumes were added")
+	}
+	// check things like assigned device-path switching
+	// at this point here we can assume the lists are identical
+	for name, cvol := range old {
+		// the new one must match
+		nvol := new[name]
+		if cvol.AssignedDevice != nvol.AssignedDevice {
+			return fmt.Errorf("cannot update gadget assets: device assignment is not identical for %q", name)
+		}
+	}
+	return nil
 }
 
 // Update applies the gadget update given the gadget information and data from
@@ -1210,7 +1241,7 @@ func volumeStructureToLocationMapImpl(old GadgetData, mod Model, vols map[string
 //
 // Only structures selected by the update policy are part of the update. When
 // the policy is nil, a default one is used. The default policy selects
-// structures in an opt-in manner, only tructures with a higher value of Edition
+// structures in an opt-in manner, only structures with a higher value of Edition
 // field in the new gadget definition are part of the update.
 //
 // Data that would be modified during the update is first backed up inside the
@@ -1238,30 +1269,21 @@ func volumeStructureToLocationMapImpl(old GadgetData, mod Model, vols map[string
 // d. After step (c) is completed the kernel refresh will now also work (no more
 // violation of rule 1)
 func Update(model Model, old, new GadgetData, rollbackDirPath string, updatePolicy UpdatePolicyFunc, observer ContentUpdateObserver) error {
+	// The gadget can only match if they have identical volumes assigned for the
+	// (currently) matching device
+	oldVolumes, _, err := VolumesForCurrentDevice(old.Info)
+	if err != nil {
+		return fmt.Errorf("cannot update gadget assets: %v", err)
+	}
+	newVolumes, _, err := VolumesForCurrentDevice(new.Info)
+	if err != nil {
+		return fmt.Errorf("cannot update gadget assets: %v", err)
+	}
+
 	// if the volumes from the old and the new gadgets do not match, then fail -
 	// we don't support adding or removing volumes from the gadget.yaml
-	newVolumes := make([]string, 0, len(new.Info.Volumes))
-	oldVolumes := make([]string, 0, len(old.Info.Volumes))
-	for newVol := range new.Info.Volumes {
-		newVolumes = append(newVolumes, newVol)
-	}
-	for oldVol := range old.Info.Volumes {
-		oldVolumes = append(oldVolumes, oldVol)
-	}
-	common := strutil.Intersection(newVolumes, oldVolumes)
-	// check dissimilar cases between common, new and old
-	switch {
-	case len(common) != len(newVolumes) && len(common) != len(oldVolumes):
-		// there are both volumes removed from old and volumes added to new
-		return fmt.Errorf("cannot update gadget assets: volumes were both added and removed")
-	case len(common) != len(newVolumes):
-		// then there are volumes in old that are not in new, i.e. a volume
-		// was removed
-		return fmt.Errorf("cannot update gadget assets: volumes were removed")
-	case len(common) != len(oldVolumes):
-		// then there are volumes in new that are not in old, i.e. a volume
-		// was added
-		return fmt.Errorf("cannot update gadget assets: volumes were added")
+	if err := validateVolumesMatch(oldVolumes, newVolumes); err != nil {
+		return err
 	}
 
 	if updatePolicy == nil {
@@ -1299,7 +1321,7 @@ func Update(model Model, old, new GadgetData, rollbackDirPath string, updatePoli
 	atLeastOneKernelAssetConsumed := false
 
 	// build the map of volume structures to locations and of disk strucutures
-	structureLocations, volToPartsMap, err := volumeStructureToLocationMap(old, model, new.Info.Volumes)
+	structureLocations, volToPartsMap, err := volumeStructureToLocationMap(model, oldVolumes, newVolumes)
 	if err != nil {
 		if err == errSkipUpdateProceedRefresh {
 			// we couldn't successfully build a map for the structure locations,
@@ -1320,8 +1342,8 @@ func Update(model Model, old, new GadgetData, rollbackDirPath string, updatePoli
 
 	allUpdates := []updatePair{}
 	laidOutVols := map[string]*LaidOutVolume{}
-	for volName, oldVol := range old.Info.Volumes {
-		newVol := new.Info.Volumes[volName]
+	for volName, oldVol := range oldVolumes {
+		newVol := newVolumes[volName]
 
 		// layout old partially, without going deep into the layout of structure
 		// content
@@ -1390,7 +1412,7 @@ func Update(model Model, old, new GadgetData, rollbackDirPath string, updatePoli
 		return ErrNoUpdate
 	}
 
-	if len(new.Info.Volumes) != 1 {
+	if len(newVolumes) != 1 {
 		logger.Debugf("gadget asset update routine for multiple volumes")
 
 		// check if the structure location map has only one volume in it - this
@@ -1486,12 +1508,7 @@ func arePartitionTypesCompatible(from, to *VolumeStructure) bool {
 			return true
 		}
 	}
-
-	if isLegacyMBRTransition(from, to) {
-		return true
-	}
-
-	return false
+	return isLegacyMBRTransition(from, to)
 }
 
 // canUpdateStructure checks gadget compatibility on updates, looking only at
@@ -1699,7 +1716,7 @@ func applyUpdates(structureLocations map[string]map[int]StructureLocation, new G
 		if err != nil {
 			return fmt.Errorf("cannot prepare update for volume structure %v on volume %s: %v", one.to, one.volume.Name, err)
 		}
-		up, err := updaterForStructure(loc, one.to, new.RootDir, rollbackDir, observer)
+		up, err := updaterForStructure(loc, one.from, one.to, new.RootDir, rollbackDir, observer)
 		if err != nil {
 			return fmt.Errorf("cannot prepare update for volume structure %v on volume %s: %v", one.to, one.volume.Name, err)
 		}
@@ -1726,6 +1743,9 @@ func applyUpdates(structureLocations map[string]map[int]StructureLocation, new G
 			return fmt.Errorf("cannot observe prepared update: %v", err)
 		}
 	}
+
+	// Inject fault during update of boot assets
+	osutil.MaybeInjectFault("update-boot-assets")
 
 	var updateErr error
 	var updateLastAttempted int
@@ -1772,7 +1792,7 @@ func applyUpdates(structureLocations map[string]map[int]StructureLocation, new G
 
 var updaterForStructure = updaterForStructureImpl
 
-func updaterForStructureImpl(loc StructureLocation, ps *LaidOutStructure, newRootDir, rollbackDir string, observer ContentUpdateObserver) (Updater, error) {
+func updaterForStructureImpl(loc StructureLocation, fromPs *LaidOutStructure, ps *LaidOutStructure, newRootDir, rollbackDir string, observer ContentUpdateObserver) (Updater, error) {
 	// TODO: this is sort of clunky, we already did the lookup, but doing the
 	// lookup out of band from this function makes for easier mocking
 	if !ps.HasFilesystem() {
@@ -1784,12 +1804,12 @@ func updaterForStructureImpl(loc StructureLocation, ps *LaidOutStructure, newRoo
 		lookup := func(ps *LaidOutStructure) (string, error) {
 			return loc.RootMountPoint, nil
 		}
-		return newMountedFilesystemUpdater(ps, rollbackDir, lookup, observer)
+		return newMountedFilesystemUpdater(fromPs, ps, rollbackDir, lookup, observer)
 	}
 }
 
 // MockUpdaterForStructure replace internal call with a mocked one, for use in tests only
-func MockUpdaterForStructure(mock func(loc StructureLocation, ps *LaidOutStructure, rootDir, rollbackDir string, observer ContentUpdateObserver) (Updater, error)) (restore func()) {
+func MockUpdaterForStructure(mock func(loc StructureLocation, fromPs, ps *LaidOutStructure, rootDir, rollbackDir string, observer ContentUpdateObserver) (Updater, error)) (restore func()) {
 	old := updaterForStructure
 	updaterForStructure = mock
 	return func() {

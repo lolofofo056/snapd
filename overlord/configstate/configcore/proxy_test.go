@@ -81,6 +81,8 @@ PATH="/usr/bin"
 
 func (s *proxySuite) TestConfigureProxyUnhappy(c *C) {
 	dirs.SetRootDir(c.MkDir())
+	r := configcore.MockEnvPath("/otherrootfs/etc/environment")
+	defer r()
 	err := configcore.Run(coreDev, &mockConf{
 		state: s.state,
 		conf: map[string]interface{}{
@@ -105,7 +107,8 @@ func (s *proxySuite) TestConfigureProxy(c *C) {
 
 		c.Check(s.mockEtcEnvironment, testutil.FileEquals, fmt.Sprintf(`
 PATH="/usr/bin"
-%[1]s_proxy=%[1]s://example.com`, proto))
+%[1]s_proxy=%[1]s://example.com
+`, proto))
 	}
 }
 
@@ -122,7 +125,8 @@ func (s *proxySuite) TestConfigureNoProxy(c *C) {
 
 	c.Check(s.mockEtcEnvironment, testutil.FileEquals, `
 PATH="/usr/bin"
-no_proxy=example.com,bar.com`)
+no_proxy=example.com,bar.com
+`)
 }
 
 func (s *proxySuite) TestConfigureProxyStore(c *C) {

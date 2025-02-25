@@ -23,7 +23,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
@@ -54,6 +53,7 @@ import (
 	"github.com/snapcore/snapd/seed/seedtest"
 	"github.com/snapcore/snapd/seed/seedwriter"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
 	"github.com/snapcore/snapd/snap/snaptest"
 	"github.com/snapcore/snapd/store"
 	"github.com/snapcore/snapd/store/tooling"
@@ -199,9 +199,11 @@ func (s *imageSuite) SnapAction(_ context.Context, curSnaps []*store.CurrentSnap
 			redirectChannel = channel
 		}
 		info1.Channel = channel
+		comps := s.AssertedSnapComponents(a.InstanceName)
 		sars = append(sars, store.SnapActionResult{
 			Info:            &info1,
 			RedirectChannel: redirectChannel,
+			Resources:       comps,
 		})
 	}
 
@@ -771,7 +773,7 @@ func (s *imageSuite) TestSetupSeed(c *C) {
 	})
 	c.Check(runSnaps[0].Path, testutil.FilePresent)
 
-	l, err := ioutil.ReadDir(seedsnapsdir)
+	l, err := os.ReadDir(seedsnapsdir)
 	c.Assert(err, IsNil)
 	c.Check(l, HasLen, 4)
 
@@ -1197,7 +1199,7 @@ func (s *imageSuite) TestSetupSeedWithBase(c *C) {
 	})
 	c.Check(runSnaps[0].Path, testutil.FilePresent)
 
-	l, err := ioutil.ReadDir(seedsnapsdir)
+	l, err := os.ReadDir(seedsnapsdir)
 	c.Assert(err, IsNil)
 	c.Check(l, HasLen, 5)
 
@@ -1520,7 +1522,7 @@ func (s *imageSuite) TestSetupSeedWithBaseLegacySnap(c *C) {
 	})
 	c.Check(runSnaps[1].Path, testutil.FilePresent)
 
-	l, err := ioutil.ReadDir(seedsnapsdir)
+	l, err := os.ReadDir(seedsnapsdir)
 	c.Assert(err, IsNil)
 	c.Check(l, HasLen, 6)
 
@@ -1657,7 +1659,7 @@ func (s *imageSuite) TestSetupSeedWithBaseDefaultTrackSnap(c *C) {
 	})
 	c.Check(runSnaps[0].Path, testutil.FilePresent)
 
-	l, err := ioutil.ReadDir(seedsnapsdir)
+	l, err := os.ReadDir(seedsnapsdir)
 	c.Assert(err, IsNil)
 	c.Check(l, HasLen, 5)
 
@@ -1800,7 +1802,7 @@ func (s *imageSuite) TestSetupSeedLocalSnapsWithStoreAsserts(c *C) {
 	})
 	c.Check(runSnaps[0].Path, testutil.FilePresent)
 
-	l, err := ioutil.ReadDir(seedsnapsdir)
+	l, err := os.ReadDir(seedsnapsdir)
 	c.Assert(err, IsNil)
 	c.Check(l, HasLen, 4)
 
@@ -2028,7 +2030,7 @@ func (s *imageSuite) TestSetupSeedLocalSnapsWithStoreAssertsValidationEnforce(c 
 	})
 	c.Check(runSnaps[0].Path, testutil.FilePresent)
 
-	l, err := ioutil.ReadDir(seedsnapsdir)
+	l, err := os.ReadDir(seedsnapsdir)
 	c.Assert(err, IsNil)
 	c.Check(l, HasLen, 4)
 
@@ -2237,7 +2239,7 @@ func (s *imageSuite) TestPrepareClassicModelNoModelAssertion(c *C) {
 
 	// check assertions
 	seedassertsdir := filepath.Join(seeddir, "assertions")
-	l, err := ioutil.ReadDir(seedassertsdir)
+	l, err := os.ReadDir(seedassertsdir)
 	c.Assert(err, IsNil)
 	c.Check(l, HasLen, 9)
 }
@@ -2863,7 +2865,7 @@ func (s *imageSuite) TestSetupSeedClassic(c *C) {
 	})
 	c.Check(runSnaps[0].Path, testutil.FilePresent)
 
-	l, err := ioutil.ReadDir(seedsnapsdir)
+	l, err := os.ReadDir(seedsnapsdir)
 	c.Assert(err, IsNil)
 	c.Check(l, HasLen, 3)
 
@@ -2973,7 +2975,7 @@ func (s *imageSuite) TestSetupSeedClassicUC20(c *C) {
 	})
 	c.Check(runSnaps[0].Path, testutil.FilePresent)
 
-	l, err := ioutil.ReadDir(seedsnapsdir)
+	l, err := os.ReadDir(seedsnapsdir)
 	c.Assert(err, IsNil)
 	c.Check(l, HasLen, 5)
 
@@ -3036,7 +3038,7 @@ func (s *imageSuite) TestSetupSeedClassicWithLocalClassicSnap(c *C) {
 	})
 	c.Check(runSnaps[0].Path, testutil.FilePresent)
 
-	l, err := ioutil.ReadDir(seedsnapsdir)
+	l, err := os.ReadDir(seedsnapsdir)
 	c.Assert(err, IsNil)
 	c.Check(l, HasLen, 2)
 
@@ -3105,7 +3107,7 @@ func (s *imageSuite) TestSetupSeedClassicSnapdOnly(c *C) {
 	})
 	c.Check(runSnaps[0].Path, testutil.FilePresent)
 
-	l, err := ioutil.ReadDir(seedsnapsdir)
+	l, err := os.ReadDir(seedsnapsdir)
 	c.Assert(err, IsNil)
 	c.Check(l, HasLen, 4)
 
@@ -3150,7 +3152,7 @@ func (s *imageSuite) TestSetupSeedClassicNoSnaps(c *C) {
 	c.Check(essSnaps, HasLen, 0)
 	c.Check(runSnaps, HasLen, 0)
 
-	l, err := ioutil.ReadDir(seedsnapsdir)
+	l, err := os.ReadDir(seedsnapsdir)
 	c.Assert(err, IsNil)
 	c.Check(l, HasLen, 0)
 
@@ -3240,6 +3242,10 @@ func (s *imageSuite) makeSnap(c *C, yamlKey string, files [][]string, revno snap
 }
 
 func (s *imageSuite) makeUC20Model(extraHeaders map[string]interface{}) *asserts.Model {
+	comps := map[string]interface{}{
+		"comp1": "required",
+		"comp2": "optional",
+	}
 	headers := map[string]interface{}{
 		"display-name": "my model",
 		"architecture": "amd64",
@@ -3258,8 +3264,9 @@ func (s *imageSuite) makeUC20Model(extraHeaders map[string]interface{}) *asserts
 				"default-channel": "20",
 			},
 			map[string]interface{}{
-				"name": "required20",
-				"id":   s.AssertedSnapID("required20"),
+				"name":       "required20",
+				"id":         s.AssertedSnapID("required20"),
+				"components": comps,
 			}},
 	}
 	for k, v := range extraHeaders {
@@ -3288,7 +3295,12 @@ func (s *imageSuite) testSetupSeedCore20Grub(c *C, kernelContent [][]string, exp
 		{"meta/gadget.yaml", pcUC20GadgetYaml},
 	}
 	s.makeSnap(c, "pc=20", gadgetContent, snap.R(22), "")
-	s.makeSnap(c, "required20", nil, snap.R(21), "other")
+	comRevs := map[string]snap.Revision{
+		"comp1": snap.R(22),
+		"comp2": snap.R(33),
+	}
+	s.SeedSnaps.MakeAssertedSnapWithComps(c, seedtest.SampleSnapYaml["required20"], nil,
+		snap.R(21), comRevs, "other", s.StoreSigning.Database)
 
 	opts := &image.Options{
 		PrepareDir: prepareDir,
@@ -3332,17 +3344,38 @@ func (s *imageSuite) testSetupSeedCore20Grub(c *C, kernelContent [][]string, exp
 			Channel:       channel,
 		})
 	}
+	// comp2 is optional in our model so it has not been included
+	// as it was not in the options either
+	cref1 := naming.NewComponentRef("required20", "comp1")
 	c.Check(runSnaps[0], DeepEquals, &seed.Snap{
 		Path:     filepath.Join(seedsnapsdir, "required20_21.snap"),
 		SideInfo: &s.AssertedSnapInfo("required20").SideInfo,
 		Required: true,
 		Channel:  stableChannel,
+		Components: []seed.Component{
+			{
+				Path:         filepath.Join(seedsnapsdir, "required20+comp1_22.comp"),
+				CompSideInfo: *snap.NewComponentSideInfo(cref1, snap.R(22)),
+			},
+		},
 	})
 	c.Check(runSnaps[0].Path, testutil.FilePresent)
 
-	l, err := ioutil.ReadDir(seedsnapsdir)
+	l, err := os.ReadDir(seedsnapsdir)
 	c.Assert(err, IsNil)
-	c.Check(l, HasLen, 5)
+	foundFiles := map[string]bool{}
+	for _, entry := range l {
+		foundFiles[entry.Name()] = true
+	}
+	expectedFiles := map[string]bool{
+		"snapd_1.snap":             true,
+		"pc-kernel_1.snap":         true,
+		"core20_20.snap":           true,
+		"pc_22.snap":               true,
+		"required20_21.snap":       true,
+		"required20+comp1_22.comp": true,
+	}
+	c.Check(foundFiles, DeepEquals, expectedFiles)
 
 	// check boot config
 	grubCfg := filepath.Join(prepareDir, "system-seed", "EFI/ubuntu/grub.cfg")
@@ -3407,12 +3440,21 @@ func (s *imageSuite) testSetupSeedCore20Grub(c *C, kernelContent [][]string, exp
 		Flags:        store.SnapActionIgnoreValidation,
 	})
 	declCount := 0
+	compsWithResRevAssert := map[string]bool{}
+	compsWithResPairAssert := map[string]bool{}
 	for _, req := range s.assertReqs {
-		if req.ref.Type == asserts.SnapDeclarationType {
+		switch req.ref.Type {
+		case asserts.SnapDeclarationType:
 			c.Check(req.maxFormats, DeepEquals, expectedAssertMaxFormats)
 			declCount += 1
+		case asserts.SnapResourceRevisionType:
+			compsWithResRevAssert[req.ref.PrimaryKey[1]] = true
+		case asserts.SnapResourcePairType:
+			compsWithResPairAssert[req.ref.PrimaryKey[1]] = true
 		}
 	}
+	c.Check(compsWithResRevAssert, DeepEquals, map[string]bool{"comp1": true})
+	c.Check(compsWithResPairAssert, DeepEquals, map[string]bool{"comp1": true})
 	c.Check(declCount, Equals, 5)
 }
 
@@ -3505,7 +3547,7 @@ func (s *imageSuite) TestSetupSeedCore20UBoot(c *C) {
 	essSnaps, runSnaps, _ := s.loadSeed(c, seeddir)
 	c.Check(essSnaps, HasLen, 4)
 	c.Check(runSnaps, HasLen, 0)
-	l, err := ioutil.ReadDir(seedsnapsdir)
+	l, err := os.ReadDir(seedsnapsdir)
 	c.Assert(err, IsNil)
 	c.Check(l, HasLen, 4)
 
@@ -3671,7 +3713,7 @@ func (s *imageSuite) TestSetupSeedCore20DelegatedSnap(c *C) {
 		"account-id": "my-brand",
 		"provenance": []interface{}{"delegated-prov"},
 	}
-	s.MakeAssertedDelegatedSnap(c, seedtest.SampleSnapYaml["required20"]+"\nprovenance: delegated-prov\n", nil, snap.R(1), "my-brand", "my-brand", "delegated-prov", ra, s.StoreSigning.Database)
+	s.MakeAssertedDelegatedSnap(c, seedtest.SampleSnapYaml["required20"]+"\nprovenance: delegated-prov\n", nil, snap.R(1), "my-brand", "my-brand", "delegated-prov", "delegated-prov", ra, s.StoreSigning.Database)
 
 	opts := &image.Options{
 		PrepareDir: prepareDir,
@@ -3683,6 +3725,92 @@ func (s *imageSuite) TestSetupSeedCore20DelegatedSnap(c *C) {
 
 	err := image.SetupSeed(s.tsto, model, opts)
 	c.Check(err, IsNil)
+}
+
+func (s *imageSuite) TestSetupSeedCore20DelegatedComponentMismatch(c *C) {
+	bootloader.Force(nil)
+	restore := image.MockTrusted(s.StoreSigning.Trusted)
+	defer restore()
+
+	// a model that uses core20
+	model := s.makeUC20Model(nil)
+
+	prepareDir := c.MkDir()
+
+	s.makeSnap(c, "snapd", [][]string{snapdInfoFile}, snap.R(1), "")
+	s.makeSnap(c, "core20", nil, snap.R(20), "")
+	s.makeSnap(c, "pc-kernel=20", nil, snap.R(1), "")
+	gadgetContent := [][]string{
+		{"grub.conf", "# boot grub.cfg"},
+		{"meta/gadget.yaml", pcUC20GadgetYaml},
+	}
+	s.makeSnap(c, "pc=20", gadgetContent, snap.R(22), "")
+
+	ra := map[string]interface{}{
+		"account-id": "my-brand",
+		"provenance": []interface{}{"delegated-prov"},
+	}
+	s.MakeAssertedDelegatedSnap(
+		c,
+		seedtest.SampleSnapYaml["required20"]+"\nprovenance: delegated-prov\n",
+		nil,
+		snap.R(1),
+		"my-brand",
+		"my-brand",
+		"delegated-prov",
+		"", // note the missing provenance here
+		ra,
+		s.StoreSigning.Database,
+	)
+
+	opts := &image.Options{
+		PrepareDir: prepareDir,
+		Customizations: image.Customizations{
+			BootFlags:  []string{"factory"},
+			Validation: "ignore",
+		},
+	}
+
+	err := image.SetupSeed(s.tsto, model, opts)
+	c.Check(err, ErrorMatches, `component .* has been signed under provenance "delegated-prov" different from the metadata one: "global-upload"`)
+}
+
+func (s *imageSuite) TestSetupSeedCore20ComponentTamperedWith(c *C) {
+	bootloader.Force(nil)
+	restore := image.MockTrusted(s.StoreSigning.Trusted)
+	defer restore()
+
+	// a model that uses core20
+	model := s.makeUC20Model(nil)
+
+	prepareDir := c.MkDir()
+
+	s.TamperWithResourceRevisions = func(headers map[string]interface{}) {
+		n, err := strconv.Atoi(headers["resource-revision"].(string))
+		c.Assert(err, IsNil)
+		headers["resource-revision"] = strconv.Itoa(n + 1)
+	}
+
+	s.makeSnap(c, "snapd", [][]string{snapdInfoFile}, snap.R(1), "")
+	s.makeSnap(c, "core20", nil, snap.R(20), "")
+	s.makeSnap(c, "pc-kernel=20", nil, snap.R(1), "")
+	gadgetContent := [][]string{
+		{"grub.conf", "# boot grub.cfg"},
+		{"meta/gadget.yaml", pcUC20GadgetYaml},
+	}
+	s.makeSnap(c, "pc=20", gadgetContent, snap.R(22), "")
+	s.makeSnap(c, "required20", nil, snap.R(1), "")
+
+	opts := &image.Options{
+		PrepareDir: prepareDir,
+		Customizations: image.Customizations{
+			BootFlags:  []string{"factory"},
+			Validation: "ignore",
+		},
+	}
+
+	err := image.SetupSeed(s.tsto, model, opts)
+	c.Check(err, ErrorMatches, `resource "comp1" does not have expected revision according to assertions \(metadata is broken or tampered\): 77 != 78`)
 }
 
 func (s *imageSuite) prepSetupSeedCore20DelegatedSnapAssertionMaxFormats(c *C) {
@@ -3712,7 +3840,7 @@ func (s *imageSuite) TestSetupSeedCore20DelegatedSnapAssertionMaxFormatsHappy(c 
 		"account-id": "my-brand",
 		"provenance": []interface{}{"delegated-prov"},
 	}
-	s.MakeAssertedDelegatedSnap(c, seedtest.SampleSnapYaml["required20"]+"\nprovenance: delegated-prov\n", nil, snap.R(1), "my-brand", "my-brand", "delegated-prov", ra, s.StoreSigning.Database)
+	s.MakeAssertedDelegatedSnap(c, seedtest.SampleSnapYaml["required20"]+"\nprovenance: delegated-prov\n", nil, snap.R(1), "my-brand", "my-brand", "delegated-prov", "delegated-prov", ra, s.StoreSigning.Database)
 
 	s.addSnapDecl(c, "required20", "my-brand", map[string]interface{}{
 		"revision":           "1",
@@ -3781,7 +3909,7 @@ func (s *imageSuite) TestSetupSeedCore20DelegatedSnapAssertionMaxFormatsAuthorit
 		"account-id": "my-brand",
 		"provenance": []interface{}{"delegated-prov"},
 	}
-	s.MakeAssertedDelegatedSnap(c, seedtest.SampleSnapYaml["required20"]+"\nprovenance: delegated-prov\n", nil, snap.R(1), "my-brand", "my-brand", "delegated-prov", ra, s.StoreSigning.Database)
+	s.MakeAssertedDelegatedSnap(c, seedtest.SampleSnapYaml["required20"]+"\nprovenance: delegated-prov\n", nil, snap.R(1), "my-brand", "my-brand", "delegated-prov", "delegated-prov", ra, s.StoreSigning.Database)
 
 	// format 4 will be used but does not have revision-authority set up
 	s.addSnapDecl(c, "required20", "my-brand", map[string]interface{}{
@@ -3894,7 +4022,7 @@ func (s *imageSuite) testSetupSeedWithMixedSnapsAndRevisions(c *C, rules map[str
 		})
 	}
 
-	l, err := ioutil.ReadDir(seedsnapsdir)
+	l, err := os.ReadDir(seedsnapsdir)
 	c.Assert(err, IsNil)
 	c.Check(l, HasLen, 4)
 
@@ -3982,7 +4110,12 @@ func (s *imageSuite) TestSetupSeedSnapRevisionsDownloadHappy(c *C) {
 		{"meta/gadget.yaml", pcUC20GadgetYaml},
 	}
 	s.makeSnap(c, "pc=20", gadgetContent, snap.R(12), "")
-	s.makeSnap(c, "required20", nil, snap.R(59), "other")
+	comRevs := map[string]snap.Revision{
+		"comp1": snap.R(22),
+		"comp2": snap.R(33),
+	}
+	s.SeedSnaps.MakeAssertedSnapWithComps(c, seedtest.SampleSnapYaml["required20"], nil,
+		snap.R(59), comRevs, "other", s.StoreSigning.Database)
 
 	opts := &image.Options{
 		PrepareDir: prepareDir,
@@ -3990,6 +4123,8 @@ func (s *imageSuite) TestSetupSeedSnapRevisionsDownloadHappy(c *C) {
 			BootFlags:  []string{"factory"},
 			Validation: "ignore",
 		},
+		// ask for inclusion of optional component comp2
+		Components: []string{"required20+comp2"},
 		SeedManifest: seedwriter.MockManifest(map[string]*seedwriter.ManifestSnapRevision{
 			"snapd":      {SnapName: "snapd", Revision: snap.R(133)},
 			"core20":     {SnapName: "core20", Revision: snap.R(58)},
@@ -4033,17 +4168,42 @@ func (s *imageSuite) TestSetupSeedSnapRevisionsDownloadHappy(c *C) {
 			Channel:       channel,
 		})
 	}
+	cref1 := naming.NewComponentRef("required20", "comp1")
+	cref2 := naming.NewComponentRef("required20", "comp2")
 	c.Check(runSnaps[0], DeepEquals, &seed.Snap{
 		Path:     filepath.Join(seedsnapsdir, "required20_59.snap"),
 		SideInfo: &s.AssertedSnapInfo("required20").SideInfo,
 		Required: true,
 		Channel:  stableChannel,
+		Components: []seed.Component{
+			{
+				Path:         filepath.Join(seedsnapsdir, "required20+comp1_22.comp"),
+				CompSideInfo: *snap.NewComponentSideInfo(cref1, snap.R(22)),
+			},
+			{
+				Path:         filepath.Join(seedsnapsdir, "required20+comp2_33.comp"),
+				CompSideInfo: *snap.NewComponentSideInfo(cref2, snap.R(33)),
+			},
+		},
 	})
 	c.Check(runSnaps[0].Path, testutil.FilePresent)
 
-	l, err := ioutil.ReadDir(seedsnapsdir)
+	l, err := os.ReadDir(seedsnapsdir)
 	c.Assert(err, IsNil)
-	c.Check(l, HasLen, 5)
+	foundFiles := map[string]bool{}
+	for _, entry := range l {
+		foundFiles[entry.Name()] = true
+	}
+	expectFiles := map[string]bool{
+		"snapd_133.snap":           true,
+		"pc-kernel_15.snap":        true,
+		"core20_58.snap":           true,
+		"pc_12.snap":               true,
+		"required20_59.snap":       true,
+		"required20+comp1_22.comp": true,
+		"required20+comp2_33.comp": true,
+	}
+	c.Check(foundFiles, DeepEquals, expectFiles)
 
 	// check the downloads
 	c.Check(s.storeActionsBunchSizes, DeepEquals, []int{5})
@@ -4077,6 +4237,21 @@ func (s *imageSuite) TestSetupSeedSnapRevisionsDownloadHappy(c *C) {
 		Revision:     snap.R(59),
 		Flags:        store.SnapActionIgnoreValidation,
 	})
+
+	compsWithResRevAssert := map[string]bool{}
+	compsWithResPairAssert := map[string]bool{}
+	for _, req := range s.assertReqs {
+		switch req.ref.Type {
+		case asserts.SnapResourceRevisionType:
+			compsWithResRevAssert[req.ref.PrimaryKey[1]] = true
+		case asserts.SnapResourcePairType:
+			compsWithResPairAssert[req.ref.PrimaryKey[1]] = true
+		}
+	}
+	c.Check(compsWithResRevAssert, DeepEquals, map[string]bool{
+		"comp1": true, "comp2": true})
+	c.Check(compsWithResPairAssert, DeepEquals, map[string]bool{
+		"comp1": true, "comp2": true})
 }
 
 func (s *imageSuite) TestSetupSeedSnapRevisionsDownloadWrongRevision(c *C) {
@@ -4234,7 +4409,7 @@ func (s *imageSuite) TestLocalSnapRevisionMatchingStoreRevision(c *C) {
 	})
 	c.Check(runSnaps[0].Path, testutil.FilePresent)
 
-	l, err := ioutil.ReadDir(seedsnapsdir)
+	l, err := os.ReadDir(seedsnapsdir)
 	c.Assert(err, IsNil)
 	c.Check(l, HasLen, 4)
 
@@ -4284,6 +4459,142 @@ func (s *imageSuite) TestLocalSnapRevisionMatchingStoreRevision(c *C) {
 			TrackingChannel:  "stable",
 			Epoch:            snap.E("0"),
 			IgnoreValidation: false,
+		},
+	})
+}
+
+func (s *imageSuite) TestLocalSnapWithCompsRevisionMatchingStoreRevision(c *C) {
+	bootloader.Force(nil)
+	restore := image.MockTrusted(s.StoreSigning.Trusted)
+	defer restore()
+
+	prepareDir := c.MkDir()
+
+	s.makeSnap(c, "snapd", [][]string{snapdInfoFile}, snap.R(1), "")
+	s.makeSnap(c, "core20", nil, snap.R(20), "")
+	s.makeSnap(c, "pc-kernel=20", nil, snap.R(1), "")
+	gadgetContent := [][]string{
+		{"grub-recovery.conf", "# recovery grub.cfg"},
+		{"grub.conf", "# boot grub.cfg"},
+		{"meta/gadget.yaml", pcUC20GadgetYaml},
+	}
+	s.makeSnap(c, "pc=20", gadgetContent, snap.R(22), "")
+	comRevs := map[string]snap.Revision{
+		"comp1": snap.R(22),
+		"comp2": snap.R(33),
+	}
+	s.SeedSnaps.MakeAssertedSnapWithComps(c, seedtest.SampleSnapYaml["required20"], nil,
+		snap.R(21), comRevs, "other", s.StoreSigning.Database)
+
+	model := s.makeUC20Model(nil)
+
+	opts := &image.Options{
+		Snaps: []string{
+			s.AssertedSnap("required20"),
+		},
+		Components: []string{
+			s.AssertedSnap("required20+comp1"),
+			s.AssertedSnap("required20+comp2"),
+		},
+		PrepareDir: prepareDir,
+		Customizations: image.Customizations{
+			Validation: "ignore",
+		},
+	}
+
+	err := image.SetupSeed(s.tsto, model, opts)
+	c.Assert(err, IsNil)
+
+	// check seed
+	seeddir := filepath.Join(prepareDir, "system-seed")
+	seedsnapsdir := filepath.Join(seeddir, "snaps")
+	essSnaps, runSnaps, roDB := s.loadSeed(c, seeddir)
+	c.Check(essSnaps, HasLen, 4)
+	c.Check(runSnaps, HasLen, 1)
+
+	// check the files are in place
+	essChannel := []string{"latest/stable", "20", "latest/stable", "20"}
+	essNames := []string{"snapd", "pc-kernel", "core20", "pc"}
+	for i, name := range essNames {
+		info := s.AssertedSnapInfo(name)
+		fn := info.Filename()
+		p := filepath.Join(seedsnapsdir, fn)
+		c.Check(p, testutil.FilePresent)
+		c.Check(essSnaps[i], DeepEquals, &seed.Snap{
+			Path:          p,
+			SideInfo:      &info.SideInfo,
+			EssentialType: info.Type(),
+			Essential:     true,
+			Required:      true,
+			Channel:       essChannel[i],
+		})
+	}
+	cref1 := naming.NewComponentRef("required20", "comp1")
+	cref2 := naming.NewComponentRef("required20", "comp2")
+	c.Check(runSnaps[0], DeepEquals, &seed.Snap{
+		Path:     filepath.Join(seedsnapsdir, "required20_21.snap"),
+		Required: true,
+		SideInfo: &snap.SideInfo{
+			RealName: "required20",
+			SnapID:   s.AssertedSnapID("required20"),
+			Revision: snap.R(21),
+		},
+		Channel: "latest/stable",
+		Components: []seed.Component{
+			{
+				Path:         filepath.Join(seedsnapsdir, "required20+comp1_22.comp"),
+				CompSideInfo: *snap.NewComponentSideInfo(cref1, snap.R(22)),
+			},
+			{
+				Path:         filepath.Join(seedsnapsdir, "required20+comp2_33.comp"),
+				CompSideInfo: *snap.NewComponentSideInfo(cref2, snap.R(33)),
+			},
+		},
+	})
+	c.Check(runSnaps[0].Path, testutil.FilePresent)
+	// Check components exist
+	// TODO:COMPS: check components when added to seed.Snap type
+	c.Check(filepath.Join(seedsnapsdir, "required20+comp1_22.comp"), testutil.FilePresent)
+	c.Check(filepath.Join(seedsnapsdir, "required20+comp2_33.comp"), testutil.FilePresent)
+
+	l, err := os.ReadDir(seedsnapsdir)
+	c.Assert(err, IsNil)
+	c.Check(l, HasLen, 7)
+
+	// check assertions
+	decls, err := roDB.FindMany(asserts.SnapDeclarationType, nil)
+	c.Assert(err, IsNil)
+	c.Check(decls, HasLen, 5)
+
+	resRevs, err := roDB.FindMany(asserts.SnapResourceRevisionType, nil)
+	c.Assert(err, IsNil)
+	c.Check(resRevs, HasLen, 2)
+	resPairRevs, err := roDB.FindMany(asserts.SnapResourcePairType, nil)
+	c.Assert(err, IsNil)
+	c.Check(resPairRevs, HasLen, 2)
+
+	// check the downloads, make sure no downloads for required20 and its
+	// components are present as we are using local files for this.
+	c.Check(s.storeActionsBunchSizes, DeepEquals, []int{4})
+	for i := range s.storeActions {
+		c.Check(s.storeActions[i], DeepEquals, &store.SnapAction{
+			Action:       "download",
+			InstanceName: essNames[i],
+			Channel:      essChannel[i],
+			Flags:        store.SnapActionIgnoreValidation,
+		})
+	}
+
+	// Verify that the local file is of correct revision
+	c.Check(s.curSnaps, HasLen, 1)
+	c.Check(s.curSnaps[0], DeepEquals, []*store.CurrentSnap{
+		{
+			InstanceName:     "required20",
+			SnapID:           s.AssertedSnapID("required20"),
+			Revision:         snap.R(21),
+			TrackingChannel:  "stable",
+			Epoch:            snap.E("0"),
+			IgnoreValidation: true,
 		},
 	})
 }
@@ -4876,4 +5187,244 @@ func (s *imageSuite) TestSetupSeedFetchText(c *C) {
 	c.Assert(s.stdout.String(), testutil.Contains, "Fetching pc-kernel (2)")
 	c.Assert(s.stdout.String(), testutil.Contains, "Fetching pc (10)")
 	c.Assert(s.stdout.String(), testutil.Contains, "Fetching required20 (2)")
+}
+
+func (s *imageSuite) TestSetupSeedLocalComponents(c *C) {
+	bootloader.Force(nil)
+	restore := image.MockTrusted(s.StoreSigning.Trusted)
+	defer restore()
+
+	// a model that uses core20
+	model := s.makeUC20Model(map[string]interface{}{"grade": "dangerous"})
+
+	prepareDir := c.MkDir()
+
+	s.makeSnap(c, "snapd", [][]string{snapdInfoFile}, snap.R(1), "")
+	s.makeSnap(c, "core20", nil, snap.R(20), "")
+	s.makeSnap(c, "pc-kernel=20", nil, snap.R(1), "")
+	gadgetContent := [][]string{
+		{"grub.conf", "# boot grub.cfg"},
+		{"meta/gadget.yaml", pcUC20GadgetYaml},
+	}
+	s.makeSnap(c, "pc=20", gadgetContent, snap.R(22), "")
+
+	snapFile := snaptest.MakeTestSnapWithFiles(c, seedtest.SampleSnapYaml["required20"], nil)
+	comp1File := snaptest.MakeTestComponent(c, seedtest.SampleSnapYaml["required20+comp1"])
+	comp2File := snaptest.MakeTestComponent(c, seedtest.SampleSnapYaml["required20+comp2"])
+
+	opts := &image.Options{
+		PrepareDir: prepareDir,
+		Customizations: image.Customizations{
+			BootFlags:  []string{"factory"},
+			Validation: "ignore",
+		},
+		Snaps:      []string{snapFile},
+		Components: []string{comp1File, comp2File},
+	}
+
+	err := image.SetupSeed(s.tsto, model, opts)
+	c.Assert(err, IsNil)
+
+	// check seed
+	seeddir := filepath.Join(prepareDir, "system-seed")
+	seedsnapsdir := filepath.Join(seeddir, "snaps")
+	essSnaps, runSnaps, _ := s.loadSeed(c, seeddir)
+	c.Check(essSnaps, HasLen, 4)
+	c.Check(runSnaps, HasLen, 1)
+
+	stableChannel := "latest/stable"
+
+	// check the files are in place
+	for i, name := range []string{"snapd", "pc-kernel", "core20", "pc"} {
+		info := s.AssertedSnapInfo(name)
+
+		channel := stableChannel
+		switch name {
+		case "pc", "pc-kernel":
+			channel = "20"
+		}
+
+		fn := info.Filename()
+		p := filepath.Join(seedsnapsdir, fn)
+		c.Check(p, testutil.FilePresent)
+		c.Check(essSnaps[i], DeepEquals, &seed.Snap{
+			Path:          p,
+			SideInfo:      &info.SideInfo,
+			EssentialType: info.Type(),
+			Essential:     true,
+			Required:      true,
+			Channel:       channel,
+		})
+	}
+	expectedLabel := image.MakeLabel(time.Now())
+	extraSnapsDir := filepath.Join(seeddir, "systems", expectedLabel, "snaps")
+	cref1 := naming.NewComponentRef("required20", "comp1")
+	cref2 := naming.NewComponentRef("required20", "comp2")
+	c.Check(runSnaps[0], DeepEquals, &seed.Snap{
+		Path: filepath.Join(extraSnapsDir, "required20_1.0.snap"),
+		SideInfo: &snap.SideInfo{
+			RealName: "required20",
+		},
+		Required: true,
+		Components: []seed.Component{
+			{
+				Path:         filepath.Join(extraSnapsDir, "required20+comp1_1.0.comp"),
+				CompSideInfo: *snap.NewComponentSideInfo(cref1, snap.R(0)),
+			},
+			{
+				Path:         filepath.Join(extraSnapsDir, "required20+comp2_2.0.comp"),
+				CompSideInfo: *snap.NewComponentSideInfo(cref2, snap.R(0)),
+			},
+		},
+	})
+	c.Check(runSnaps[0].Path, testutil.FilePresent)
+
+	c.Check(osutil.FileExists(filepath.Join(extraSnapsDir, "required20+comp1_1.0.comp")),
+		Equals, true)
+	c.Check(osutil.FileExists(filepath.Join(extraSnapsDir, "required20+comp2_2.0.comp")),
+		Equals, true)
+
+	l, err := os.ReadDir(seedsnapsdir)
+	c.Assert(err, IsNil)
+	c.Check(l, HasLen, 4)
+
+	l, err = os.ReadDir(extraSnapsDir)
+	c.Assert(err, IsNil)
+	c.Check(l, HasLen, 3)
+
+	// check boot config
+	grubCfg := filepath.Join(prepareDir, "system-seed", "EFI/ubuntu/grub.cfg")
+	seedGrubenv := filepath.Join(prepareDir, "system-seed", "EFI/ubuntu/grubenv")
+	grubRecoveryCfgAsset := assets.Internal("grub-recovery.cfg")
+	c.Assert(grubRecoveryCfgAsset, NotNil)
+	c.Check(grubCfg, testutil.FileEquals, string(grubRecoveryCfgAsset))
+	// make sure that grub.cfg and grubenv are the only files present inside
+	// the directory
+	gl, err := filepath.Glob(filepath.Join(prepareDir, "system-seed/EFI/ubuntu/*"))
+	c.Assert(err, IsNil)
+	c.Check(gl, DeepEquals, []string{
+		grubCfg,
+		seedGrubenv,
+	})
+
+	// check recovery system specific config
+	systems, err := filepath.Glob(filepath.Join(seeddir, "systems", "*"))
+	c.Assert(err, IsNil)
+	c.Assert(systems, HasLen, 1)
+
+	seedGenv := grubenv.NewEnv(seedGrubenv)
+	c.Assert(seedGenv.Load(), IsNil)
+	c.Check(seedGenv.Get("snapd_recovery_system"), Equals, filepath.Base(systems[0]))
+	c.Check(seedGenv.Get("snapd_recovery_mode"), Equals, "install")
+	c.Check(seedGenv.Get("snapd_boot_flags"), Equals, "factory")
+
+	systemGenv := grubenv.NewEnv(filepath.Join(systems[0], "grubenv"))
+	c.Assert(systemGenv.Load(), IsNil)
+	c.Check(systemGenv.Get("snapd_recovery_kernel"), Equals, "/snaps/pc-kernel_1.snap")
+
+	// check the downloads
+	c.Check(s.storeActionsBunchSizes, DeepEquals, []int{4})
+	c.Check(s.storeActions[0], DeepEquals, &store.SnapAction{
+		Action:       "download",
+		InstanceName: "snapd",
+		Channel:      stableChannel,
+		Flags:        store.SnapActionIgnoreValidation,
+	})
+	c.Check(s.storeActions[1], DeepEquals, &store.SnapAction{
+		Action:       "download",
+		InstanceName: "pc-kernel",
+		Channel:      "20",
+		Flags:        store.SnapActionIgnoreValidation,
+	})
+	c.Check(s.storeActions[2], DeepEquals, &store.SnapAction{
+		Action:       "download",
+		InstanceName: "core20",
+		Channel:      stableChannel,
+		Flags:        store.SnapActionIgnoreValidation,
+	})
+	c.Check(s.storeActions[3], DeepEquals, &store.SnapAction{
+		Action:       "download",
+		InstanceName: "pc",
+		Channel:      "20",
+		Flags:        store.SnapActionIgnoreValidation,
+	})
+}
+
+func (s *imageSuite) TestSetupSeedLocalComponentsNoLocalSnap(c *C) {
+	bootloader.Force(nil)
+	restore := image.MockTrusted(s.StoreSigning.Trusted)
+	defer restore()
+
+	// a model that uses core20
+	model := s.makeUC20Model(map[string]interface{}{"grade": "dangerous"})
+
+	prepareDir := c.MkDir()
+
+	comp1File := snaptest.MakeTestComponent(c, seedtest.SampleSnapYaml["required20+comp1"])
+
+	opts := &image.Options{
+		PrepareDir: prepareDir,
+		Customizations: image.Customizations{
+			BootFlags:  []string{"factory"},
+			Validation: "ignore",
+		},
+		Components: []string{comp1File},
+	}
+
+	err := image.SetupSeed(s.tsto, model, opts)
+	c.Assert(err, ErrorMatches, "missing local snaps:\n.* local component does not have a matching local snap.*")
+}
+
+func (s *imageSuite) TestSetupSeedLocalComponentNotDefinedBySnap(c *C) {
+	bootloader.Force(nil)
+	restore := image.MockTrusted(s.StoreSigning.Trusted)
+	defer restore()
+
+	// a model that uses core20
+	model := s.makeUC20Model(map[string]interface{}{"grade": "dangerous"})
+
+	prepareDir := c.MkDir()
+
+	snapFile := snaptest.MakeTestSnapWithFiles(c, seedtest.SampleSnapYaml["required20"], nil)
+	comp1File := snaptest.MakeTestComponent(c, seedtest.SampleSnapYaml["required20+unknown"])
+
+	opts := &image.Options{
+		PrepareDir: prepareDir,
+		Customizations: image.Customizations{
+			BootFlags:  []string{"factory"},
+			Validation: "ignore",
+		},
+		Snaps:      []string{snapFile},
+		Components: []string{comp1File},
+	}
+
+	err := image.SetupSeed(s.tsto, model, opts)
+	c.Assert(err, ErrorMatches, "component unknown is not defined by snap required20")
+}
+
+func (s *imageSuite) TestSetupSeedLocalComponentBadType(c *C) {
+	bootloader.Force(nil)
+	restore := image.MockTrusted(s.StoreSigning.Trusted)
+	defer restore()
+
+	// a model that uses core20
+	model := s.makeUC20Model(map[string]interface{}{"grade": "dangerous"})
+
+	prepareDir := c.MkDir()
+
+	snapFile := snaptest.MakeTestSnapWithFiles(c, seedtest.SampleSnapYaml["required20"], nil)
+	comp1File := snaptest.MakeTestComponent(c, seedtest.SampleSnapYaml["required20+comp1_kernel"])
+
+	opts := &image.Options{
+		PrepareDir: prepareDir,
+		Customizations: image.Customizations{
+			BootFlags:  []string{"factory"},
+			Validation: "ignore",
+		},
+		Snaps:      []string{snapFile},
+		Components: []string{comp1File},
+	}
+
+	err := image.SetupSeed(s.tsto, model, opts)
+	c.Assert(err, ErrorMatches, "component comp1 has type kernel-modules while snap required20 defines type standard for it")
 }

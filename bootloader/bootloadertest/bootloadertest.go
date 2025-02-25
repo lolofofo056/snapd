@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2014-2020 Canonical Ltd
+ * Copyright (C) 2014-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -413,7 +413,7 @@ func (b *MockExtractedRunKernelImageMixin) DisableTryKernel() error {
 // MockTrustedAssetsMixin implements the bootloader.TrustedAssetsBootloader
 // interface.
 type MockTrustedAssetsMixin struct {
-	TrustedAssetsList  []string
+	TrustedAssetsMap   map[string]string
 	TrustedAssetsErr   error
 	TrustedAssetsCalls int
 
@@ -426,6 +426,9 @@ type MockTrustedAssetsMixin struct {
 	BootChainRunBl         []bootloader.Bootloader
 	BootChainKernelPath    []string
 
+	KernelBootFileBuilder         func(kernelPath string) bootloader.BootFile
+	RecoveryKernelBootFileBuilder func(kernelPath string) bootloader.BootFile
+
 	UpdateErr                  error
 	UpdateCalls                int
 	Updated                    bool
@@ -433,6 +436,14 @@ type MockTrustedAssetsMixin struct {
 	StaticCommandLine          string
 	CandidateStaticCommandLine string
 	CommandLineErr             error
+}
+
+type MockEfiLoadOptionMixin struct {
+	EfiLoadOptionErr  error
+	EfiLoadOptionDesc string
+	EfiLoadOptionPath string
+	EfiLoadOptionData []byte
+	SeenUpdatedAssets [][]string
 }
 
 // MockTrustedAssetsBootloader mocks a bootloader implementing the
@@ -443,9 +454,31 @@ type MockTrustedAssetsBootloader struct {
 	MockTrustedAssetsMixin
 }
 
+type MockTrustedAssetsBootloaderWithEfi struct {
+	*MockBootloader
+
+	MockTrustedAssetsMixin
+	MockEfiLoadOptionMixin
+}
+
 func (b *MockBootloader) WithTrustedAssets() *MockTrustedAssetsBootloader {
 	return &MockTrustedAssetsBootloader{
 		MockBootloader: b,
+	}
+}
+
+func (b *MockBootloader) WithTrustedAssetsAndEfi() *MockTrustedAssetsBootloaderWithEfi {
+	return &MockTrustedAssetsBootloaderWithEfi{
+		MockBootloader: b,
+	}
+}
+
+func (b *MockEfiLoadOptionMixin) ParametersForEfiLoadOption(updatedAssets []string) (string, string, []byte, error) {
+	b.SeenUpdatedAssets = append(b.SeenUpdatedAssets, updatedAssets)
+	if b.EfiLoadOptionErr != nil {
+		return "", "", nil, b.EfiLoadOptionErr
+	} else {
+		return b.EfiLoadOptionDesc, b.EfiLoadOptionPath, b.EfiLoadOptionData, nil
 	}
 }
 
@@ -501,20 +534,32 @@ func (b *MockTrustedAssetsMixin) DefaultCommandLine(candidate bool) (string, err
 	return b.StaticCommandLine, nil
 }
 
-func (b *MockTrustedAssetsMixin) TrustedAssets() ([]string, error) {
+func (b *MockTrustedAssetsMixin) TrustedAssets() (map[string]string, error) {
 	b.TrustedAssetsCalls++
-	return b.TrustedAssetsList, b.TrustedAssetsErr
+	return b.TrustedAssetsMap, b.TrustedAssetsErr
 }
 
-func (b *MockTrustedAssetsMixin) RecoveryBootChain(kernelPath string) ([]bootloader.BootFile, error) {
+func (b *MockTrustedAssetsMixin) RecoveryBootChains(kernelPath string) ([][]bootloader.BootFile, error) {
 	b.RecoveryBootChainCalls = append(b.RecoveryBootChainCalls, kernelPath)
-	return b.RecoveryBootChainList, b.RecoveryBootChainErr
+
+	bootchain := b.RecoveryBootChainList
+	if b.RecoveryKernelBootFileBuilder != nil {
+		bootchain = append(bootchain, b.RecoveryKernelBootFileBuilder(kernelPath))
+	}
+
+	return [][]bootloader.BootFile{bootchain}, b.RecoveryBootChainErr
 }
 
-func (b *MockTrustedAssetsMixin) BootChain(runBl bootloader.Bootloader, kernelPath string) ([]bootloader.BootFile, error) {
+func (b *MockTrustedAssetsMixin) BootChains(runBl bootloader.Bootloader, kernelPath string) ([][]bootloader.BootFile, error) {
 	b.BootChainRunBl = append(b.BootChainRunBl, runBl)
 	b.BootChainKernelPath = append(b.BootChainKernelPath, kernelPath)
-	return b.BootChainList, b.BootChainErr
+
+	bootchain := b.BootChainList
+	if b.KernelBootFileBuilder != nil {
+		bootchain = append(bootchain, b.KernelBootFileBuilder(kernelPath))
+	}
+
+	return [][]bootloader.BootFile{bootchain}, b.BootChainErr
 }
 
 // MockRecoveryAwareTrustedAssetsBootloader implements the

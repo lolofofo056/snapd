@@ -37,6 +37,7 @@ import (
 	"github.com/snapcore/snapd/snap/naming"
 	"github.com/snapcore/snapd/store"
 	"github.com/snapcore/snapd/timings"
+	"github.com/snapcore/snapd/wrappers"
 )
 
 // A StoreService can find, list available updates and download snaps.
@@ -55,6 +56,8 @@ type StoreService interface {
 
 	Download(context.Context, string, string, *snap.DownloadInfo, progress.Meter, *auth.UserState, *store.DownloadOptions) error
 	DownloadStream(context.Context, string, *snap.DownloadInfo, int64, *auth.UserState) (r io.ReadCloser, status int, err error)
+
+	DownloadIcon(context.Context, string, string, string) error
 
 	Assertion(assertType *asserts.AssertionType, primaryKey []string, user *auth.UserState) (asserts.Assertion, error)
 	SeqFormingAssertion(assertType *asserts.AssertionType, sequenceKey []string, sequence int, user *auth.UserState) (asserts.Assertion, error)
@@ -75,12 +78,15 @@ type managerBackend interface {
 	SetupSnap(snapFilePath, instanceName string, si *snap.SideInfo, dev snap.Device, opts *backend.SetupSnapOptions, meter progress.Meter) (snap.Type, *backend.InstallRecord, error)
 	SetupKernelSnap(instanceName string, rev snap.Revision, meter progress.Meter) (err error)
 	SetupComponent(compFilePath string, compPi snap.ContainerPlaceInfo, dev snap.Device, meter progress.Meter) (installRecord *backend.InstallRecord, err error)
+	SetupKernelModulesComponents(currentComps, finalComps []*snap.ComponentSideInfo, ksnapName string, ksnapRev snap.Revision, meter progress.Meter) (err error)
 	CopySnapData(newSnap, oldSnap *snap.Info, opts *dirs.SnapDirOptions, meter progress.Meter) error
 	SetupSnapSaveData(info *snap.Info, dev snap.Device, meter progress.Meter) error
-	LinkSnap(info *snap.Info, dev snap.Device, linkCtx backend.LinkContext, tm timings.Measurer) (rebootInfo boot.RebootInfo, err error)
-	StartServices(svcs []*snap.AppInfo, disabledSvcs []string, meter progress.Meter, tm timings.Measurer) error
+	LinkSnap(info *snap.Info, dev snap.Device, linkCtx backend.LinkContext, tm timings.Measurer) error
+	LinkComponent(cpi snap.ContainerPlaceInfo, snapRev snap.Revision) error
+	StartServices(svcs []*snap.AppInfo, disabledSvcs *wrappers.DisabledServices, meter progress.Meter, tm timings.Measurer) error
 	StopServices(svcs []*snap.AppInfo, reason snap.ServiceStopReason, meter progress.Meter, tm timings.Measurer) error
-	QueryDisabledServices(info *snap.Info, pb progress.Meter) ([]string, error)
+	QueryDisabledServices(info *snap.Info, pb progress.Meter) (*wrappers.DisabledServices, error)
+	MaybeSetNextBoot(info *snap.Info, dev snap.Device, isUndo bool) (boot.RebootInfo, error)
 
 	// the undoers for install
 	UndoSetupSnap(s snap.PlaceInfo, typ snap.Type, installRecord *backend.InstallRecord, dev snap.Device, meter progress.Meter) error
@@ -92,6 +98,8 @@ type managerBackend interface {
 
 	// remove related
 	UnlinkSnap(info *snap.Info, linkCtx backend.LinkContext, meter progress.Meter) error
+	UnlinkComponent(cpi snap.ContainerPlaceInfo, snapRev snap.Revision) error
+	KillSnapApps(snapName string, reason snap.AppKillReason, tm timings.Measurer) error
 	RemoveSnapFiles(s snap.PlaceInfo, typ snap.Type, installRecord *backend.InstallRecord, dev snap.Device, meter progress.Meter) error
 	RemoveSnapDir(s snap.PlaceInfo, hasOtherInstances bool) error
 	RemoveSnapData(info *snap.Info, opts *dirs.SnapDirOptions) error
@@ -101,7 +109,7 @@ type managerBackend interface {
 	RemoveComponentDir(cpi snap.ContainerPlaceInfo) error
 	RemoveContainerMountUnits(cpi snap.ContainerPlaceInfo, meter progress.Meter) error
 	DiscardSnapNamespace(snapName string) error
-	RemoveSnapInhibitLock(snapName string) error
+	RemoveSnapInhibitLock(snapName string, stateUnlocker runinhibit.Unlocker) error
 	RemoveAllSnapAppArmorProfiles() error
 	RemoveKernelSnapSetup(instanceName string, rev snap.Revision, meter progress.Meter) error
 
@@ -114,7 +122,7 @@ type managerBackend interface {
 	Candidate(sideInfo *snap.SideInfo)
 
 	// refresh related
-	RunInhibitSnapForUnlink(info *snap.Info, hint runinhibit.Hint, decision func() error) (*osutil.FileLock, error)
+	RunInhibitSnapForUnlink(info *snap.Info, hint runinhibit.Hint, stateUnlocker runinhibit.Unlocker, decision func() error) (*osutil.FileLock, error)
 	// (not a backend method because doInstall cannot access the backend)
 	// WithSnapLock(info *snap.Info, action func() error) error
 

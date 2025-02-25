@@ -96,8 +96,16 @@ func (spec *Specification) AddSnippet(snippet string) {
 	spec.addEntry(snippet, "")
 }
 
+// udevTag converts a security tag into a string that can be used as a udev tag.
+// systemd only allows alphanumeric characters, underscores and hyphens in tags.
+// Our security tags can contain periods and plus signs, so we replace them with
+// underscores. Periods are replaced with single underscores, and plus signs are
+// replaced with two underscores.
+// Examples:
+//   - "snap.foo+bar.hook.install" -> "snap_foo__bar_hook_install"
+//   - "snap.foo.bar" -> "snap_foo_bar"
 func udevTag(securityTag string) string {
-	return strings.Replace(securityTag, ".", "_", -1)
+	return strings.ReplaceAll(strings.ReplaceAll(securityTag, "+", "__"), ".", "_")
 }
 
 // TagDevice adds an app/hook specific udev tag to devices described by the
@@ -110,7 +118,7 @@ func (spec *Specification) TagDevice(snippet string) {
 		// SUBSYSTEM=="subsystem" is for subsystems (the top directories in /sys/class). Not for devices.
 		// When loaded, they send an ADD event
 		// snap-device-helper expects devices only, not modules nor subsystems
-		spec.addEntry(fmt.Sprintf("TAG==\"%s\", SUBSYSTEM!=\"module\", SUBSYSTEM!=\"subsystem\", RUN+=\"%s/snap-device-helper %s\"",
+		spec.addEntry(fmt.Sprintf("TAG==\"%s\", SUBSYSTEM!=\"module\", SUBSYSTEM!=\"subsystem\", RUN+=\"%s/snap-device-helper $env{ACTION} %s $devpath $major:$minor\"",
 			tag, dirs.DistroLibExecDir, tag), tag)
 	}
 }

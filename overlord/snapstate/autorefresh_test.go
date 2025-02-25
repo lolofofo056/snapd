@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2017-2022 Canonical Ltd
+ * Copyright (C) 2017-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -21,6 +21,7 @@ package snapstate_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -151,7 +152,7 @@ func (s *autoRefreshTestSuite) SetUpTest(c *C) {
 	s.AddCleanup(snapstatetest.MockDeviceModel(DefaultModel()))
 
 	restore := snapstate.MockEnforcedValidationSets(func(st *state.State, extraVss ...*asserts.ValidationSet) (*snapasserts.ValidationSets, error) {
-		return nil, nil
+		return snapasserts.NewValidationSets(), nil
 	})
 	s.AddCleanup(restore)
 }
@@ -172,11 +173,6 @@ func (s *autoRefreshTestSuite) TestLastRefresh(c *C) {
 }
 
 func (s *autoRefreshTestSuite) TestLastRefreshRefreshManaged(c *C) {
-	snapstate.CanManageRefreshes = func(st *state.State) bool {
-		return true
-	}
-	defer func() { snapstate.CanManageRefreshes = nil }()
-
 	logbuf, restore := logger.MockLogger()
 	defer restore()
 
@@ -219,11 +215,6 @@ func (s *autoRefreshTestSuite) TestLastRefreshRefreshManaged(c *C) {
 }
 
 func (s *autoRefreshTestSuite) TestRefreshManagedTimerWins(c *C) {
-	snapstate.CanManageRefreshes = func(st *state.State) bool {
-		return true
-	}
-	defer func() { snapstate.CanManageRefreshes = nil }()
-
 	s.state.Lock()
 	defer s.state.Unlock()
 
@@ -247,18 +238,7 @@ func (s *autoRefreshTestSuite) TestRefreshManagedTimerWins(c *C) {
 	c.Check(err, IsNil)
 }
 
-func (s *autoRefreshTestSuite) TestRefreshManagedDenied(c *C) {
-	canManageCalled := false
-	snapstate.CanManageRefreshes = func(st *state.State) bool {
-		canManageCalled = true
-		// always deny
-		return false
-	}
-	defer func() { snapstate.CanManageRefreshes = nil }()
-
-	logbuf, restore := logger.MockLogger()
-	defer restore()
-
+func (s *autoRefreshTestSuite) TestRefreshManagedIsRespected(c *C) {
 	s.state.Lock()
 	defer s.state.Unlock()
 
@@ -274,23 +254,11 @@ func (s *autoRefreshTestSuite) TestRefreshManagedDenied(c *C) {
 			err := af.Ensure()
 			s.state.Lock()
 			c.Check(err, IsNil)
-			c.Check(s.store.ops, DeepEquals, []string{"list-refresh"})
-
-			refreshScheduleStr, _, err := af.RefreshSchedule()
-			c.Check(refreshScheduleStr, Equals, snapstate.DefaultRefreshSchedule)
-			c.Check(err, IsNil)
-			c.Check(canManageCalled, Equals, true)
-			count := strings.Count(logbuf.String(),
-				": managed refresh schedule denied, no properly configured snapd-control\n")
-			c.Check(count, Equals, 1, Commentf("too many occurrences:\n%s", logbuf.String()))
-
-			canManageCalled = false
+			c.Check(s.store.ops, HasLen, 0)
 		}
 
 		// ensure clean config for the next run
 		s.state.Set("config", nil)
-		logbuf.Reset()
-		canManageCalled = false
 	}
 }
 
@@ -989,7 +957,7 @@ func (s *autoRefreshTestSuite) TestInitialInhibitRefreshWithinInhibitWindow(c *C
 	s.state.Lock()
 	defer s.state.Unlock()
 
-	restore := snapstate.MockAsyncPendingRefreshNotification(func(ctx context.Context, client *userclient.Client, refreshInfo *userclient.PendingSnapRefreshInfo) {
+	restore := snapstate.MockAsyncPendingRefreshNotification(func(ctx context.Context, refreshInfo *userclient.PendingSnapRefreshInfo) {
 		c.Fatal("shouldn't trigger pending refresh notification unless it was an auto-refresh and we're overdue")
 	})
 	defer restore()
@@ -1024,13 +992,13 @@ func (s *autoRefreshTestSuite) TestSubsequentInhibitRefreshWithinInhibitWindow(c
 	s.state.Lock()
 	defer s.state.Unlock()
 
-	restore := snapstate.MockAsyncPendingRefreshNotification(func(ctx context.Context, client *userclient.Client, refreshInfo *userclient.PendingSnapRefreshInfo) {
+	restore := snapstate.MockAsyncPendingRefreshNotification(func(ctx context.Context, refreshInfo *userclient.PendingSnapRefreshInfo) {
 		c.Fatal("shouldn't trigger pending refresh notification unless it was an auto-refresh and we're overdue")
 	})
 	defer restore()
 
 	instant := time.Now()
-	pastInstant := instant.Add(-snapstate.MaxInhibition / 2) // In the middle of the allowed window
+	pastInstant := instant.Add(-snapstate.MaxInhibitionDuration(s.state) / 2) // In the middle of the allowed window
 
 	si := &snap.SideInfo{RealName: "pkg", Revision: snap.R(1)}
 	info := &snap.Info{SideInfo: *si}
@@ -1066,7 +1034,7 @@ func (s *autoRefreshTestSuite) TestInhibitRefreshRefreshesWhenOverdue(c *C) {
 	defer s.state.Unlock()
 
 	notificationCount := 0
-	restore := snapstate.MockAsyncPendingRefreshNotification(func(ctx context.Context, client *userclient.Client, refreshInfo *userclient.PendingSnapRefreshInfo) {
+	restore := snapstate.MockAsyncPendingRefreshNotification(func(ctx context.Context, refreshInfo *userclient.PendingSnapRefreshInfo) {
 		notificationCount++
 		c.Check(refreshInfo.InstanceName, Equals, "pkg")
 		c.Check(refreshInfo.TimeRemaining, Equals, time.Duration(0))
@@ -1074,7 +1042,7 @@ func (s *autoRefreshTestSuite) TestInhibitRefreshRefreshesWhenOverdue(c *C) {
 	defer restore()
 
 	instant := time.Now()
-	pastInstant := instant.Add(-snapstate.MaxInhibition * 2)
+	pastInstant := instant.Add(-snapstate.MaxInhibitionDuration(s.state) * 2)
 
 	si := &snap.SideInfo{RealName: "pkg", Revision: snap.R(1)}
 	info := &snap.Info{SideInfo: *si}
@@ -1100,12 +1068,12 @@ func (s *autoRefreshTestSuite) TestInhibitNoNotificationOnManualRefresh(c *C) {
 	s.state.Lock()
 	defer s.state.Unlock()
 
-	restore := snapstate.MockAsyncPendingRefreshNotification(func(ctx context.Context, client *userclient.Client, refreshInfo *userclient.PendingSnapRefreshInfo) {
+	restore := snapstate.MockAsyncPendingRefreshNotification(func(ctx context.Context, refreshInfo *userclient.PendingSnapRefreshInfo) {
 		c.Fatal("shouldn't trigger pending refresh notification if refresh was manual")
 	})
 	defer restore()
 
-	pastInstant := time.Now().Add(-snapstate.MaxInhibition)
+	pastInstant := time.Now().Add(-snapstate.MaxInhibitionDuration(s.state))
 
 	si := &snap.SideInfo{RealName: "pkg", Revision: snap.R(1)}
 	info := &snap.Info{SideInfo: *si}
@@ -1262,19 +1230,37 @@ func (s *autoRefreshTestSuite) TestSnapStoreOffline(c *C) {
 	s.state.Unlock()
 }
 
-func (s *autoRefreshTestSuite) TestMaybeAddRefreshInhibitNotice(c *C) {
+func (s *autoRefreshTestSuite) testMaybeAddRefreshInhibitNotice(c *C, markerInterfaceConnected bool, warningFallback bool) {
 	st := s.state
 	st.Lock()
 	defer st.Unlock()
 
+	var connCheckCalled int
+	restore := snapstate.MockHasActiveConnection(func(st *state.State, iface string) (bool, error) {
+		connCheckCalled++
+		c.Check(iface, Equals, "snap-refresh-observe")
+		return markerInterfaceConnected, nil
+	})
+	defer restore()
+
+	// let's add some random warnings
+	st.Warnf("this is a random warning 1")
+	st.Warnf("this is a random warning 2")
+
 	err := snapstate.MaybeAddRefreshInhibitNotice(st)
 	c.Assert(err, IsNil)
-	// empty set of inhibited snaps unchanged -> [], no notice recorded
+	// empty set of inhibited snaps unchanged -> []
+	// no notice recorded
 	c.Assert(st.Notices(nil), HasLen, 0)
+	// no "refresh inhibition" warnings recorded
+	checkNoRefreshInhibitWarning(c, st)
 	// Verify list is empty
 	checkLastRecordedInhibitedSnaps(c, st, nil)
 
 	now := time.Now()
+	warningTime := now
+	// mock time to determine if recorded warning is recent
+	defer state.MockTime(warningTime)()
 	snapstate.Set(s.state, "some-snap", &snapstate.SnapState{
 		Active: true,
 		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
@@ -1286,14 +1272,33 @@ func (s *autoRefreshTestSuite) TestMaybeAddRefreshInhibitNotice(c *C) {
 	})
 	err = snapstate.MaybeAddRefreshInhibitNotice(st)
 	c.Assert(err, IsNil)
-	// set of inhibited snaps changed -> ["some-snap"], notice recorded
-	checkRefreshInhibitNotice(c, st, 1)
+	// set of inhibited snaps changed -> ["some-snap"]
+	// notice recorded
+	expectedOccurrances := 1
+	checkRefreshInhibitNotice(c, st, expectedOccurrances)
+	// check warnings fallback
+	if warningFallback {
+		checkRefreshInhibitWarning(c, st, []string{"some-snap"}, warningTime)
+	} else {
+		checkNoRefreshInhibitWarning(c, st)
+	}
+	// check that the set of last recorded inhibited snaps is persisted
 	checkLastRecordedInhibitedSnaps(c, st, []string{"some-snap"})
 
+	// mock time to determine if recorded warning is recent
+	warningTime = warningTime.Add(1 * time.Hour)
+	defer state.MockTime(warningTime)()
 	err = snapstate.MaybeAddRefreshInhibitNotice(st)
 	c.Assert(err, IsNil)
-	// set of inhibited snaps unchanged -> ["some-snap"], no notice recorded
-	checkRefreshInhibitNotice(c, st, 1)
+	// set of inhibited snaps unchanged -> ["some-snap"]
+	// no new notice recorded
+	checkRefreshInhibitNotice(c, st, expectedOccurrances)
+	// check warnings fallback
+	if warningFallback {
+		checkRefreshInhibitWarning(c, st, []string{"some-snap"}, warningTime)
+	} else {
+		checkNoRefreshInhibitWarning(c, st)
+	}
 	checkLastRecordedInhibitedSnaps(c, st, []string{"some-snap"})
 
 	// mark "some-snap" as not inhibited
@@ -1316,9 +1321,327 @@ func (s *autoRefreshTestSuite) TestMaybeAddRefreshInhibitNotice(c *C) {
 		SnapType:             string(snap.TypeApp),
 		RefreshInhibitedTime: &now,
 	})
+	// mock time to determine if recorded warning is recent
+	warningTime = warningTime.Add(1 * time.Hour)
+	defer state.MockTime(warningTime)()
 	err = snapstate.MaybeAddRefreshInhibitNotice(st)
 	c.Assert(err, IsNil)
-	// set of inhibited snaps changed -> ["some-other-snap"], notice recorded
-	checkRefreshInhibitNotice(c, st, 2)
+	// set of inhibited snaps changed -> ["some-other-snap"]
+	// notice recorded
+	expectedOccurrances++
+	checkRefreshInhibitNotice(c, st, expectedOccurrances)
+	// check warnings fallback
+	if warningFallback {
+		checkRefreshInhibitWarning(c, st, []string{"some-other-snap"}, warningTime)
+	} else {
+		checkNoRefreshInhibitWarning(c, st)
+	}
 	checkLastRecordedInhibitedSnaps(c, st, []string{"some-other-snap"})
+
+	// mark "some-other-snap" as not inhibited
+	snapstate.Set(s.state, "some-other-snap", &snapstate.SnapState{
+		Active: true,
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
+			{RealName: "some-other-snap", SnapID: "some-other-snap-id", Revision: snap.R(1)},
+		}),
+		Current:              snap.R(1),
+		SnapType:             string(snap.TypeApp),
+		RefreshInhibitedTime: nil,
+	})
+	// mock time to determine if recorded warning is recent
+	warningTime = warningTime.Add(1 * time.Hour)
+	defer state.MockTime(warningTime)()
+	err = snapstate.MaybeAddRefreshInhibitNotice(st)
+	c.Assert(err, IsNil)
+	// set of inhibited snaps changed -> []
+	// notice recorded
+	expectedOccurrances++
+	checkRefreshInhibitNotice(c, st, expectedOccurrances)
+	// no warning should be recorded and existing warning should be
+	// removed if inhibited snaps set is empty
+	checkNoRefreshInhibitWarning(c, st)
+	checkLastRecordedInhibitedSnaps(c, st, []string{})
+
+	// exercise multiple snaps inhibited
+	// mark "some-snap" as inhibited
+	snapstate.Set(s.state, "some-snap", &snapstate.SnapState{
+		Active: true,
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
+			{RealName: "some-snap", SnapID: "some-snap-id", Revision: snap.R(1)},
+		}),
+		Current:              snap.R(1),
+		SnapType:             string(snap.TypeApp),
+		RefreshInhibitedTime: &now,
+	})
+	// mark "some-other-snap" as inhibited
+	snapstate.Set(s.state, "some-other-snap", &snapstate.SnapState{
+		Active: true,
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
+			{RealName: "some-other-snap", SnapID: "some-other-snap-id", Revision: snap.R(1)},
+		}),
+		Current:              snap.R(1),
+		SnapType:             string(snap.TypeApp),
+		RefreshInhibitedTime: &now,
+	})
+	// mock time to determine if recorded warning is recent
+	warningTime = warningTime.Add(1 * time.Hour)
+	defer state.MockTime(warningTime)()
+	err = snapstate.MaybeAddRefreshInhibitNotice(st)
+	c.Assert(err, IsNil)
+	// set of inhibited snaps changed -> ["some-snap", "some-other-snap"]
+	// notice recorded
+	expectedOccurrances++
+	checkRefreshInhibitNotice(c, st, expectedOccurrances)
+	// check warnings fallback
+	if warningFallback {
+		checkRefreshInhibitWarning(c, st, []string{"some-snap", "some-other-snap"}, warningTime)
+	} else {
+		checkNoRefreshInhibitWarning(c, st)
+	}
+	// check that the set of last recorded inhibited snaps is persisted
+	checkLastRecordedInhibitedSnaps(c, st, []string{"some-snap", "some-other-snap"})
+}
+
+func (s *autoRefreshTestSuite) TestMaybeAddRefreshInhibitNotice(c *C) {
+	s.enableRefreshAppAwarenessUX()
+	const markerInterfaceConnected = true
+	const warningFallback = false
+	s.testMaybeAddRefreshInhibitNotice(c, markerInterfaceConnected, warningFallback)
+}
+
+func (s *autoRefreshTestSuite) TestMaybeAddRefreshInhibitNoticeWarningFallbackError(c *C) {
+	st := s.state
+	st.Lock()
+	defer st.Unlock()
+
+	logbuf, restore := logger.MockLogger()
+	defer restore()
+
+	// mark "some-snap" as inhibited
+	now := time.Now()
+	snapstate.Set(s.state, "some-snap", &snapstate.SnapState{
+		Active: true,
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
+			{RealName: "some-snap", SnapID: "some-snap-id", Revision: snap.R(1)},
+		}),
+		Current:              snap.R(1),
+		SnapType:             string(snap.TypeApp),
+		RefreshInhibitedTime: &now,
+	})
+
+	// Highly unlikely but just in case
+	tr := config.NewTransaction(s.state)
+	tr.Set("core", "experimental.refresh-app-awareness-ux", "trigger-error")
+	tr.Commit()
+
+	err := snapstate.MaybeAddRefreshInhibitNotice(st)
+	// warning fallback error is not propagated, only logged
+	c.Assert(err, IsNil)
+	// check error is logged
+	c.Check(logbuf.String(), testutil.Contains, `Cannot add refresh inhibition warning: refresh-app-awareness-ux can only be set to 'true' or 'false', got "trigger-error"`)
+	// notice recorded
+	checkRefreshInhibitNotice(c, st, 1)
+	// no warnings recorded due to error
+	checkNoRefreshInhibitWarning(c, st)
+
+	restore = snapstate.MockHasActiveConnection(func(st *state.State, iface string) (bool, error) {
+		return false, fmt.Errorf("boom")
+	})
+	defer restore()
+
+	st.Unlock()
+	s.enableRefreshAppAwarenessUX()
+	st.Lock()
+	err = snapstate.MaybeAddRefreshInhibitNotice(st)
+	// warning fallback error is not propagated, only logged
+	c.Assert(err, IsNil)
+	// check error is logged
+	c.Check(logbuf.String(), testutil.Contains, "Cannot add refresh inhibition warning: boom")
+	// set of inhibited snaps unchanged -> ["some-snap"]
+	// no new notice recorded
+	checkRefreshInhibitNotice(c, st, 1)
+	// no warnings recorded due to error
+	checkNoRefreshInhibitWarning(c, st)
+}
+
+func (s *autoRefreshTestSuite) TestMaybeAddRefreshInhibitNoticeWarningFallback(c *C) {
+	s.enableRefreshAppAwarenessUX()
+	const markerInterfaceConnected = false
+	const warningFallback = true
+	s.testMaybeAddRefreshInhibitNotice(c, markerInterfaceConnected, warningFallback)
+}
+
+func (s *autoRefreshTestSuite) TestMaybeAddRefreshInhibitNoticeWarningFallbackNoRAAUX(c *C) {
+	const markerInterfaceConnected = false
+	const warningFallback = false // because refresh-app-awareness-ux is disabled
+	s.testMaybeAddRefreshInhibitNotice(c, markerInterfaceConnected, warningFallback)
+}
+
+func (s *autoRefreshTestSuite) enableRefreshAppAwarenessUX() {
+	s.state.Lock()
+	tr := config.NewTransaction(s.state)
+	tr.Set("core", "experimental.refresh-app-awareness-ux", true)
+	tr.Commit()
+	s.state.Unlock()
+}
+
+func checkNoRefreshInhibitWarning(c *C, st *state.State) {
+	for _, warning := range st.AllWarnings() {
+		if strings.HasSuffix(warning.String(), "close running apps to continue refresh.") {
+			c.Error("inhibition warning found")
+			return
+		}
+	}
+}
+
+func checkRefreshInhibitWarning(c *C, st *state.State, snaps []string, warningTime time.Time) {
+	var inhibitionWarning *state.Warning
+	for _, warning := range st.AllWarnings() {
+		if !strings.HasSuffix(warning.String(), "close running apps to continue refresh.") {
+			continue
+		}
+		if inhibitionWarning != nil {
+			c.Errorf("found multiple inhibition warnings")
+			return
+		}
+		inhibitionWarning = warning
+	}
+
+	// There is always one warning
+	c.Assert(inhibitionWarning, NotNil)
+	w := warningToMap(c, inhibitionWarning)
+	c.Check(w["message"], Matches, "cannot refresh (.*) due running apps; close running apps to continue refresh.")
+	for _, snap := range snaps {
+		c.Check(w["message"], testutil.Contains, snap)
+	}
+	c.Check(w["repeat-after"], Equals, "24h0m0s")
+	if !warningTime.IsZero() {
+		c.Check(w["last-added"], Equals, warningTime.UTC().Format(time.RFC3339Nano))
+	}
+}
+
+// warningToMap converts a Warning to a map using a JSON marshal-unmarshal round trip.
+func warningToMap(c *C, warning *state.Warning) map[string]any {
+	buf, err := json.Marshal(warning)
+	c.Assert(err, IsNil)
+	var n map[string]any
+	err = json.Unmarshal(buf, &n)
+	c.Assert(err, IsNil)
+	return n
+}
+
+func (s *autoRefreshTestSuite) TestMaybeAsyncPendingRefreshNotification(c *C) {
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	var connCheckCalled int
+	restore := snapstate.MockHasActiveConnection(func(st *state.State, iface string) (bool, error) {
+		connCheckCalled++
+		c.Check(iface, Equals, "snap-refresh-observe")
+		// no snap has the marker interface connected
+		return false, nil
+	})
+	defer restore()
+
+	expectedInfo := &userclient.PendingSnapRefreshInfo{
+		InstanceName:  "pkg",
+		TimeRemaining: 10 * time.Second,
+	}
+	var notificationCalled int
+	restore = snapstate.MockAsyncPendingRefreshNotification(func(ctx context.Context, psri *userclient.PendingSnapRefreshInfo) {
+		notificationCalled++
+		c.Check(psri, Equals, expectedInfo)
+	})
+	defer restore()
+
+	tr := config.NewTransaction(s.state)
+	tr.Set("core", "experimental.refresh-app-awareness-ux", true)
+	tr.Commit()
+
+	snapstate.MaybeAsyncPendingRefreshNotification(context.TODO(), s.state, expectedInfo)
+	// no notification as refresh-appawareness-ux is enabled
+	// i.e. notices + warnings fallback is used instead
+	c.Check(connCheckCalled, Equals, 0)
+	c.Check(notificationCalled, Equals, 0)
+
+	tr.Set("core", "experimental.refresh-app-awareness-ux", false)
+	tr.Commit()
+
+	snapstate.MaybeAsyncPendingRefreshNotification(context.TODO(), s.state, expectedInfo)
+	// notification sent as refresh-appawareness-ux is now disabled
+	c.Check(connCheckCalled, Equals, 1)
+	c.Check(notificationCalled, Equals, 1)
+}
+
+func (s *autoRefreshTestSuite) TestMaybeAsyncPendingRefreshNotificationSkips(c *C) {
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	var connCheckCalled int
+	restore := snapstate.MockHasActiveConnection(func(st *state.State, iface string) (bool, error) {
+		connCheckCalled++
+		c.Check(iface, Equals, "snap-refresh-observe")
+		// marker interface found
+		return true, nil
+	})
+	defer restore()
+
+	restore = snapstate.MockAsyncPendingRefreshNotification(func(ctx context.Context, psri *userclient.PendingSnapRefreshInfo) {
+		c.Fatal("shouldn't trigger pending refresh notification because marker interface is connected")
+	})
+	defer restore()
+
+	snapstate.MaybeAsyncPendingRefreshNotification(context.TODO(), s.state, &userclient.PendingSnapRefreshInfo{})
+}
+
+func (s *autoRefreshTestSuite) TestAutoRefreshWithConfdbs(c *C) {
+	si := &snap.SideInfo{
+		RealName: "foo",
+		SnapID:   "foo-id",
+		Revision: snap.R(1),
+	}
+	s.state.Lock()
+	snapstate.Set(s.state, "foo", &snapstate.SnapState{
+		Active:   true,
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{si}),
+		Current:  si.Revision,
+		SnapType: string(snap.TypeApp),
+	})
+	s.state.Unlock()
+
+	info := &snap.Info{
+		SnapType:      snap.TypeApp,
+		Architectures: []string{"all"},
+		SideInfo: snap.SideInfo{
+			RealName: "foo",
+			Revision: snap.R(8),
+		},
+	}
+	info.Plugs = map[string]*snap.PlugInfo{
+		"my-plug": {
+			Snap:      info,
+			Name:      "my-plug",
+			Interface: "confdb",
+			Attrs: map[string]interface{}{
+				"account": "my-publisher",
+				"view":    "my-reg/my-view",
+			},
+		},
+	}
+	s.store.refreshable = append(s.store.refreshable, info)
+
+	af := snapstate.NewAutoRefresh(s.state)
+	err := af.Ensure()
+	c.Check(err, IsNil)
+
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	chgs := s.state.Changes()
+	c.Assert(chgs, HasLen, 1)
+	task := findLastTask(chgs[0], "validate-snap")
+
+	snapsup, err := snapstate.TaskSnapSetup(task)
+	c.Assert(err, IsNil)
+	c.Assert(snapsup.Confdbs, DeepEquals, []snapstate.ConfdbID{{Account: "my-publisher", Confdb: "my-reg"}})
 }

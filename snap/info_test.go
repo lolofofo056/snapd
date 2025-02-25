@@ -35,6 +35,8 @@ import (
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
+	"github.com/snapcore/snapd/snap/snapdir"
 	"github.com/snapcore/snapd/snap/snapfile"
 	"github.com/snapcore/snapd/snap/snaptest"
 	"github.com/snapcore/snapd/snap/squashfs"
@@ -52,6 +54,7 @@ var _ = Suite(&infoSimpleSuite{})
 
 func (s *infoSimpleSuite) SetUpTest(c *C) {
 	dirs.SetRootDir(c.MkDir())
+	snap.NewContainerFromDir = snapdir.NewContainerFromDir
 }
 
 func (s *infoSimpleSuite) TearDownTest(c *C) {
@@ -377,6 +380,36 @@ func (s *infoSuite) TestReadCurrentInfo(c *C) {
 	snapInfo3, err := snap.ReadCurrentInfo("not-sample")
 	c.Check(snapInfo3, IsNil)
 	c.Assert(err, ErrorMatches, `cannot find current revision for snap not-sample:.*`)
+	c.Assert(errors.As(err, &snap.NotFoundError{}), Equals, true)
+}
+
+func (s *infoSuite) TestReadCurrentComponentInfo(c *C) {
+	const snapYaml = `
+name: sample
+version: 1
+components:
+ comp:
+   type: standard`
+
+	const componentYaml = `
+component: sample+comp
+type: standard
+`
+
+	info := snaptest.MockSnapCurrent(c, snapYaml, &snap.SideInfo{
+		Revision: snap.R(42),
+	})
+
+	snaptest.MockComponentCurrent(c, componentYaml, info, snap.ComponentSideInfo{
+		Component: naming.NewComponentRef("sample", "comp"),
+		Revision:  snap.R(21),
+	})
+
+	currentCompInfo, err := snap.ReadCurrentComponentInfo("comp", info)
+	c.Assert(err, IsNil)
+
+	c.Assert(currentCompInfo.Revision, Equals, snap.R(21))
+	c.Assert(currentCompInfo.Component, DeepEquals, naming.NewComponentRef("sample", "comp"))
 }
 
 func (s *infoSuite) TestReadCurrentInfoWithInstance(c *C) {
@@ -395,6 +428,7 @@ func (s *infoSuite) TestReadCurrentInfoWithInstance(c *C) {
 	snapInfo3, err := snap.ReadCurrentInfo("sample_other")
 	c.Check(snapInfo3, IsNil)
 	c.Assert(err, ErrorMatches, `cannot find current revision for snap sample_other:.*`)
+	c.Assert(errors.As(err, &snap.NotFoundError{}), Equals, true)
 }
 
 func (s *infoSuite) TestInstallDate(c *C) {
@@ -660,11 +694,11 @@ func (s *infoSuite) TestAppEnvSimple(c *C) {
 version: 1.0
 type: app
 environment:
- global-k: global-v
+  global-k: global-v
 apps:
- foo:
-  environment:
-   app-k: app-v
+  foo:
+    environment:
+      app-k: app-v
 `
 	info, err := snap.InfoFromSnapYaml([]byte(yaml))
 	c.Assert(err, IsNil)
@@ -680,13 +714,13 @@ func (s *infoSuite) TestAppEnvOverrideGlobal(c *C) {
 version: 1.0
 type: app
 environment:
- global-k: global-v
- global-and-local: global-v
+  global-k: global-v
+  global-and-local: global-v
 apps:
- foo:
-  environment:
-   app-k: app-v
-   global-and-local: local-v
+  foo:
+    environment:
+      app-k: app-v
+      global-and-local: local-v
 `
 	info, err := snap.InfoFromSnapYaml([]byte(yaml))
 	c.Assert(err, IsNil)
@@ -702,11 +736,11 @@ func (s *infoSuite) TestHookEnvSimple(c *C) {
 version: 1.0
 type: app
 environment:
- global-k: global-v
+  global-k: global-v
 hooks:
- foo:
-  environment:
-   app-k: app-v
+  foo:
+    environment:
+      app-k: app-v
 `
 	info, err := snap.InfoFromSnapYaml([]byte(yaml))
 	c.Assert(err, IsNil)
@@ -722,13 +756,13 @@ func (s *infoSuite) TestHookEnvOverrideGlobal(c *C) {
 version: 1.0
 type: app
 environment:
- global-k: global-v
- global-and-local: global-v
+  global-k: global-v
+  global-and-local: global-v
 hooks:
- foo:
-  environment:
-   app-k: app-v
-   global-and-local: local-v
+  foo:
+    environment:
+      app-k: app-v
+      global-and-local: local-v
 `
 	info, err := snap.InfoFromSnapYaml([]byte(yaml))
 	c.Assert(err, IsNil)
@@ -1318,6 +1352,91 @@ func (s *infoSuite) TestAppDesktopFile(c *C) {
 	c.Check(snapInfo.DesktopPrefix(), Equals, "sample+instance")
 }
 
+func (s *infoSuite) testAppDesktopFileWithDesktopFileIDs(c *C, isParallelInstance bool) {
+	const sampleDesktopFileIDsYaml = `
+name: sample
+version: 1
+apps:
+ app:
+   command: foo
+ app2:
+   command: bar
+ sample:
+   command: foobar
+   command-chain: [chain]
+plugs:
+  desktop:
+    desktop-file-ids:
+      - org.example
+      - org.example.Foo
+      - org.example.Bar
+`
+
+	snaptest.MockSnap(c, sampleDesktopFileIDsYaml, &snap.SideInfo{})
+	snapInfo, err := snap.ReadInfo("sample", &snap.SideInfo{})
+	c.Assert(err, IsNil)
+	c.Assert(snapInfo.Plugs["desktop"], NotNil)
+
+	if isParallelInstance {
+		snapInfo.InstanceKey = "instance"
+	}
+
+	c.Assert(os.MkdirAll(dirs.SnapDesktopFilesDir, 0755), IsNil)
+	mockDesktopFile := func(app *snap.AppInfo, path string) {
+		const mockDesktopFileTemplate = `[Desktop Entry]
+X-SnapInstanceName=%s
+Name=foo
+X-SnapAppName=%s
+Exec=env BAMF_DESKTOP_FILE_HINT=foo.desktop %s
+`
+		content := fmt.Sprintf(mockDesktopFileTemplate, snapInfo.InstanceName(), app.Name, app.WrapperPath())
+		c.Assert(os.WriteFile(path, []byte(content), 0644), IsNil)
+	}
+
+	// Given the configuration below:
+	//   - org.example     -> app
+	//   - org.example.Foo -> sample
+	//   - org.example.Bar -> sample
+	mockDesktopFile(snapInfo.Apps["app"], filepath.Join(dirs.SnapDesktopFilesDir, "org.example.desktop"))
+	mockDesktopFile(snapInfo.Apps["sample"], filepath.Join(dirs.SnapDesktopFilesDir, "org.example.Foo.desktop"))
+	mockDesktopFile(snapInfo.Apps["sample"], filepath.Join(dirs.SnapDesktopFilesDir, "org.example.Bar.desktop"))
+
+	// Desktop file detected for "app" should be org.example.desktop
+	c.Check(snapInfo.Apps["app"].DesktopFile(), Matches, `.*/var/lib/snapd/desktop/applications/org.example.desktop`)
+
+	// Desktop file detected for "sample" should be org.example.Foo.desktop because
+	// it comes before org.example.Bar in the desktop-file-ids attribute
+	c.Check(snapInfo.Apps["sample"].DesktopFile(), Matches, `.*/var/lib/snapd/desktop/applications/org.example.Foo.desktop`)
+
+	// When org.example.Foo.desktop is removed, esktop file detected for "sample" should be org.example.Bar.desktop
+	c.Assert(os.Remove(filepath.Join(dirs.SnapDesktopFilesDir, "org.example.Foo.desktop")), IsNil)
+	c.Check(snapInfo.Apps["sample"].DesktopFile(), Matches, `.*/var/lib/snapd/desktop/applications/org.example.Bar.desktop`)
+
+	// When no desktop-file-id desktop files exist, fallback to the "$PREFIX_$APP.desktop" heuristic
+	c.Assert(os.Remove(filepath.Join(dirs.SnapDesktopFilesDir, "org.example.desktop")), IsNil)
+	c.Assert(os.Remove(filepath.Join(dirs.SnapDesktopFilesDir, "org.example.Bar.desktop")), IsNil)
+	prefix := "sample"
+	if isParallelInstance {
+		prefix = `sample\+instance`
+	}
+	c.Check(snapInfo.Apps["app"].DesktopFile(), Matches, ".*/var/lib/snapd/desktop/applications/"+prefix+"_app.desktop")
+	c.Check(snapInfo.Apps["sample"].DesktopFile(), Matches, ".*/var/lib/snapd/desktop/applications/"+prefix+"_sample.desktop")
+
+	// When X-SnapAppName is not found, also fallback to the "$PREFIX_$APP.desktop" heuristic
+	c.Assert(os.WriteFile(filepath.Join(dirs.SnapDesktopFilesDir, "org.example.desktop"), nil, 0644), IsNil)
+	c.Check(snapInfo.Apps["app"].DesktopFile(), Matches, ".*/var/lib/snapd/desktop/applications/"+prefix+"_app.desktop")
+}
+
+func (s *infoSuite) TestAppDesktopFileWithDesktopFileIDs(c *C) {
+	const isParallelInstance = false
+	s.testAppDesktopFileWithDesktopFileIDs(c, isParallelInstance)
+}
+
+func (s *infoSuite) TestAppDesktopFileWithDesktopFileIDsParallelInstance(c *C) {
+	const isParallelInstance = true
+	s.testAppDesktopFileWithDesktopFileIDs(c, isParallelInstance)
+}
+
 const coreSnapYaml = `name: core
 version: 0
 type: os
@@ -1755,6 +1874,35 @@ func (s *infoSuite) TestInstanceNameInSnapInfo(c *C) {
 	c.Check(info.SnapName(), Equals, "snap-name")
 }
 
+func (s *infoSuite) TestComponentFromSnapComponentInstance(c *C) {
+	type testcase struct {
+		input        string
+		snapInstance string
+		component    string
+	}
+
+	tests := []testcase{
+		{"snap", "snap", ""},
+		{"snap_instance", "snap_instance", ""},
+		{"snap+component", "snap", "component"},
+		{"snap_instance+component", "snap_instance", "component"},
+		{"", "", ""},
+		// We allow empty snap in some cases (snapctl)
+		{"+comp1", "", "comp1"},
+	}
+
+	for _, t := range tests {
+		snapInstance, component := snap.SplitSnapComponentInstanceName(t.input)
+		c.Check(snapInstance, Equals, t.snapInstance)
+		c.Check(component, Equals, t.component)
+	}
+}
+
+func (s *infoSuite) TestSnapComponentInstanceName(c *C) {
+	c.Check(snap.SnapComponentName("snap", "component"), Equals, "snap+component")
+	c.Check(snap.SnapComponentName("snap_instance", "component"), Equals, "snap_instance+component")
+}
+
 func (s *infoSuite) TestIsActive(c *C) {
 	info1 := snaptest.MockSnap(c, sampleYaml, &snap.SideInfo{Revision: snap.R(1)})
 	info2 := snaptest.MockSnap(c, sampleYaml, &snap.SideInfo{Revision: snap.R(2)})
@@ -1790,6 +1938,7 @@ func (s *infoSuite) TestDirAndFileHelpers(c *C) {
 	c.Check(snap.MountFile("name", snap.R(1)), Equals, "/var/lib/snapd/snaps/name_1.snap")
 	c.Check(snap.HooksDir("name", snap.R(1)), Equals, fmt.Sprintf("%s/name/1/meta/hooks", dirs.SnapMountDir))
 	c.Check(snap.BaseDataDir("name"), Equals, "/var/snap/name")
+	c.Check(snap.ComponentHooksDir("comp", snap.R(1), "name"), Equals, fmt.Sprintf("%s/name/components/mnt/comp/1/meta/hooks", dirs.SnapMountDir))
 	c.Check(snap.DataDir("name", snap.R(1)), Equals, "/var/snap/name/1")
 	c.Check(snap.CommonDataDir("name"), Equals, "/var/snap/name/common")
 	c.Check(snap.CommonDataSaveDir("name"), Equals, "/var/lib/snapd/save/snap/name")
@@ -1816,21 +1965,27 @@ func (s *infoSuite) TestSortByType(c *C) {
 		{SuggestedName: "app1", SnapType: "app"},
 		{SuggestedName: "os1", SnapType: "os"},
 		{SuggestedName: "base1", SnapType: "base"},
+		{SuggestedName: "internal1", SnapType: "internal-boot-base"},
 		{SuggestedName: "gadget1", SnapType: "gadget"},
 		{SuggestedName: "kernel1", SnapType: "kernel"},
 		{SuggestedName: "app2", SnapType: "app"},
 		{SuggestedName: "os2", SnapType: "os"},
+		{SuggestedName: "internal2", SnapType: "internal-boot-base"},
 		{SuggestedName: "snapd", SnapType: "snapd"},
 		{SuggestedName: "base2", SnapType: "base"},
 		{SuggestedName: "gadget2", SnapType: "gadget"},
 		{SuggestedName: "kernel2", SnapType: "kernel"},
 	}
-	sort.Stable(snap.ByType(infos))
+	sort.SliceStable(infos, func(i, j int) bool {
+		return infos[i].Type().SortsBefore(infos[j].Type())
+	})
 
 	c.Check(infos, DeepEquals, []*snap.Info{
 		{SuggestedName: "snapd", SnapType: "snapd"},
 		{SuggestedName: "os1", SnapType: "os"},
 		{SuggestedName: "os2", SnapType: "os"},
+		{SuggestedName: "internal1", SnapType: "internal-boot-base"},
+		{SuggestedName: "internal2", SnapType: "internal-boot-base"},
 		{SuggestedName: "kernel1", SnapType: "kernel"},
 		{SuggestedName: "kernel2", SnapType: "kernel"},
 		{SuggestedName: "base1", SnapType: "base"},
@@ -1850,7 +2005,9 @@ func (s *infoSuite) TestSortByTypeAgain(c *C) {
 	snapd.SideInfo = snap.SideInfo{RealName: "snapd"}
 
 	byType := func(snaps ...*snap.Info) []*snap.Info {
-		sort.Stable(snap.ByType(snaps))
+		sort.SliceStable(snaps, func(i, j int) bool {
+			return snaps[i].Type().SortsBefore(snaps[j].Type())
+		})
 		return snaps
 	}
 
@@ -2126,7 +2283,7 @@ version: 1.0`, nil)
 	c.Assert(err, IsNil)
 
 	_, _, err = snap.SnapdAssertionMaxFormatsFromSnapFile(snapf)
-	c.Check(err, ErrorMatches, `cannot extract assertion max formats information, snaps of type app do not carry snapd`)
+	c.Check(err, ErrorMatches, `cannot extract snapd information, snaps of type app do not carry snapd information`)
 }
 
 func (s *infoSuite) TestAppsForPlug(c *C) {
@@ -2254,4 +2411,373 @@ slots:
 
 	unscopedHooks := info.HooksForSlot(unscoped)
 	c.Assert(unscopedHooks, testutil.DeepUnsortedMatches, []*snap.HookInfo{info.Hooks["install"], info.Hooks["pre-refresh"]})
+}
+
+func (s *infoSuite) TestHookSecurityTags(c *C) {
+	const snapYaml = `
+name: test-snap
+version: 1
+components:
+  standard-component:
+    hooks:
+      install:
+hooks:
+  install:
+`
+	info := snaptest.MockSnap(c, snapYaml, &snap.SideInfo{Revision: snap.R(1)})
+
+	component := info.Components["standard-component"]
+	c.Assert(component, NotNil)
+
+	componentHook := component.ExplicitHooks["install"]
+	c.Assert(componentHook, NotNil)
+	c.Check(componentHook.SecurityTag(), Equals, "snap.test-snap+standard-component.hook.install")
+
+	hook := info.Hooks["install"]
+	c.Assert(hook, NotNil)
+	c.Check(hook.SecurityTag(), Equals, "snap.test-snap.hook.install")
+}
+
+func (s *infoSuite) TestHookSecurityTagsInstance(c *C) {
+	const snapYaml = `
+name: test-snap
+version: 1
+components:
+  standard-component:
+    hooks:
+      install:
+hooks:
+  install:
+`
+	info := snaptest.MockSnapInstance(c, "test-snap_instance", snapYaml, &snap.SideInfo{Revision: snap.R(1)})
+
+	component := info.Components["standard-component"]
+	c.Assert(component, NotNil)
+
+	componentHook := component.ExplicitHooks["install"]
+	c.Assert(componentHook, NotNil)
+	c.Check(componentHook.SecurityTag(), Equals, "snap.test-snap_instance+standard-component.hook.install")
+
+	hook := info.Hooks["install"]
+	c.Assert(hook, NotNil)
+	c.Check(hook.SecurityTag(), Equals, "snap.test-snap_instance.hook.install")
+}
+
+func (s *infoSuite) TestComponentMountDir(c *C) {
+	dir := snap.ComponentMountDir("comp", snap.R(1), "snap")
+	c.Check(dir, Equals, filepath.Join(dirs.SnapMountDir, "snap", "components", "mnt", "comp", "1"))
+}
+
+func (s *infoSuite) TestComponentHookSecurityTag(c *C) {
+	c.Check(snap.ComponentHookSecurityTag("snap", "comp", "install"), Equals, "snap.snap+comp.hook.install")
+	c.Check(snap.ComponentHookSecurityTag("snap_name", "comp", "install"), Equals, "snap.snap_name+comp.hook.install")
+}
+
+func (s *infoSuite) TestRunnables(c *C) {
+	const yaml = `
+name: test-snap
+version: 1
+components:
+  comp:
+    hooks:
+      install:
+hooks:
+  install:
+apps:
+  app:
+`
+	info := snaptest.MockSnap(c, yaml, &snap.SideInfo{Revision: snap.R(1)})
+
+	app := info.Apps["app"]
+	c.Assert(app, NotNil)
+	c.Check(app.Runnable(), Equals, snap.Runnable{
+		CommandName: "app",
+		SecurityTag: "snap.test-snap.app",
+	})
+
+	hook := info.Hooks["install"]
+	c.Assert(hook, NotNil)
+	c.Check(hook.Runnable(), Equals, snap.Runnable{
+		CommandName: "hook.install",
+		SecurityTag: "snap.test-snap.hook.install",
+	})
+
+	compHook := info.Components["comp"].ExplicitHooks["install"]
+	c.Assert(compHook, NotNil)
+	c.Check(compHook.Runnable(), Equals, snap.Runnable{
+		CommandName: "test-snap+comp.hook.install",
+		SecurityTag: "snap.test-snap+comp.hook.install",
+	})
+}
+
+func (s *infoSuite) TestConfdbPlugAttrs(c *C) {
+	plug := &snap.PlugInfo{
+		Snap:      &snap.Info{SuggestedName: "test-snap"},
+		Name:      "test-plug",
+		Interface: "confdb",
+		Attrs: map[string]interface{}{
+			"account": "foo",
+			"view":    "bar/baz",
+			"role":    "custodian",
+		},
+	}
+
+	account, confdb, view, err := snap.ConfdbPlugAttrs(plug)
+	c.Assert(err, IsNil)
+	c.Assert(account, Equals, "foo")
+	c.Assert(confdb, Equals, "bar")
+	c.Assert(view, Equals, "baz")
+}
+
+func (s *infoSuite) TestConfdbPlugAttrsInvalid(c *C) {
+	type testcase struct {
+		iface   string
+		account string
+		view    string
+		err     string
+	}
+
+	tcs := []testcase{
+		{
+			iface: "other-thing",
+			err:   "must be confdb plug: other-thing",
+		},
+
+		{
+			iface:   "confdb",
+			account: "my-acc",
+			view:    "reg",
+			err:     "\"view\" must conform to <confdb>/<view>: reg",
+		},
+	}
+
+	for _, tc := range tcs {
+		plug := &snap.PlugInfo{
+			Snap:      &snap.Info{SuggestedName: "test-snap"},
+			Name:      "test-plug",
+			Interface: tc.iface,
+			Attrs: map[string]interface{}{
+				"account": tc.account,
+				"view":    tc.view,
+			},
+		}
+
+		_, _, _, err := snap.ConfdbPlugAttrs(plug)
+		c.Assert(err, ErrorMatches, tc.err)
+	}
+}
+
+func (s *infoSuite) TestSplitSnapInstanceAndComponents(c *C) {
+	for _, tc := range []struct {
+		input string
+		snap  string
+		comps []string
+	}{
+		{"", "", []string{}},
+		{"snap", "snap", []string{}},
+		{"snap+comp1", "snap", []string{"comp1"}},
+		{"snap+comp-1+comp-2", "snap", []string{"comp-1", "comp-2"}},
+		{"+comp1", "", []string{"comp1"}},
+		{"+comp-1+comp-2", "", []string{"comp-1", "comp-2"}},
+	} {
+		snap, comps := snap.SplitSnapInstanceAndComponents(tc.input)
+		c.Check(snap, Equals, tc.snap, Commentf("%v", tc.input))
+		c.Check(comps, DeepEquals, tc.comps, Commentf("%v", tc.input))
+	}
+}
+
+func (s *infoSuite) testDesktopFileIDs(c *C, hasDesktopPlug, hasDesktopFileIDs bool) {
+	if hasDesktopFileIDs && !hasDesktopPlug {
+		c.Error("cannot set hasDesktopFileIDs without hasDesktopPlug")
+	}
+
+	var desktopAppYaml = `
+name: foo
+version: 1.0
+`
+	if hasDesktopPlug {
+		desktopAppYaml += "\nplugs:\n  desktop:"
+	}
+	if hasDesktopFileIDs {
+		desktopAppYaml += "\n    desktop-file-ids: [org.example, org.example.Foo]"
+	}
+	info, err := snap.InfoFromSnapYaml([]byte(desktopAppYaml))
+	c.Assert(err, IsNil)
+	if hasDesktopPlug {
+		c.Assert(info.Plugs["desktop"], NotNil)
+	}
+
+	desktopFileIDs, err := info.DesktopPlugFileIDs()
+	c.Assert(err, IsNil)
+
+	if hasDesktopFileIDs {
+		c.Assert(desktopFileIDs, DeepEquals, []string{"org.example", "org.example.Foo"})
+	} else {
+		c.Assert(desktopFileIDs, IsNil)
+	}
+}
+
+func (s *infoSuite) TestDesktopFileIDs(c *C) {
+	const hasDesktopPlug = true
+	const hasDesktopFileIDs = true
+	s.testDesktopFileIDs(c, hasDesktopPlug, hasDesktopFileIDs)
+}
+
+func (s *infoSuite) TestDesktopFileIDsWithoutDesktopInterface(c *C) {
+	const hasDesktopPlug = false
+	const hasDesktopFileIDs = false
+	s.testDesktopFileIDs(c, hasDesktopPlug, hasDesktopFileIDs)
+}
+
+func (s *infoSuite) TestDesktopFileIDsWithoutDesktopFileIDs(c *C) {
+	const hasDesktopPlug = true
+	const hasDesktopFileIDs = false
+	s.testDesktopFileIDs(c, hasDesktopPlug, hasDesktopFileIDs)
+}
+
+func (s *infoSuite) TestDesktopFileIDsError(c *C) {
+	const desktopAppYamlTemplate = `
+name: foo
+version: 1.0
+plugs:
+  desktop:
+    desktop-file-ids: %s
+`
+
+	for _, tc := range []string{
+		"not-a-list-of-strings",
+		"1",
+		"true",
+		"[[string],1]",
+	} {
+		desktopAppYaml := fmt.Sprintf(desktopAppYamlTemplate, tc)
+		info, err := snap.InfoFromSnapYaml([]byte(desktopAppYaml))
+		c.Assert(err, IsNil)
+		c.Assert(info.Plugs["desktop"], NotNil)
+
+		_, err = info.DesktopPlugFileIDs()
+		c.Assert(err, ErrorMatches, `internal error: "desktop-file-ids" must be a list of strings`)
+	}
+}
+
+func (s *infoSuite) TestMangleDesktopFileName(c *C) {
+	const desktopAppYaml = `
+name: foo
+version: 1.0
+plugs:
+  desktop:
+    desktop-file-ids: [org.example]
+`
+
+	info, err := snap.InfoFromSnapYaml([]byte(desktopAppYaml))
+	c.Assert(err, IsNil)
+
+	type testcase struct {
+		fname, target string
+	}
+
+	for _, tc := range []testcase{
+		{"/some/dir/org.example.desktop", "/some/dir/org.example.desktop"},
+		{"/some/dir/org.example.Foo.desktop", "/some/dir/foo_org.example.Foo.desktop"},
+		{"/some/dir/org.desktop", "/some/dir/foo_org.desktop"},
+		{"/some/dir/test.desktop", "/some/dir/foo_test.desktop"},
+
+		{"org.example.desktop", "org.example.desktop"},
+		{"org.example.Foo.desktop", "foo_org.example.Foo.desktop"},
+		{"org.desktop", "foo_org.desktop"},
+		{"test.desktop", "foo_test.desktop"},
+		// character not in [A-Za-z0-9-_.] are replaced by '_'
+		{"test**.desktop", "foo_test__.desktop"},
+		{`AaZz09. -,._?**[]{}^"\$#` + "\x00" + "\000" + ".desktop", "foo_AaZz09._-_._______________.desktop"},
+	} {
+		mangled, err := info.MangleDesktopFileName(tc.fname)
+		c.Assert(err, IsNil, Commentf(tc.fname))
+		c.Assert(mangled, Equals, tc.target, Commentf(tc.fname))
+	}
+}
+
+func (s *infoSuite) TestMangleDesktopFileNameError(c *C) {
+	const desktopAppYaml = `
+name: foo
+version: 1.0
+plugs:
+  desktop:
+    desktop-file-ids: 1
+`
+
+	info, err := snap.InfoFromSnapYaml([]byte(desktopAppYaml))
+	c.Assert(err, IsNil)
+
+	_, err = info.MangleDesktopFileName("test.desktop")
+	c.Assert(err, NotNil)
+}
+
+func (s *infoSuite) TestDesktopFilesFromInstalledSnapNoFiles(c *C) {
+	const desktopAppYaml = `
+name: foo
+version: 1.0
+`
+
+	info, err := snap.InfoFromSnapYaml([]byte(desktopAppYaml))
+	c.Assert(err, IsNil)
+
+	desktopFiles, err := info.DesktopFilesFromInstalledSnap(snap.DesktopFilesFromInstalledSnapOptions{})
+	c.Assert(err, IsNil)
+	c.Assert(desktopFiles, IsNil)
+}
+
+func (s *infoSuite) testDesktopFilesFromInstalledSnap(c *C, mangle bool) {
+	const desktopAppYaml = `
+name: foo
+version: 1.0
+plugs:
+  desktop:
+    desktop-file-ids: [org.example]
+`
+
+	info, err := snap.InfoFromSnapYaml([]byte(desktopAppYaml))
+	c.Assert(err, IsNil)
+
+	guiDir := filepath.Join(info.MountDir(), "meta", "gui")
+	err = os.MkdirAll(guiDir, 0755)
+	c.Assert(err, IsNil)
+
+	testDesktopFiles := []string{"org.example.desktop", "org.example.Foo.desktop", "test.desktop"}
+	for _, df := range testDesktopFiles {
+		err = os.WriteFile(filepath.Join(guiDir, df), nil, 0644)
+		c.Assert(err, IsNil)
+	}
+
+	opts := snap.DesktopFilesFromInstalledSnapOptions{MangleFileNames: mangle}
+	desktopFilesFound, err := info.DesktopFilesFromInstalledSnap(opts)
+	c.Assert(err, IsNil)
+	c.Assert(desktopFilesFound, HasLen, len(testDesktopFiles))
+
+	for _, target := range desktopFilesFound {
+		ok := false
+		for _, src := range testDesktopFiles {
+			src := filepath.Join(guiDir, src)
+			if mangle {
+				src, err = info.MangleDesktopFileName(src)
+				c.Assert(err, IsNil)
+			}
+			if src == target {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			c.Error(Commentf(target))
+		}
+	}
+}
+
+func (s *infoSuite) TestDesktopFilesFromInstalledSnap(c *C) {
+	const mangle = false
+	s.testDesktopFilesFromInstalledSnap(c, mangle)
+}
+
+func (s *infoSuite) TestDesktopFilesFromInstalledSnapMangled(c *C) {
+	const mangle = true
+	s.testDesktopFilesFromInstalledSnap(c, mangle)
 }

@@ -22,7 +22,6 @@ package main
 import (
 	"context"
 	"os"
-	"os/user"
 	"time"
 
 	"github.com/jessevdk/go-flags"
@@ -31,6 +30,7 @@ import (
 	"github.com/snapcore/snapd/cmd/snaplock/runinhibit"
 	"github.com/snapcore/snapd/image"
 	"github.com/snapcore/snapd/osutil"
+	"github.com/snapcore/snapd/osutil/user"
 	"github.com/snapcore/snapd/sandbox/cgroup"
 	"github.com/snapcore/snapd/sandbox/selinux"
 	"github.com/snapcore/snapd/seed/seedwriter"
@@ -38,7 +38,6 @@ import (
 	"github.com/snapcore/snapd/store"
 	"github.com/snapcore/snapd/store/tooling"
 	"github.com/snapcore/snapd/testutil"
-	usersessionclient "github.com/snapcore/snapd/usersession/client"
 )
 
 var RunMain = run
@@ -98,7 +97,8 @@ var (
 
 	IsStopping = isStopping
 
-	GetSnapDirOptions = getSnapDirOptions
+	GetSnapDirOptions                   = getSnapDirOptions
+	SnapInstancesAndComponentsFromNames = snapInstancesAndComponentsFromNames
 )
 
 func HiddenCmd(descr string, completeHidden bool) *cmdInfo {
@@ -133,27 +133,27 @@ func SetVerbose(iw *infoWriter, verbose bool) {
 }
 
 var (
-	ClientSnapFromPath                            = clientSnapFromPath
-	SetupDiskSnap                                 = (*infoWriter).setupDiskSnap
-	SetupSnap                                     = (*infoWriter).setupSnap
-	MaybePrintServices                            = (*infoWriter).maybePrintServices
-	MaybePrintCommands                            = (*infoWriter).maybePrintCommands
-	MaybePrintType                                = (*infoWriter).maybePrintType
-	PrintSummary                                  = (*infoWriter).printSummary
-	MaybePrintPublisher                           = (*infoWriter).maybePrintPublisher
-	MaybePrintNotes                               = (*infoWriter).maybePrintNotes
-	MaybePrintStandaloneVersion                   = (*infoWriter).maybePrintStandaloneVersion
-	MaybePrintBuildDate                           = (*infoWriter).maybePrintBuildDate
-	MaybePrintLinks                               = (*infoWriter).maybePrintLinks
-	MaybePrintBase                                = (*infoWriter).maybePrintBase
-	MaybePrintPath                                = (*infoWriter).maybePrintPath
-	MaybePrintSum                                 = (*infoWriter).maybePrintSum
-	MaybePrintCohortKey                           = (*infoWriter).maybePrintCohortKey
-	MaybePrintHealth                              = (*infoWriter).maybePrintHealth
-	MaybePrintRefreshInfo                         = (*infoWriter).maybePrintRefreshInfo
-	WaitWhileInhibited                            = waitWhileInhibited
-	TryNotifyRefreshViaSnapDesktopIntegrationFlow = tryNotifyRefreshViaSnapDesktopIntegrationFlow
-	NewInhibitionFlow                             = newInhibitionFlow
+	ClientSnapFromPath          = clientSnapFromPath
+	SetupDiskSnap               = (*infoWriter).setupDiskSnap
+	SetupSnap                   = (*infoWriter).setupSnap
+	MaybePrintServices          = (*infoWriter).maybePrintServices
+	MaybePrintCommands          = (*infoWriter).maybePrintCommands
+	MaybePrintType              = (*infoWriter).maybePrintType
+	PrintSummary                = (*infoWriter).printSummary
+	MaybePrintPublisher         = (*infoWriter).maybePrintPublisher
+	MaybePrintNotes             = (*infoWriter).maybePrintNotes
+	MaybePrintStandaloneVersion = (*infoWriter).maybePrintStandaloneVersion
+	MaybePrintBuildDate         = (*infoWriter).maybePrintBuildDate
+	MaybePrintLinks             = (*infoWriter).maybePrintLinks
+	MaybePrintBase              = (*infoWriter).maybePrintBase
+	MaybePrintPath              = (*infoWriter).maybePrintPath
+	MaybePrintSum               = (*infoWriter).maybePrintSum
+	MaybePrintCohortKey         = (*infoWriter).maybePrintCohortKey
+	MaybePrintHealth            = (*infoWriter).maybePrintHealth
+	MaybePrintRefreshInfo       = (*infoWriter).maybePrintRefreshInfo
+	WaitWhileInhibited          = waitWhileInhibited
+	NewInhibitionFlow           = newInhibitionFlow
+	ErrSnapRefreshConflict      = errSnapRefreshConflict
 )
 
 func MockPollTime(d time.Duration) (restore func()) {
@@ -357,6 +357,14 @@ func MockConfirmSystemdServiceTracking(fn func(securityTag string) error) (resto
 	}
 }
 
+func MockConfirmSystemdAppTracking(fn func(securityTag string) error) (restore func()) {
+	old := cgroupConfirmSystemdAppTracking
+	cgroupConfirmSystemdAppTracking = fn
+	return func() {
+		cgroupConfirmSystemdAppTracking = old
+	}
+}
+
 func MockApparmorSnapAppFromPid(f func(pid int) (string, string, string, error)) (restore func()) {
 	old := apparmorSnapAppFromPid
 	apparmorSnapAppFromPid = f
@@ -382,18 +390,26 @@ func MockSyscallUmount(f func(string, int) error) (restore func()) {
 }
 
 func MockIoutilTempDir(f func(string, string) (string, error)) (restore func()) {
-	old := ioutilTempDir
-	ioutilTempDir = f
+	old := osMkdirTemp
+	osMkdirTemp = f
 	return func() {
-		ioutilTempDir = old
+		osMkdirTemp = old
 	}
 }
 
-func MockDownloadDirect(f func(snapName string, revision snap.Revision, dlOpts tooling.DownloadSnapOptions) error) (restore func()) {
-	old := downloadDirect
-	downloadDirect = f
+func MockDownloadContainers(f func(snapName string, components []string, tsto *tooling.ToolingStore, opts tooling.DownloadSnapOptions) (*tooling.DownloadedSnap, error)) (restore func()) {
+	old := downloadContainers
+	downloadContainers = f
 	return func() {
-		downloadDirect = old
+		downloadContainers = old
+	}
+}
+
+func MockDownloadAssertions(f func(info *snap.Info, snapPath string, components map[string]*snap.ComponentInfo, tsto *tooling.ToolingStore, opts tooling.DownloadSnapOptions) (string, error)) (restore func()) {
+	old := downloadAssertions
+	downloadAssertions = f
+	return func() {
+		downloadAssertions = old
 	}
 }
 
@@ -427,37 +443,13 @@ func MockWaitWhileInhibited(f func(ctx context.Context, snapName string, notInhi
 	return restore
 }
 
-func MockIsGraphicalSession(graphical bool) (restore func()) {
-	old := isGraphicalSession
-	isGraphicalSession = func() bool {
-		return graphical
+func MockInhibitionFlow(flow inhibitionFlow) (restore func()) {
+	old := newInhibitionFlow
+	newInhibitionFlow = func(cli *client.Client, name string) inhibitionFlow {
+		return flow
 	}
 	return func() {
-		isGraphicalSession = old
-	}
-}
-
-func MockPendingRefreshNotification(f func(ctx context.Context, refreshInfo *usersessionclient.PendingSnapRefreshInfo) error) (restore func()) {
-	old := pendingRefreshNotification
-	pendingRefreshNotification = f
-	return func() {
-		pendingRefreshNotification = old
-	}
-}
-
-func MockFinishRefreshNotification(f func(ctx context.Context, refreshInfo *usersessionclient.FinishedSnapRefreshInfo) error) (restore func()) {
-	old := finishRefreshNotification
-	finishRefreshNotification = f
-	return func() {
-		finishRefreshNotification = old
-	}
-}
-
-func MockTryNotifyRefreshViaSnapDesktopIntegrationFlow(f func(ctx context.Context, snapName string) bool) (restore func()) {
-	old := tryNotifyRefreshViaSnapDesktopIntegrationFlow
-	tryNotifyRefreshViaSnapDesktopIntegrationFlow = f
-	return func() {
-		tryNotifyRefreshViaSnapDesktopIntegrationFlow = old
+		newInhibitionFlow = old
 	}
 }
 

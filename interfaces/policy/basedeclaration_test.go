@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2016-2018 Canonical Ltd
+ * Copyright (C) 2016-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -28,6 +28,7 @@ import (
 	"github.com/snapcore/snapd/asserts"
 	"github.com/snapcore/snapd/interfaces"
 	"github.com/snapcore/snapd/interfaces/builtin"
+	"github.com/snapcore/snapd/interfaces/ifacetest"
 	"github.com/snapcore/snapd/interfaces/policy"
 	"github.com/snapcore/snapd/release"
 	"github.com/snapcore/snapd/snap"
@@ -67,11 +68,13 @@ plugs:
   %s:
 `, iface)
 	}
-	slotSnap := snaptest.MockInfo(c, slotYaml, nil)
-	plugSnap := snaptest.MockInfo(c, plugYaml, nil)
+
+	slot, _ := ifacetest.MockConnectedSlot(c, slotYaml, nil, iface)
+	plug, _ := ifacetest.MockConnectedPlug(c, plugYaml, nil, iface)
+
 	return &policy.ConnectCandidate{
-		Plug:            interfaces.NewConnectedPlug(plugSnap.Plugs[iface], nil, nil),
-		Slot:            interfaces.NewConnectedSlot(slotSnap.Slots[iface], nil, nil),
+		Plug:            plug,
+		Slot:            slot,
 		BaseDeclaration: s.baseDecl,
 	}
 }
@@ -140,19 +143,21 @@ func (s *baseDeclSuite) TestAutoConnection(c *C) {
 	// these have more complex or in flux policies and have their
 	// own separate tests
 	snowflakes := map[string]bool{
-		"content":            true,
-		"core-support":       true,
-		"desktop":            true,
-		"home":               true,
-		"lxd-support":        true,
-		"microstack-support": true,
-		"multipass-support":  true,
-		"packagekit-control": true,
-		"pkcs11":             true,
-		"remoteproc":         true,
-		"snapd-control":      true,
-		"upower-observe":     true,
-		"empty":              true,
+		"content":                true,
+		"core-support":           true,
+		"cuda-driver-libs":       true,
+		"desktop":                true,
+		"home":                   true,
+		"lxd-support":            true,
+		"microstack-support":     true,
+		"multipass-support":      true,
+		"packagekit-control":     true,
+		"pkcs11":                 true,
+		"remoteproc":             true,
+		"screen-inhibit-control": true,
+		"snapd-control":          true,
+		"upower-observe":         true,
+		"empty":                  true,
 	}
 
 	// these simply auto-connect, anything else doesn't
@@ -170,7 +175,6 @@ func (s *baseDeclSuite) TestAutoConnection(c *C) {
 		"opengl":                  true,
 		"optical-drive":           true,
 		"ros-opt-data":            true,
-		"screen-inhibit-control":  true,
 		"ubuntu-download-manager": true,
 		"unity7":                  true,
 		"unity8":                  true,
@@ -202,8 +206,9 @@ func (s *baseDeclSuite) TestAutoConnectionImplicitSlotOnly(c *C) {
 
 	// these auto-connect only with an implicit slot
 	autoconnect := map[string]bool{
-		"desktop":        true,
-		"upower-observe": true,
+		"desktop":                true,
+		"screen-inhibit-control": true,
+		"upower-observe":         true,
 	}
 
 	for _, iface := range all {
@@ -804,7 +809,8 @@ var (
 		"bluez":                     {"app", "core"},
 		"bool-file":                 {"core", "gadget"},
 		"browser-support":           {"core"},
-		"content":                   {"app", "gadget"},
+		"checkbox-support":          {"core"},
+		"content":                   {"app", "gadget", "kernel"},
 		"core-support":              {"core"},
 		"cups":                      {"app"},
 		"cups-control":              {"app", "core"},
@@ -841,6 +847,7 @@ var (
 		"power-control":             {"core"},
 		"ppp":                       {"core"},
 		"polkit-agent":              {"core"},
+		"pipewire":                  {"app", "core"},
 		"pulseaudio":                {"app", "core"},
 		"pwm":                       {"core", "gadget"},
 		"qualcomm-ipc-router":       {"core", "app"},
@@ -849,6 +856,7 @@ var (
 		"sd-control":                {"core"},
 		"serial-port":               {"core", "gadget"},
 		"spi":                       {"core", "gadget"},
+		"screen-inhibit-control":    {"core", "app"},
 		"steam-support":             {"core"},
 		"storage-framework-service": {"app"},
 		"thumbnailer-service":       {"app"},
@@ -864,15 +872,17 @@ var (
 		"wayland":                   {"app", "core"},
 		"x11":                       {"app", "core"},
 		// snowflakes
-		"classic-support": nil,
-		"custom-device":   nil,
-		"docker":          nil,
-		"lxd":             nil,
-		"microceph":       nil,
-		"microovn":        nil,
-		"pkcs11":          nil,
-		"posix-mq":        nil,
-		"shared-memory":   nil,
+		"classic-support":   nil,
+		"cuda-driver-libs":  nil,
+		"custom-device":     nil,
+		"docker":            nil,
+		"lxd":               nil,
+		"microceph":         nil,
+		"microceph-support": nil,
+		"microovn":          nil,
+		"pkcs11":            nil,
+		"posix-mq":          nil,
+		"shared-memory":     nil,
 	}
 
 	restrictedPlugInstallation = map[string][]string{
@@ -1004,41 +1014,47 @@ func (s *baseDeclSuite) TestPlugInstallation(c *C) {
 	all := builtin.Interfaces()
 
 	restricted := map[string]bool{
-		"block-devices":           true,
-		"classic-support":         true,
-		"desktop-launch":          true,
-		"dm-crypt":                true,
-		"docker-support":          true,
-		"greengrass-support":      true,
-		"gpio-control":            true,
-		"ion-memory-control":      true,
-		"kernel-firmware-control": true,
-		"kernel-module-control":   true,
-		"kernel-module-load":      true,
-		"kubernetes-support":      true,
-		"lxd-support":             true,
-		"microstack-support":      true,
-		"mount-control":           true,
-		"multipass-support":       true,
-		"nvidia-drivers-support":  true,
-		"packagekit-control":      true,
-		"personal-files":          true,
-		"polkit":                  true,
-		"polkit-agent":            true,
-		"remoteproc":              true,
-		"sd-control":              true,
-		"shutdown":                true,
-		"snap-refresh-control":    true,
-		"snap-themes-control":     true,
-		"snap-refresh-observe":    true,
-		"snapd-control":           true,
-		"steam-support":           true,
-		"system-files":            true,
-		"tee":                     true,
-		"uinput":                  true,
-		"unity8":                  true,
-		"userns":                  true,
-		"xilinx-dma":              true,
+		"auditd-support":                   true,
+		"block-devices":                    true,
+		"checkbox-support":                 true,
+		"classic-support":                  true,
+		"cuda-driver-libs":                 true,
+		"desktop-launch":                   true,
+		"dm-crypt":                         true,
+		"docker-support":                   true,
+		"greengrass-support":               true,
+		"gpio-control":                     true,
+		"ion-memory-control":               true,
+		"kernel-firmware-control":          true,
+		"kernel-module-control":            true,
+		"kernel-module-load":               true,
+		"kubernetes-support":               true,
+		"lxd-support":                      true,
+		"microceph-support":                true,
+		"microstack-support":               true,
+		"mount-control":                    true,
+		"multipass-support":                true,
+		"nomad-support":                    true,
+		"nvidia-drivers-support":           true,
+		"packagekit-control":               true,
+		"personal-files":                   true,
+		"polkit":                           true,
+		"polkit-agent":                     true,
+		"remoteproc":                       true,
+		"sd-control":                       true,
+		"shutdown":                         true,
+		"snap-interfaces-requests-control": true,
+		"snap-refresh-control":             true,
+		"snap-refresh-observe":             true,
+		"snap-themes-control":              true,
+		"snapd-control":                    true,
+		"steam-support":                    true,
+		"system-files":                     true,
+		"tee":                              true,
+		"uinput":                           true,
+		"unity8":                           true,
+		"userns":                           true,
+		"xilinx-dma":                       true,
 	}
 
 	for _, iface := range all {
@@ -1102,6 +1118,7 @@ func (s *baseDeclSuite) TestConnection(c *C) {
 		"posix-mq":                  true,
 		"qualcomm-ipc-router":       true,
 		"raw-volume":                true,
+		"screen-inhibit-control":    true,
 		"shared-memory":             true,
 		"storage-framework-service": true,
 		"thumbnailer-service":       true,
@@ -1132,9 +1149,10 @@ func (s *baseDeclSuite) TestConnectionImplicitSlotOnly(c *C) {
 
 	// these allow connect only with an implicit slot
 	autoconnect := map[string]bool{
-		"desktop":             true,
-		"qualcomm-ipc-router": true,
-		"upower-observe":      true,
+		"desktop":                true,
+		"qualcomm-ipc-router":    true,
+		"screen-inhibit-control": true,
+		"upower-observe":         true,
 	}
 
 	for _, iface := range all {
@@ -1296,50 +1314,59 @@ func (s *baseDeclSuite) TestValidity(c *C) {
 	// given how the rules work this can be delicate,
 	// listed here to make sure that was a conscious decision
 	bothSides := map[string]bool{
-		"block-devices":           true,
-		"audio-playback":          true,
-		"classic-support":         true,
-		"core-support":            true,
-		"custom-device":           true,
-		"desktop-launch":          true,
-		"dm-crypt":                true,
-		"docker-support":          true,
-		"greengrass-support":      true,
-		"gpio-control":            true,
-		"ion-memory-control":      true,
-		"kernel-firmware-control": true,
-		"kernel-module-control":   true,
-		"kernel-module-load":      true,
-		"kubernetes-support":      true,
-		"lxd-support":             true,
-		"microstack-support":      true,
-		"mount-control":           true,
-		"multipass-support":       true,
-		"nvidia-drivers-support":  true,
-		"packagekit-control":      true,
-		"personal-files":          true,
-		"pkcs11":                  true,
-		"posix-mq":                true,
-		"polkit":                  true,
-		"polkit-agent":            true,
-		"remoteproc":              true,
-		"qualcomm-ipc-router":     true,
-		"sd-control":              true,
-		"shutdown":                true,
-		"shared-memory":           true,
-		"snap-refresh-control":    true,
-		"snap-themes-control":     true,
-		"snap-refresh-observe":    true,
-		"snapd-control":           true,
-		"steam-support":           true,
-		"system-files":            true,
-		"tee":                     true,
-		"udisks2":                 true,
-		"uinput":                  true,
-		"unity8":                  true,
-		"userns":                  true,
-		"wayland":                 true,
-		"xilinx-dma":              true,
+		"auditd-support":                   true,
+		"block-devices":                    true,
+		"audio-playback":                   true,
+		"classic-support":                  true,
+		"checkbox-support":                 true,
+		"core-support":                     true,
+		"cuda-driver-libs":                 true,
+		"custom-device":                    true,
+		"desktop":                          true,
+		"desktop-launch":                   true,
+		"dm-crypt":                         true,
+		"docker-support":                   true,
+		"greengrass-support":               true,
+		"gpio-control":                     true,
+		"ion-memory-control":               true,
+		"kernel-firmware-control":          true,
+		"kernel-module-control":            true,
+		"kernel-module-load":               true,
+		"kubernetes-support":               true,
+		"lxd-support":                      true,
+		"microceph-support":                true,
+		"microstack-support":               true,
+		"mount-control":                    true,
+		"multipass-support":                true,
+		"nomad-support":                    true,
+		"nvidia-drivers-support":           true,
+		"packagekit-control":               true,
+		"personal-files":                   true,
+		"pkcs11":                           true,
+		"posix-mq":                         true,
+		"polkit":                           true,
+		"polkit-agent":                     true,
+		"remoteproc":                       true,
+		"qualcomm-ipc-router":              true,
+		"screen-inhibit-control":           true,
+		"sd-control":                       true,
+		"shutdown":                         true,
+		"shared-memory":                    true,
+		"snap-interfaces-requests-control": true,
+		"snap-refresh-control":             true,
+		"snap-refresh-observe":             true,
+		"snap-themes-control":              true,
+		"snapd-control":                    true,
+		"steam-support":                    true,
+		"system-files":                     true,
+		"tee":                              true,
+		"udisks2":                          true,
+		"uinput":                           true,
+		"unity8":                           true,
+		"userns":                           true,
+		"wayland":                          true,
+		"xilinx-dma":                       true,
+		"confdb":                           true,
 	}
 
 	for _, iface := range all {
@@ -1696,28 +1723,28 @@ plugs:
 }
 
 func (s *baseDeclSuite) TestRawVolumeOverride(c *C) {
-	slotYaml := `name: slot-snap
+	const slotYaml = `name: slot-snap
 type: gadget
 version: 0
 slots:
   raw-volume:
     path: /dev/mmcblk0p1
 `
-	slotSnap := snaptest.MockInfo(c, slotYaml, nil)
+	slot, _ := ifacetest.MockConnectedSlot(c, slotYaml, nil, "raw-volume")
 	// mock a well-formed slot snap decl with SnapID
 	slotSnapDecl := s.mockSnapDecl(c, "slot-snap", "slotsnapidididididididididididid", "canonical", "")
 
-	plugYaml := `name: plug-snap
+	const plugYaml = `name: plug-snap
 version: 0
 plugs:
   raw-volume:
 `
-	plugSnap := snaptest.MockInfo(c, plugYaml, nil)
+	plug, _ := ifacetest.MockConnectedPlug(c, plugYaml, nil, "raw-volume")
 
 	// no plug-side declaration
 	cand := &policy.ConnectCandidate{
-		Plug:                interfaces.NewConnectedPlug(plugSnap.Plugs["raw-volume"], nil, nil),
-		Slot:                interfaces.NewConnectedSlot(slotSnap.Slots["raw-volume"], nil, nil),
+		Plug:                plug,
+		Slot:                slot,
 		SlotSnapDeclaration: slotSnapDecl,
 		BaseDeclaration:     s.baseDecl,
 	}
@@ -1812,6 +1839,94 @@ plugs:
 `
 
 	snapDecl := s.mockSnapDecl(c, "some-snap", "some-snap-with-polkit-agent-id", "canonical", plugsSlots)
+	cand.PlugSnapDeclaration = snapDecl
+	_, err = cand.CheckAutoConnect()
+	c.Check(err, IsNil)
+}
+
+func (s *baseDeclSuite) TestConnectionDesktop(c *C) {
+	cand := s.connectCand(c, "desktop", "", "")
+	err := cand.Check()
+	c.Assert(err, ErrorMatches, `connection denied by plug rule of interface "desktop"`)
+
+	plugsSlots := `
+plugs:
+  desktop:
+    allow-connection: true
+`
+	snapDecl := s.mockSnapDecl(c, "some-snap", "some-snap-with-desktop-id", "canonical", plugsSlots)
+	cand.PlugSnapDeclaration = snapDecl
+	err = cand.Check()
+	c.Assert(err, IsNil)
+}
+
+func (s *baseDeclSuite) TestAutoConnectionDesktop(c *C) {
+	cand := s.connectCand(c, "desktop", "", "")
+	_, err := cand.CheckAutoConnect()
+	c.Assert(err, ErrorMatches, "auto-connection denied by plug rule of interface \"desktop\"")
+
+	plugsSlots := `
+plugs:
+  desktop:
+    allow-auto-connection: true
+`
+	snapDecl := s.mockSnapDecl(c, "some-snap", "some-snap-with-desktop-id", "canonical", plugsSlots)
+	cand.PlugSnapDeclaration = snapDecl
+	_, err = cand.CheckAutoConnect()
+	c.Check(err, IsNil)
+}
+
+func (s *baseDeclSuite) TestDesktopFileIDsOverride(c *C) {
+	ic := s.installPlugCand(c, "desktop", snap.TypeApp, `name: some-snap
+version: 0
+type: app
+plugs:
+  desktop:
+    desktop-file-ids: [org.example]
+`)
+	err := ic.Check()
+	c.Assert(err, ErrorMatches, `installation not allowed by "desktop" plug rule of interface "desktop"`)
+
+	const plugsOverride = `
+plugs:
+  desktop:
+    allow-installation:
+      plug-attributes:
+        desktop-file-ids:
+          - org.example
+`
+	ic.SnapDeclaration = s.mockSnapDecl(c, "some-snap", "some-snap-id", "canonical", plugsOverride)
+	err = ic.Check()
+	c.Assert(err, IsNil)
+}
+
+func (s *baseDeclSuite) TestConnectionScreenInhibitControl(c *C) {
+	cand := s.connectCand(c, "screen-inhibit-control", "", "")
+	err := cand.Check()
+	c.Assert(err, ErrorMatches, `connection denied by slot rule of interface "screen-inhibit-control"`)
+
+	plugsSlots := `
+plugs:
+  screen-inhibit-control:
+    allow-connection: true
+`
+	snapDecl := s.mockSnapDecl(c, "some-snap", "some-snap", "canonical", plugsSlots)
+	cand.PlugSnapDeclaration = snapDecl
+	err = cand.Check()
+	c.Assert(err, IsNil)
+}
+
+func (s *baseDeclSuite) TestAutoConnectionScreenInhibitControl(c *C) {
+	cand := s.connectCand(c, "screen-inhibit-control", "", "")
+	_, err := cand.CheckAutoConnect()
+	c.Assert(err, ErrorMatches, "auto-connection denied by slot rule of interface \"screen-inhibit-control\"")
+
+	plugsSlots := `
+plugs:
+  screen-inhibit-control:
+    allow-auto-connection: true
+`
+	snapDecl := s.mockSnapDecl(c, "some-snap", "some-snap", "canonical", plugsSlots)
 	cand.PlugSnapDeclaration = snapDecl
 	_, err = cand.CheckAutoConnect()
 	c.Check(err, IsNil)

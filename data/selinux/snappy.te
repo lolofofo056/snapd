@@ -345,11 +345,6 @@ optional_policy(`
 	allow snappy_t systemd_timedated_t:dbus send_msg;
 	allow systemd_timedated_t snappy_t:dbus send_msg;
 ')
-# or on some systems same dbus API may be provided by timedatex
-# RHEL7: there is no timedatex.if
-ifndef(`distro_rhel7',`
-  timedatex_dbus_chat(snappy_t)
-')
 
 # kernel-module-load interface may inspect or write files under /etc/modprobe.d
 optional_policy(`
@@ -575,8 +570,9 @@ allow snappy_mount_t lib_t:dir mounton;
 # mount things labeled usr_t from the host
 allow snappy_mount_t usr_t:dir mounton;
 
-# allow mounting on top of /var/lib
+# allow mounting on top of /var and /var/lib
 allow snappy_mount_t var_lib_t:dir mounton;
+allow snappy_mount_t var_t:dir mounton;
 
 # mount and unmount on top of snaps
 allow snappy_mount_t snappy_snap_t:dir mounton;
@@ -760,6 +756,10 @@ kernel_mounton_proc(snappy_confine_t)
 kernel_unmount_proc(snappy_confine_t)
 seutil_read_file_contexts(snappy_confine_t)
 term_mount_pty_fs(snappy_confine_t)
+
+# check if /run/systemd/container
+# note, it's unlikely we're ever going to need to read that file on Fedora
+init_search_pid_dirs(snappy_confine_t)
 
 # device group
 fs_manage_cgroup_dirs(snappy_confine_t)

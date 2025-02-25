@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2015-2022 Canonical Ltd
+ * Copyright (C) 2015-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -27,9 +27,9 @@ import (
 
 	"github.com/gorilla/mux"
 
-	"github.com/snapcore/snapd/overlord/aspectstate"
 	"github.com/snapcore/snapd/overlord/assertstate"
 	"github.com/snapcore/snapd/overlord/auth"
+	"github.com/snapcore/snapd/overlord/confdbstate"
 	"github.com/snapcore/snapd/overlord/configstate"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
@@ -82,15 +82,21 @@ var api = []*Command{
 	systemRecoveryKeysCmd,
 	quotaGroupsCmd,
 	quotaGroupInfoCmd,
-	aspectsCmd,
+	confdbCmd,
 	noticesCmd,
 	noticeCmd,
+	requestsPromptsCmd,
+	requestsPromptCmd,
+	requestsRulesCmd,
+	requestsRuleCmd,
+	systemSecurebootCmd,
 }
 
 const (
-	polkitActionLogin            = "io.snapcraft.snapd.login"
-	polkitActionManage           = "io.snapcraft.snapd.manage"
-	polkitActionManageInterfaces = "io.snapcraft.snapd.manage-interfaces"
+	polkitActionLogin               = "io.snapcraft.snapd.login"
+	polkitActionManage              = "io.snapcraft.snapd.manage"
+	polkitActionManageInterfaces    = "io.snapcraft.snapd.manage-interfaces"
+	polkitActionManageConfiguration = "io.snapcraft.snapd.manage-configuration"
 )
 
 // userFromRequest extracts user information from request and return the respective user in state, if valid
@@ -137,15 +143,19 @@ func storeFrom(d *Daemon) snapstate.StoreService {
 }
 
 var (
-	snapstateInstall                        = snapstate.Install
+	snapstateStoreInstallGoal               = snapstate.StoreInstallGoal
+	snapstatePathUpdateGoal                 = snapstate.PathUpdateGoal
+	snapstateInstallWithGoal                = snapstate.InstallWithGoal
 	snapstateInstallPath                    = snapstate.InstallPath
 	snapstateInstallPathMany                = snapstate.InstallPathMany
 	snapstateInstallComponentPath           = snapstate.InstallComponentPath
+	snapstateInstallComponents              = snapstate.InstallComponents
 	snapstateRefreshCandidates              = snapstate.RefreshCandidates
 	snapstateTryPath                        = snapstate.TryPath
-	snapstateUpdate                         = snapstate.Update
-	snapstateUpdateMany                     = snapstate.UpdateMany
-	snapstateInstallMany                    = snapstate.InstallMany
+	snapstateStoreUpdateGoal                = snapstate.StoreUpdateGoal
+	snapstateUpdateWithGoal                 = snapstate.UpdateWithGoal
+	snapstateUpdateOne                      = snapstate.UpdateOne
+	snapstateRemove                         = snapstate.Remove
 	snapstateRemoveMany                     = snapstate.RemoveMany
 	snapstateResolveValSetsEnforcementError = snapstate.ResolveValidationSetsEnforcementError
 	snapstateRevert                         = snapstate.Revert
@@ -155,14 +165,18 @@ var (
 	snapstateHoldRefreshesBySystem          = snapstate.HoldRefreshesBySystem
 	snapstateLongestGatingHold              = snapstate.LongestGatingHold
 	snapstateSystemHold                     = snapstate.SystemHold
+	snapstateRemoveComponents               = snapstate.RemoveComponents
 
 	configstateConfigureInstalled = configstate.ConfigureInstalled
 
 	assertstateRefreshSnapAssertions         = assertstate.RefreshSnapAssertions
 	assertstateRestoreValidationSetsTracking = assertstate.RestoreValidationSetsTracking
+	assertstateFetchAllValidationSets        = assertstate.FetchAllValidationSets
 
-	aspectstateGetAspect = aspectstate.GetAspect
-	aspectstateSetAspect = aspectstate.SetAspect
+	confdbstateGetView        = confdbstate.GetView
+	confdbstateGetTransaction = confdbstate.GetTransactionToModify
+	confdbstateGet            = confdbstate.Get
+	confdbstateSetViaView     = confdbstate.SetViaView
 )
 
 func ensureStateSoonImpl(st *state.State) {
